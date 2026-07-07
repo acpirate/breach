@@ -1,0 +1,70 @@
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #16161c;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+canvas {
+  display: block;
+  width: 100vw;
+  height: 100vh;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  font-family: system-ui, sans-serif;
+  z-index: 10;
+}
+
+#overlay.hidden {
+  display: none;
+}
+
+.dialog {
+  background: #2a2a34;
+  color: #eee;
+  padding: 24px;
+  border: 1px solid #555;
+  min-width: 250px;
+  max-width: 84vw;
+  text-align: center;
+}
+
+.dialog h1 {
+  font-size: 20px;
+  margin: 0 0 8px;
+  letter-spacing: 1px;
+}
+
+.dialog p {
+  color: #aaa;
+  margin: 0 0 16px;
+  font-size: 14px;
+}
+
+.dialog button {
+  display: block;
+  width: 100%;
+  margin: 8px 0;
+  padding: 12px;
+  font-size: 16px;
+  background: #3a3a48;
+  color: #eee;
+  border: 1px solid #666;
+  cursor: pointer;
+}
+
+.dialog button:active {
+  background: #505064;
+}
