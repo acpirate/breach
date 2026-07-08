@@ -1,9 +1,16 @@
 // Orchestrator: wires the pure logic layer to the canvas view and DOM dialogs.
 // Owns the interaction flow (title → battle → pause/game-over) but no game rules.
 
-import { BOARD_SHAKE_COST, UNIT_DEFS } from './logic/constants';
+import {
+  BOARD_SHAKE_COST,
+  STARTING_HP_ENEMY,
+  STARTING_HP_PLAYER_LOW_SCENARIO,
+  STARTING_HP_PLAYER_NORMAL,
+  UNIT_DEFS,
+} from './logic/constants';
 import { Game } from './logic/game';
-import { Pt, Scenario, Side, gridViewOf } from './logic/types';
+import { BattleMetrics } from './logic/metrics';
+import { Pt, Scenario, Side, UNIT_ORDER, gridViewOf } from './logic/types';
 import { attachInput } from './render/input';
 import { Hud, View } from './render/view';
 
@@ -34,12 +41,12 @@ function getHud(): Hud | null {
   if (!game) return null;
   const s = game.state;
   const act = canAct();
-  const hpMaxPlayer = s.scenario === 'normal' ? 150 : 1;
+  const hpMaxPlayer = s.scenario === 'normal' ? STARTING_HP_PLAYER_NORMAL : STARTING_HP_PLAYER_LOW_SCENARIO;
   return {
     hpPlayer: Math.max(0, s.hp.player),
     hpPlayerMax: hpMaxPlayer,
     hpEnemy: Math.max(0, s.hp.enemy),
-    hpEnemyMax: 150,
+    hpEnemyMax: STARTING_HP_ENEMY,
     programs: s.units.player.map((u) => {
       const d = UNIT_DEFS[u.type];
       return { label: d.label, cost: d.cost, charge: u.charge, ready: act && u.charge >= d.cost, color: d.color, shape: d.shape };
@@ -63,7 +70,7 @@ const view = new View(canvas, getHud);
 
 // ---- dialogs (DOM) ----
 
-function showDialog(title: string, sub: string, buttons: [string, () => void][]): void {
+function showDialog(title: string, sub: string, buttons: [string, () => void][], extra?: HTMLElement): void {
   overlay.innerHTML = '';
   const box = document.createElement('div');
   box.className = 'dialog';
@@ -81,8 +88,45 @@ function showDialog(title: string, sub: string, buttons: [string, () => void][])
     b.addEventListener('click', cb);
     box.appendChild(b);
   }
+  if (extra) box.appendChild(extra); // MK2.3: metrics go BELOW the buttons
   overlay.appendChild(box);
   overlay.classList.remove('hidden');
+}
+
+// MK2.3 game-over metrics: plain text rows in a scrollable area, player side
+// first, enemy side second. Reads only logic-layer metrics state.
+function metricsElement(m: BattleMetrics): HTMLElement {
+  const wrap = document.createElement('div');
+  wrap.className = 'metrics';
+  const row = (text: string, head = false): void => {
+    const d = document.createElement('div');
+    if (head) d.className = 'mhead';
+    d.textContent = text;
+    wrap.appendChild(d);
+  };
+  const fmt = (n: number): string => (Number.isInteger(n) ? String(n) : n.toFixed(1));
+
+  row('BATTLE', true);
+  row(`Turns to resolution: ${m.turns}`);
+  row(`Match-locks (auto-reshuffles): ${m.autoReshuffles}`);
+
+  for (const side of ['player', 'enemy'] as const) {
+    const sm = m.sides[side];
+    row(side === 'player' ? 'YOUR SIDE' : 'ENEMY SIDE', true);
+    row(`Total damage dealt: ${fmt(sm.totalDamage)}`);
+    row(`  from matches: ${fmt(sm.matchDamage)}`);
+    row(`  from Attacker ability: ${fmt(sm.attackerDamage)}`);
+    row(`  from bomb detonations: ${fmt(sm.bombDamage)}`);
+    const critPct = sm.matchDamage > 0 ? ((sm.critExtra / sm.matchDamage) * 100).toFixed(1) : '0.0';
+    row(`Crit bonus damage (1.5x extra): ${fmt(sm.critExtra)} (${critPct}% of match damage)`);
+    row(`Largest single hit: ${fmt(sm.largestHit)}`);
+    row(`Deepest cascade: ${sm.deepestCascade} step${sm.deepestCascade === 1 ? '' : 's'}`);
+    for (const t of UNIT_ORDER) {
+      const u = sm.units[t];
+      row(`${UNIT_DEFS[t].label}: fired ${u.fires}, effect ${fmt(u.effect)}, charge wasted ${fmt(u.chargeWasted)}`);
+    }
+  }
+  return wrap;
 }
 
 function hideDialog(): void {
@@ -121,6 +165,7 @@ function maybeGameOver(): void {
       ['Reset', () => void startBattle(scenario)],
       ['Quit', showTitle],
     ],
+    metricsElement(game.state.metrics),
   );
 }
 

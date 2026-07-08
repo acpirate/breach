@@ -14,6 +14,7 @@ import {
 } from './constants';
 import { generateInitialBoard, reshuffleBoard, swap } from './board';
 import { detectMatches } from './match';
+import { consumeEvents, createBattleMetrics } from './metrics';
 import { addUnitCharge, buffBonus, dealDamage, resolveCascades, resolveDetonation } from './resolve';
 import { makeRNG } from './rng';
 import {
@@ -54,7 +55,17 @@ export class Game {
       winner: null,
       scenario,
       turn: 1,
+      metrics: createBattleMetrics(),
     };
+  }
+
+  // MK2.3 — every event batch a public action produces is routed through the
+  // logic-layer metrics collector before being handed to the renderer.
+  private collect(events: GameEvent[]): GameEvent[] {
+    consumeEvents(this.state.metrics, events);
+    this.state.metrics.turns = this.state.turn;
+    this.state.metrics.winner = this.state.winner;
+    return events;
   }
 
   // 1.6.1.a — player phase start: tick player-owned countdowns (oldest first,
@@ -68,7 +79,7 @@ export class Game {
     events.push({ t: 'msg', text: `Turn ${s.turn} — your move` });
     this.tickBombs('player', events);
     if (!s.winner) s.phase = 'playerPre';
-    return events;
+    return this.collect(events);
   }
 
   private findBySeq(seq: number): Pt | null {
@@ -103,20 +114,20 @@ export class Game {
     }
   }
 
-  // 1.7 — player-paid board-shake: does not end the turn; result MAY contain
-  // matches (intentional cascade payoff), which resolve as player-owned steps.
+  // 1.7 as revised by MK2.2 — player-paid board-shake is now a PURE anti-lock
+  // reshuffle, identical to the automatic deadlock reshuffle: guaranteed >=1
+  // valid move, NO pre-existing match, therefore no damage, no charge, no
+  // cascades. Does not end the turn. Cost / starts-charged / neutral-match
+  // replenishment are unchanged.
   fireShake(): GameEvent[] {
     const s = this.state;
     const events: GameEvent[] = [];
     if (s.phase !== 'playerPre' || s.shakeCharge < BOARD_SHAKE_COST) return events;
     s.shakeCharge -= BOARD_SHAKE_COST;
-    reshuffleBoard(s, true);
+    reshuffleBoard(s);
     events.push({ t: 'msg', text: 'Board shake!' });
     events.push({ t: 'board', grid: gridViewOf(s.board) });
-    s.phase = 'resolving';
-    resolveCascades(s, 'player', events);
-    if (!s.winner) s.phase = 'playerPre';
-    return events;
+    return this.collect(events);
   }
 
   // 1.6.1.b — fire a charged program during the pre-match window.
@@ -130,7 +141,7 @@ export class Game {
     s.phase = 'resolving';
     this.castUnit('player', u.type, events);
     if (!s.winner) s.phase = 'playerPre';
-    return events;
+    return this.collect(events);
   }
 
   private castUnit(owner: Side, type: UnitType, events: GameEvent[]): void {
@@ -138,21 +149,34 @@ export class Game {
     const who = owner === 'player' ? 'You' : 'Enemy';
     switch (type) {
       case 'bomber':
+        events.push({ t: 'ability', side: owner, unit: type });
         this.placeSpecial('bomb', owner, events);
         break;
       case 'buffer':
+        events.push({ t: 'ability', side: owner, unit: type });
         this.placeSpecial('buff', owner, events);
         break;
-      case 'attacker':
+      case 'attacker': {
+        events.push({ t: 'ability', side: owner, unit: type });
         events.push({ t: 'msg', text: `${who} fired Attacker` });
-        dealDamage(s, opponentOf(owner), ATTACKER_DAMAGE + buffBonus(s, owner), `${owner} attacker`, events);
+        const bonus = buffBonus(s, owner);
+        dealDamage(
+          s,
+          opponentOf(owner),
+          ATTACKER_DAMAGE + bonus,
+          { source: 'attacker', label: `${owner} attacker`, buffBonus: bonus },
+          events,
+        );
         break;
+      }
       case 'disabler': {
         // Highest RAW charge among the opponent's 4 units; ties broken randomly.
         const targets = s.units[opponentOf(owner)];
         const max = Math.max(...targets.map((t) => t.charge));
         const pick = s.rng.pick(targets.filter((t) => t.charge === max));
+        const drained = pick.charge;
         pick.charge = 0;
+        events.push({ t: 'ability', side: owner, unit: type, drained });
         events.push({ t: 'msg', text: `${who} fired Disabler — drained ${UNIT_DEFS[pick.type].label}` });
         break;
       }
@@ -205,7 +229,7 @@ export class Game {
     }
     s.phase = 'resolving'; // match committed — no further abilities this turn
     resolveCascades(s, 'player', events);
-    return { matched: true, events };
+    return { matched: true, events: this.collect(events) };
   }
 
   // 1.6.2 — enemy phase: tick own countdowns, cast all charged minions in
@@ -218,7 +242,7 @@ export class Game {
     events.push({ t: 'msg', text: 'Enemy turn' });
 
     this.tickBombs('enemy', events);
-    if (s.winner) return events;
+    if (s.winner) return this.collect(events);
 
     const ready = s.units.enemy.filter((u) => u.charge >= UNIT_DEFS[u.type].cost);
     s.rng.shuffle(ready);
@@ -227,10 +251,13 @@ export class Game {
       u.charge -= UNIT_DEFS[u.type].cost;
       this.castUnit('enemy', u.type, events);
     }
-    if (s.winner) return events;
+    if (s.winner) return this.collect(events);
 
-    for (const u of s.units.enemy) addUnitCharge(u, UNIT_DEFS[u.type].enemyChargeRate);
+    for (const u of s.units.enemy) {
+      const wasted = addUnitCharge(u, UNIT_DEFS[u.type].enemyChargeRate);
+      if (wasted > 0) events.push({ t: 'chargeWaste', side: 'enemy', unit: u.type, amount: wasted });
+    }
     s.turn += 1;
-    return events;
+    return this.collect(events);
   }
 }

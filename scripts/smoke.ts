@@ -71,7 +71,29 @@ function runScenario(scenario: Scenario, seed: number): void {
       if (u.charge >= UNIT_DEFS[u.type].cost) g.fireProgram(i);
     }
     if (g.state.winner) break;
-    if (g.state.shakeCharge >= BOARD_SHAKE_COST && safety % 4 === 0) g.fireShake();
+    if (g.state.shakeCharge >= BOARD_SHAKE_COST && safety % 4 === 0) {
+      // MK2.2: shake is a pure anti-lock reshuffle — verify NO damage, NO
+      // charge, NO cascades, and a no-match board with >=1 valid move
+      const hpBefore = JSON.stringify(g.state.hp);
+      const chargesBefore = JSON.stringify({
+        p: g.state.units.player.map((u) => u.charge),
+        e: g.state.units.enemy.map((u) => u.charge),
+      });
+      const shakeBefore = g.state.shakeCharge;
+      const ev = g.fireShake();
+      assert(ev.length > 0, 'charged shake in playerPre must fire');
+      assert(!ev.some((e) => e.t === 'damage'), 'shake must deal no damage');
+      assert(!ev.some((e) => e.t === 'destroy'), 'shake must trigger no cascades');
+      assert(JSON.stringify(g.state.hp) === hpBefore, 'shake must not change HP');
+      assert(
+        JSON.stringify({ p: g.state.units.player.map((u) => u.charge), e: g.state.units.enemy.map((u) => u.charge) }) === chargesBefore,
+        'shake must not change unit charges',
+      );
+      assert(g.state.shakeCharge === shakeBefore - BOARD_SHAKE_COST, 'shake must spend its cost');
+      assert(detectMatches(g.state.board).length === 0, 'shake board must contain no pre-existing match');
+      assert(findValidMove(g.state.board), 'shake board must have a valid move');
+      assert(g.state.phase === 'playerPre', 'shake must not end the turn');
+    }
     if (g.state.winner) break;
 
     // abilities must be blocked after the match commits — verified below
@@ -91,6 +113,13 @@ function runScenario(scenario: Scenario, seed: number): void {
 
   assert(g.state.winner, `${scenario} (seed ${seed}) should reach game over`);
   assert(g.state.hp[g.state.winner] > 0, 'winner must have positive HP');
+  // MK2.3: metrics must be populated on both win and loss outcomes
+  const m = g.state.metrics;
+  assert(m.winner === g.state.winner, 'metrics winner must match game winner');
+  assert(m.turns === g.state.turn, 'metrics turn count must match game state');
+  assert(m.sides[g.state.winner].totalDamage > 0, 'winning side must have dealt damage');
+  const tallied = m.sides[g.state.winner].matchDamage + m.sides[g.state.winner].attackerDamage + m.sides[g.state.winner].bombDamage;
+  assert(tallied === m.sides[g.state.winner].totalDamage, 'damage source split must sum to total');
   console.log(
     `${scenario} seed=${seed}: winner=${g.state.winner} turns=${g.state.turn} ` +
       `hp(player=${Math.max(0, g.state.hp.player)}, enemy=${Math.max(0, g.state.hp.enemy)})`,

@@ -38,7 +38,29 @@ canvas {
   border: 1px solid #555;
   min-width: 250px;
   max-width: 84vw;
+  max-height: 88vh;
   text-align: center;
+  display: flex;
+  flex-direction: column;
+}
+
+/* MK2.3 game-over metrics: plain text rows, scrollable for mobile portrait */
+.metrics {
+  margin-top: 12px;
+  border-top: 1px solid #555;
+  padding-top: 8px;
+  overflow-y: auto;
+  min-height: 0;
+  text-align: left;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #bbb;
+}
+
+.metrics .mhead {
+  font-weight: bold;
+  color: #fff;
+  margin-top: 8px;
 }
 
 .dialog h1 {

@@ -25,7 +25,7 @@ import {
 } from './constants';
 import { clearsLine, detectMatches, multiplierForLength } from './match';
 import { hasAnyValidMove, randomTile, reshuffleBoard } from './board';
-import { GameEvent, GameState, Pt, Side, Tile, UnitState, gridViewOf, opponentOf, tileViewOf } from './types';
+import { GameEvent, GameState, Pt, Side, Tile, UnitState, UnitType, gridViewOf, opponentOf, tileViewOf } from './types';
 
 export function buffBonus(state: GameState, side: Side): number {
   let n = 0;
@@ -47,18 +47,28 @@ export function baseDamage(t: Tile, owner: Side, fromMatch: boolean): number {
 }
 
 // Charge cap = activation cost, applied at the moment charge is added.
-export function addUnitCharge(u: UnitState, amount: number): void {
-  u.charge = Math.min(UNIT_DEFS[u.type].cost, u.charge + amount);
+// Returns the amount discarded at the cap (for the MK2.3 waste metric).
+export function addUnitCharge(u: UnitState, amount: number): number {
+  const before = u.charge;
+  u.charge = Math.min(UNIT_DEFS[u.type].cost, before + amount);
+  return before + amount - u.charge;
 }
 
 export function addShakeCharge(state: GameState, amount: number): void {
   state.shakeCharge = Math.min(BOARD_SHAKE_COST, state.shakeCharge + amount);
 }
 
-export function dealDamage(state: GameState, target: Side, amount: number, label: string, events: GameEvent[]): void {
+export interface DamageInfo {
+  source: 'match' | 'attacker' | 'bomb';
+  label: string;
+  critExtra?: number; // portion of `amount` added by the 1.5x multiplier (pre-floor)
+  buffBonus?: number; // portion of `amount` contributed by buff tiles
+}
+
+export function dealDamage(state: GameState, target: Side, amount: number, info: DamageInfo, events: GameEvent[]): void {
   if (state.winner || amount <= 0) return;
   state.hp[target] -= amount;
-  events.push({ t: 'damage', target, amount, label });
+  events.push({ t: 'damage', target, amount, label: info.label, source: info.source, critExtra: info.critExtra, buffBonus: info.buffBonus });
   if (state.hp[target] <= 0) {
     state.winner = opponentOf(target);
     state.phase = 'over';
@@ -68,19 +78,22 @@ export function dealDamage(state: GameState, target: Side, amount: number, label
 
 // Charge from one destroyed tile in a MATCH step. Owner-scoped: only the
 // event-owning side's units (and, for the player, the shake meter) gain.
-function chargeFromDestroyedTile(state: GameState, owner: Side, t: Tile): void {
+// Cap overflow is accumulated into `waste` per unit (MK2.3 metric).
+function chargeFromDestroyedTile(state: GameState, owner: Side, t: Tile, waste: Map<string, number>): void {
   if (t.kind === 'neutral') {
     if (owner === 'player') addShakeCharge(state, SHAKE_CHARGE_PER_NEUTRAL_TILE);
     return;
   }
   for (const u of state.units[owner]) {
     const def = UNIT_DEFS[u.type];
+    let w = 0;
     if (def.color === t.color) {
       let c = CHARGE_PER_TILE_COLOR_MATCH;
       if (owner === 'player' && t.color === HACKER_BONUS_COLOR) c += HACKER_BONUS_CHARGE;
-      addUnitCharge(u, c);
+      w += addUnitCharge(u, c);
     }
-    if (def.shape === t.shape) addUnitCharge(u, CHARGE_PER_TILE_SHAPE_MATCH);
+    if (def.shape === t.shape) w += addUnitCharge(u, CHARGE_PER_TILE_SHAPE_MATCH);
+    if (w > 0) waste.set(u.type, (waste.get(u.type) ?? 0) + w);
   }
 }
 
@@ -117,10 +130,14 @@ export function applyGravityAndRefill(state: GameState, events: GameEvent[]): vo
 // Resolve all match steps for one owner-side event until the board settles.
 // Each loop iteration is one "step" (spec 1.5): all simultaneous matches in
 // the current board state resolve together, with a single buff application.
-export function resolveCascades(state: GameState, owner: Side, events: GameEvent[]): void {
+// Returns the number of steps resolved (for the MK2.3 deepest-cascade metric;
+// 1 = a plain match with no cascading).
+export function resolveCascades(state: GameState, owner: Side, events: GameEvent[]): number {
+  let steps = 0;
   while (!state.winner) {
     const matches = detectMatches(state.board);
     if (!matches.length) break;
+    steps++;
 
     // Per destroyed tile: highest multiplier it qualifies for, applied once.
     const mult = new Map<number, { p: Pt; m: number }>();
@@ -149,23 +166,38 @@ export function resolveCascades(state: GameState, owner: Side, events: GameEvent
     const bonus = buffBonus(state, owner);
 
     let raw = 0;
+    let critExtra = 0; // damage added by the 1.5x multiplier only (pre-floor)
     const destroyed: Pt[] = [];
+    const waste = new Map<string, number>();
     for (const { p, m } of mult.values()) {
       const t = state.board[p.y][p.x];
       if (!t) continue;
       destroyed.push(p);
-      raw += baseDamage(t, owner, true) * m;
-      chargeFromDestroyedTile(state, owner, t);
+      const base = baseDamage(t, owner, true);
+      raw += base * m;
+      if (m > 1) critExtra += base * (m - 1);
+      chargeFromDestroyedTile(state, owner, t, waste);
+    }
+    for (const [unit, amount] of waste) {
+      events.push({ t: 'chargeWaste', side: owner, unit: unit as UnitType, amount });
     }
 
     events.push({ t: 'destroy', cells: destroyed });
     for (const p of destroyed) state.board[p.y][p.x] = null;
 
     // Fractional crit sums are floored (documented in README).
-    dealDamage(state, opponentOf(owner), Math.floor(raw) + bonus, owner === 'player' ? 'match' : 'enemy match', events);
+    dealDamage(
+      state,
+      opponentOf(owner),
+      Math.floor(raw) + bonus,
+      { source: 'match', label: owner === 'player' ? 'match' : 'enemy match', critExtra, buffBonus: bonus },
+      events,
+    );
     applyGravityAndRefill(state, events);
   }
+  if (steps > 0) events.push({ t: 'cascadeDepth', side: owner, depth: steps });
   if (!state.winner) ensureNoDeadlock(state, events);
+  return steps;
 }
 
 // Bomb detonation: destroys the bomb + its 4 orthogonal neighbors as NORMAL
@@ -195,18 +227,27 @@ export function resolveDetonation(state: GameState, p: Pt, events: GameEvent[]):
   events.push({ t: 'destroy', cells });
   for (const c of cells) state.board[c.y][c.x] = null;
 
-  dealDamage(state, opponentOf(owner), raw + bonus, owner === 'player' ? 'your bomb' : 'enemy bomb', events);
+  dealDamage(
+    state,
+    opponentOf(owner),
+    raw + bonus,
+    { source: 'bomb', label: owner === 'player' ? 'your bomb' : 'enemy bomb', buffBonus: bonus },
+    events,
+  );
   if (state.winner) return;
 
   applyGravityAndRefill(state, events);
-  resolveCascades(state, owner, events);
+  const steps = resolveCascades(state, owner, events);
+  // detonation depth = the blast itself + any cascade steps it caused
+  events.push({ t: 'cascadeDepth', side: owner, depth: 1 + steps });
 }
 
 // Run after every settle: if the board has no valid moves, the automatic
 // deadlock reshuffle triggers (guaranteed >=1 move, no pre-existing match).
 export function ensureNoDeadlock(state: GameState, events: GameEvent[]): void {
   if (hasAnyValidMove(state.board)) return;
-  reshuffleBoard(state, false);
+  reshuffleBoard(state);
+  events.push({ t: 'autoReshuffle' }); // MK2.3 match-lock metric
   events.push({ t: 'msg', text: 'No moves left — board reshuffled' });
   events.push({ t: 'board', grid: gridViewOf(state.board) });
 }

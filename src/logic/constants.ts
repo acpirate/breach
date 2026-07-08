@@ -35,7 +35,7 @@ export const MATCH_5_NONLINE_MULTIPLIER = 1.5;
 
 export const STARTING_HP_PLAYER_NORMAL = 150;
 export const STARTING_HP_PLAYER_LOW_SCENARIO = 1; // forced-loss test scenario
-export const STARTING_HP_ENEMY = 150;
+export const STARTING_HP_ENEMY = 350; // designer-set for MK2 iteration
 
 export const BOARD_SHAKE_COST = 3;
 export const BOARD_SHAKE_STARTS_CHARGED = true;

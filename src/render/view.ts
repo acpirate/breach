@@ -47,6 +47,17 @@ const COLOR_HEX: Record<Color, string> = {
   [Color.Blue]: '#4a72e8',
 };
 
+// MK2.1: darker shade of each gem color, used for the 1px tile border and the
+// 1px outline around the white shape glyph.
+const DARK_HEX: Record<Color, string> = {
+  [Color.Red]: '#79201f',
+  [Color.Yellow]: '#776e1a',
+  [Color.Magenta]: '#6f2570',
+  [Color.Green]: '#1f5f28',
+  [Color.Cyan]: '#1c6666',
+  [Color.Blue]: '#22397e',
+};
+
 const ease = (t: number): number => (t < 0 ? 0 : t > 1 ? 1 : t * (2 - t));
 
 interface VTile {
@@ -382,6 +393,13 @@ export class View {
         this.msgText = ev.winner === 'player' ? 'Enemy down!' : 'You are down!';
         this.msgUntil = now + 3000;
         break;
+      // metrics-only events (MK2.3): nothing to draw, consume instantly
+      case 'ability':
+      case 'chargeWaste':
+      case 'autoReshuffle':
+      case 'cascadeDepth':
+        dur = 1;
+        break;
     }
     return { ev, started: now, dur, tweens };
   }
@@ -502,13 +520,16 @@ export class View {
     ctx.lineWidth = charged ? 2 : 1;
     ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
 
-    // binding swatch (color square with shape glyph)
+    // binding swatch (color square with shape glyph, MK2.1 style)
     const sw = 14;
     ctx.fillStyle = COLOR_HEX[u.color];
     ctx.fillRect(r.x + 4, r.y + 4, sw, sw);
-    ctx.fillStyle = 'rgba(0,0,0,0.55)';
     traceShape(ctx, u.shape, r.x + 4 + sw / 2, r.y + 4 + sw / 2, sw * 0.36);
+    ctx.fillStyle = '#ffffff';
     ctx.fill();
+    ctx.strokeStyle = DARK_HEX[u.color];
+    ctx.lineWidth = 1;
+    ctx.stroke();
 
     ctx.fillStyle = '#ddd';
     ctx.font = 'bold 11px sans-serif';
@@ -629,15 +650,23 @@ export class View {
 
     if (view.kind === 'neutral') {
       // static/glitch noise — never a blank space, never one of the 6 colors
+      // (unchanged by MK2.1)
       ctx.imageSmoothingEnabled = false;
       ctx.drawImage(this.noise, px + 1, py + 1, c - 2, c - 2);
       ctx.imageSmoothingEnabled = true;
     } else {
+      // MK2.1: gem fill + 1px darker-same-color tile border, and the shape as
+      // a WHITE fill with a 1px darker-same-color outline for legibility on
+      // light tiles.
       ctx.fillStyle = COLOR_HEX[view.color!];
       ctx.fillRect(px + 1, py + 1, c - 2, c - 2);
-      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.strokeStyle = DARK_HEX[view.color!];
+      ctx.lineWidth = 1;
+      ctx.strokeRect(px + 1.5, py + 1.5, c - 3, c - 3);
       traceShape(ctx, view.shape!, cx, cy, c * 0.32);
+      ctx.fillStyle = '#ffffff';
       ctx.fill();
+      ctx.stroke(); // same path, same 1px dark stroke style
     }
 
     if (view.special) {

@@ -1,6 +1,6 @@
 # Breach — Match-3 Hacking RPG (Proof of Concept)
 
-Whitebox PoC of the core combat loop from `breach-poc-requirements.md`: matching, damage, charge, abilities, win/loss. TypeScript + Vite + canvas; mobile-first portrait; no backend, no persistence.
+Whitebox PoC of the core combat loop from `breach-poc-requirements.md`: matching, damage, charge, abilities, win/loss. TypeScript + Vite + canvas; mobile-first portrait; no backend, no persistence. Includes the Section 1-MK2 revisions (see below).
 
 ## Run
 
@@ -8,8 +8,20 @@ Whitebox PoC of the core combat loop from `breach-poc-requirements.md`: matching
 npm install
 npm run dev        # local dev server (Vite prints the URL; use --host + a tunnel for phone testing)
 npm run smoke      # headless logic smoke test: full battles, both scenarios, 10 seeds each
+npm run batch      # headless batch: 100 bot-played battles, aggregate metrics report
 npm run typecheck  # tsc --noEmit
 ```
+
+## MK2 revisions (Section 1-MK2)
+
+- **MK2.1 Shape rendering:** standard-tile shapes are a white fill with a 1px outline in a darker shade of the tile's own color; each tile also gets a 1px darker-same-color border. Neutral tiles unchanged.
+- **MK2.2 Board-shake is pure anti-lock:** the paid shake is now identical to the automatic deadlock reshuffle — guaranteed ≥1 valid move, no pre-existing match, therefore no damage/charge/cascades. Cost 3, starts charged, neutral-match replenishment unchanged. The old cascade-payoff rule is removed.
+- **MK2.3 Per-battle metrics:** collected entirely in the logic layer (`src/logic/metrics.ts`) by consuming the resolver's event stream — the same collector powers the game-over display and headless batch runs (`npm run batch`). Metric definitions:
+  - Per-unit "effect": Attacker = direct damage; Bomber = detonation damage from that side's bombs; Buffer = bonus damage its buffs added to damage events; Disabler = charge drained.
+  - Crit metric counts only the damage **added** by the 1.5× multiplier (per-tile `base × 0.5`, measured pre-floor).
+  - Deepest cascade: steps in one move (1 = no cascading); a detonation counts its blast + subsequent cascade steps. Turn count and match-lock (auto-reshuffle) count are battle-global; everything else is per side.
+  - Displayed on the game-over dialog below the win/loss indicator and Reset/Quit, in a scrollable plain-text area, player side first.
+- `STARTING_HP_ENEMY` is 350 for this iteration (designer-set).
 
 ## Controls
 
@@ -47,7 +59,7 @@ Enemy minions use the **identical bindings** (approved). Cyan, Magenta, Circle, 
 - Matches are **owned events**. Enemy bomb detonations trigger enemy-owned cascade matches: they damage the **player** (same formulas, enemy buffs apply per step) and charge **enemy minions**. Blast-destroyed tiles themselves grant no charge to anyone.
 - Charge is strictly **owner-scoped**: player matches charge only player units/shake; enemy cascades charge only enemy minions. Neutral tiles in enemy cascades damage the player but charge nothing.
 - The Hacker passive (Red +1/+1) applies **only to player-owned match events** — never to blasts or enemy cascades.
-- Board-shake is mechanically a unit ability: cost 3, +1 charge per neutral tile destroyed in a player match (including row/column-clear sweeps), capped at 3, starts charged. New constant: `SHAKE_CHARGE_PER_NEUTRAL_TILE = 1`.
+- Board-shake is mechanically a unit ability: cost 3, +1 charge per neutral tile destroyed in a player match (including row/column-clear sweeps), capped at 3, starts charged. New constant: `SHAKE_CHARGE_PER_NEUTRAL_TILE = 1`. (Its effect is the MK2.2 pure anti-lock reshuffle — see above.)
 - Bombs/buffs swept by a 4/5-match row/column clear are destroyed as **normal tiles** (no detonation); a same-side buff destroyed in a step/blast still counts toward that same step's damage.
 - 4/5-tier effects (row/column clears, crits) can occur in any cascade step, from either side's events.
 

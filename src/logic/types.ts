@@ -1,6 +1,7 @@
 // Pure data types shared by all game-logic modules. No DOM, no rendering.
 
 import type { RNG } from './rng';
+import type { BattleMetrics } from './metrics';
 
 export type Side = 'player' | 'enemy';
 export function opponentOf(s: Side): Side {
@@ -53,6 +54,7 @@ export interface GameState {
   winner: Side | null;
   scenario: Scenario;
   turn: number;
+  metrics: BattleMetrics; // MK2.3 — accumulated in the logic layer
 }
 
 // ---- Render-facing snapshots & events (plain serializable data) ----
@@ -92,6 +94,14 @@ export type GameEvent =
   | { t: 'setTile'; p: Pt; view: TileView }
   | { t: 'countdown'; p: Pt; value: number }
   | { t: 'detonate'; p: Pt }
-  | { t: 'damage'; target: Side; amount: number; label: string }
+  // damage carries metrics enrichment (MK2.3): source bucket, the portion
+  // added by the 1.5x crit multiplier (pre-floor), and the buff-tile bonus
+  // portion included in `amount`
+  | { t: 'damage'; target: Side; amount: number; label: string; source: 'match' | 'attacker' | 'bomb'; critExtra?: number; buffBonus?: number }
   | { t: 'msg'; text: string }
-  | { t: 'over'; winner: Side };
+  | { t: 'over'; winner: Side }
+  // metrics-only events (no visual representation; renderer skips them)
+  | { t: 'ability'; side: Side; unit: UnitType; drained?: number }
+  | { t: 'chargeWaste'; side: Side; unit: UnitType; amount: number }
+  | { t: 'autoReshuffle' }
+  | { t: 'cascadeDepth'; side: Side; depth: number };

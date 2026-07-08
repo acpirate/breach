@@ -93,15 +93,14 @@ export function hasAnyValidMove(board: Board): boolean {
   return findValidMove(board) !== null;
 }
 
-// Shared reshuffle core (spec 1.7). Both paths reposition ALL tiles; special
-// tiles (bombs/buffs, either side) persist with color/shape/owner/duration
-// unchanged, at new random positions. Non-special tiles get entirely new
-// random assignments.
-//   allowMatches=true  → player-paid board-shake: may land on matches
-//                        (intentional cascade payoff).
-//   allowMatches=false → automatic deadlock reshuffle: MUST have no
-//                        pre-existing match and >=1 valid move.
-export function reshuffleBoard(state: { board: Board; rng: RNG; nextId: number }, allowMatches: boolean): void {
+// Shared reshuffle core (spec 1.7, as revised by MK2.2): the player-paid
+// board-shake and the automatic deadlock reshuffle are now IDENTICAL. Both
+// reposition ALL tiles (special tiles persist with color/shape/owner/duration
+// unchanged, at new random positions; non-special tiles get entirely new
+// random assignments), and both guarantee >=1 valid move with NO pre-existing
+// match — no damage, no charge, no cascades. The old "player shake may land
+// on matches as a cascade payoff" rule is removed.
+export function reshuffleBoard(state: { board: Board; rng: RNG; nextId: number }): void {
   const specials: Tile[] = [];
   for (const row of state.board) for (const t of row) if (t?.special) specials.push(t);
 
@@ -114,16 +113,6 @@ export function reshuffleBoard(state: { board: Board; rng: RNG; nextId: number }
       const p = cells[i];
       board[p.y][p.x] = s;
     });
-
-    if (allowMatches) {
-      for (let y = 0; y < BOARD_HEIGHT; y++) {
-        for (let x = 0; x < BOARD_WIDTH; x++) {
-          if (!board[y][x]) board[y][x] = randomTile(state);
-        }
-      }
-      state.board = board;
-      return;
-    }
 
     // Constrained fill: local rejection keeps most matches from forming; the
     // full-board validation below catches the rest (e.g. runs completed by a
