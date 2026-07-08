@@ -357,6 +357,47 @@ Two fixed scenarios must be playable, selectable at battle start (a simple menu/
 
 ---
 
+# Section 1-MK2: Post-PoC Revisions (BUILD THIS, ON TOP OF SECTION 1)
+
+This section defines a second iteration on the working PoC. It assumes Section 1 is already built and functioning. Each item here is a DELTA against Section 1 — where an MK2 item conflicts with Section 1, MK2 governs; everything in Section 1 not mentioned here is unchanged. No new gameplay mechanics are introduced in MK2; this is refinement, one simplification, and metrics tooling. Section 2 (Roadmap) remains out of scope.
+
+## MK2.1 Shape rendering (visual)
+
+- Standard-tile shapes are now rendered as a WHITE fill, with a 1px outline in that tile's own darker gem color (the same darker shade used elsewhere for that color), so the shape stays legible on light-colored tiles (e.g. a white star on a yellow or cyan tile would otherwise wash out). The 1px same-color-darker outline restores the edge.
+- Additionally, each jewel/tile itself gets a 1px darker outline (a slightly darker shade of its own fill color) around its border, purely for visual separation and interest. No mechanical effect.
+- This remains within whitebox scope (Section 1.2): these are minimal primitive-rendering rules for clarity/legibility, not an art pass. Neutral tiles are UNCHANGED (still the black/white/gray static texture from 1.8).
+
+## MK2.2 Board-shake becomes pure anti-lock (simplification)
+
+Supersedes the relevant parts of Section 1.7. The player-triggered board-shake ability now behaves IDENTICALLY to the automatic deadlock reshuffle:
+
+- It reshuffles the board (repositioning all tiles; special tiles retain color/shape/owner/duration data per the existing rule).
+- It produces a board with at least one valid move available and NO match already present at the moment of generation — the SAME validity guarantee as the automatic deadlock reshuffle.
+- It therefore deals NO damage, grants NO charge, and triggers NO cascades. The previous "player shake is allowed to land on existing matches as a cascade payoff" rule from Section 1.7 is REMOVED — there is no longer any mechanical difference between the paid shake and the auto-reshuffle except what triggers them (player spending charge vs. automatic on deadlock).
+- Cost (`BOARD_SHAKE_COST`), starts-charged behavior, and neutral-match replenishment are all UNCHANGED. Shake is now purely a utility/anti-lock tool: spend charge to force a fresh, guaranteed-playable board, with no offensive upside.
+- Rationale: the cascade/damage payoff made shake overwhelming in MK1. Reducing it to a pure reshuffle removes that swing while keeping its anti-softlock purpose.
+
+## MK2.3 Per-battle metrics (new tooling — additive)
+
+Add per-battle metrics collection and an end-of-battle display. This introduces NO gameplay change — it only observes and reports.
+
+**Architecture (required):** metrics MUST be collected in the pure logic layer, not the render layer. The turn-resolver (and ability/detonation resolution) already produces discrete resolution events; a metrics collector subscribes to those events and accumulates counters in logic-layer state. This keeps metrics portable to a future engine (e.g. Godot) and, critically, means the headless logic can be run in batches (many simulated battles) to read aggregate stats WITHOUT rendering — seeding the Section 2 "random play / autobattle balance-testing" roadmap item. Do NOT scrape metrics from UI state.
+
+**Metrics to collect this pass** (tracked for BOTH sides — player and enemy — since both have the same 4 units and both deal damage via abilities/bombs):
+
+- Turn count to resolution (battle length).
+- Total damage dealt, split by source: match damage vs. ability (Attacker) damage vs. bomb-detonation damage.
+- Critical (1.5× tier) damage total, and as a percentage of total match damage.
+- Per-ability fire count and total damage/effect per ability, for all 4 unit types on each side.
+- Charge wasted to the cap, per unit (charge that was generated/granted but discarded because the unit was already at its cost cap).
+- Match-lock count: how many times the automatic deadlock reshuffle fired during the battle.
+- Largest single-hit damage (biggest damage from one match or one ability in the battle).
+- Deepest cascade: the maximum number of cascade steps reached in a single move/detonation.
+
+**Display (game-over screen):** show the metrics on the existing game-over scene, laid out BELOW the existing win/loss indicator and the Reset/Quit controls. The area must be scrollable for mobile (portrait) since the metric list is long. Player-side metrics are shown FIRST (above, or on the left, or at the top of the scroll order); enemy-side metrics follow. Whitebox styling only — plain text rows and default fonts are fine; no charts or visual polish required for this pass.
+
+---
+
 # Section 2: Roadmap (DO NOT BUILD — CONTEXT ONLY)
 
 This section exists so future work has a documented home and so deferred ideas aren't lost. Nothing in this section should be implemented as part of the PoC. If anything here appears to conflict with Section 1, Section 1 governs for this build.
@@ -546,4 +587,47 @@ committed. Then report the agent-discretion choices you made (rule 7) for review
 
 Ask clarifying questions before coding if anything in Section 1 is ambiguous. Do
 not silently expand scope — smaller and exactly-to-spec is correct.
+```
+
+# Coding Agent Prompt — MK2 Iteration (Ready to Paste)
+
+```
+This is a second iteration on the existing, working "Breach" PoC. The build
+from Section 1 of breach-poc-requirements.md is already complete and running.
+Now implement "Section 1-MK2: Post-PoC Revisions" from that same document.
+
+Read Section 1-MK2 in full before making changes. It has four parts:
+
+1. MK2.1 — Shape rendering: standard-tile shapes become a WHITE fill with a
+   1px outline in that tile's own darker gem color; ALSO add a 1px darker
+   outline around each tile itself. Neutral tiles are unchanged. Whitebox
+   scope still applies — this is minimal primitive rendering, not an art pass.
+
+2. MK2.2 — Board-shake becomes a pure anti-lock reshuffle: no damage, no
+   charge, no cascades. It now behaves identically to the automatic deadlock
+   reshuffle (guaranteed >=1 valid move, NO pre-existing match). REMOVE the old
+   "player shake may land on existing matches for a cascade payoff" behavior.
+   Cost, starts-charged, and neutral-match replenishment are unchanged.
+
+3. MK2.3 — Per-battle metrics. Collect them in the PURE LOGIC LAYER via events
+   emitted by the turn/ability/detonation resolver — NOT scraped from the UI —
+   so they stay portable and can later run headless in batches. Track the
+   metric list in MK2.3 for BOTH sides. Display them on the game-over screen,
+   below the existing win/loss indicator and Reset/Quit controls, in a
+   scrollable area (mobile portrait), player-side metrics first, enemy second.
+   Plain text rows, default fonts, no charts.
+
+CRITICAL:
+- These are DELTAS on top of Section 1. Do not rebuild working systems. Where
+  MK2 conflicts with Section 1, MK2 wins; everything else in Section 1 stays.
+- NO new gameplay mechanics. MK2 is refinement + one simplification + metrics
+  tooling only. Do not add anything not written in Section 1-MK2.
+- Keep the logic/render separation intact — metrics especially must live in
+  the logic layer.
+- Constants stay in the single constants module.
+
+Before coding, tell me: any clarifying questions, and a one-line plan for where
+the metrics collector will hook into the existing resolver. Then wait for my
+go-ahead. After building, confirm the shake no longer deals damage/charge and
+that metrics display correctly on both a win and a loss.
 ```
