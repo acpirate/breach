@@ -52,7 +52,7 @@ canvas {
   overflow-y: auto;
   min-height: 0;
   text-align: left;
-  font-size: 12px;
+  font-size: 15px;
   line-height: 1.5;
   color: #bbb;
 }
@@ -63,8 +63,9 @@ canvas {
   margin-top: 8px;
 }
 
+/* MK3.6: fonts sized to fill their allotted areas */
 .dialog h1 {
-  font-size: 20px;
+  font-size: 26px;
   margin: 0 0 8px;
   letter-spacing: 1px;
 }
@@ -72,7 +73,7 @@ canvas {
 .dialog p {
   color: #aaa;
   margin: 0 0 16px;
-  font-size: 14px;
+  font-size: 17px;
 }
 
 .dialog button {
@@ -80,7 +81,7 @@ canvas {
   width: 100%;
   margin: 8px 0;
   padding: 12px;
-  font-size: 16px;
+  font-size: 19px;
   background: #3a3a48;
   color: #eee;
   border: 1px solid #666;

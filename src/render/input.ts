@@ -10,6 +10,7 @@ export interface InputHandlers {
   onTap(p: Pt): void;
   onDrag(a: Pt, b: Pt): void;
   onProgram(i: number): void;
+  onMinion(i: number): void; // MK3.2: Disabler target selection
   onShake(): void;
   onMenu(): void;
 }
@@ -60,6 +61,9 @@ export function attachInput(canvas: HTMLCanvasElement, view: View, h: InputHandl
             break;
           case 'program':
             if (downHit.kind === 'program' && hit.idx === downHit.idx) h.onProgram(hit.idx);
+            break;
+          case 'minion':
+            if (downHit.kind === 'minion' && hit.idx === downHit.idx) h.onMinion(hit.idx);
             break;
           case 'shake':
             h.onShake();

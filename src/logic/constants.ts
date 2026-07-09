@@ -15,9 +15,11 @@ export const SHAPE_COUNT = 6;
 // are neutral; the remaining 92% are split evenly across the 36 color/shape combos.
 export const NEUTRAL_TILE_DROP_RATE = 0.08;
 
-export const DAMAGE_PER_TILE_LOW_COLOR = 2;
-export const DAMAGE_PER_TILE_HIGH_COLOR = 4;
-export const DAMAGE_PER_TILE_NEUTRAL = 3;
+// MK3.1: match damage halved (was 2/4/3) to give abilities room to matter.
+// Charge values are unchanged — this halves damage only.
+export const DAMAGE_PER_TILE_LOW_COLOR = 1;
+export const DAMAGE_PER_TILE_HIGH_COLOR = 2;
+export const DAMAGE_PER_TILE_NEUTRAL = 2;
 
 // Charge is ALWAYS flat per qualifying destroyed tile — it never uses the
 // damage multiplier table below.
@@ -28,9 +30,8 @@ export const CHARGE_PER_TILE_SHAPE_MATCH = 1;
 export const MATCH_3_MULTIPLIER = 1.0;
 export const MATCH_4_MULTIPLIER = 1.0; // 4-line clears full row/column
 export const MATCH_5_LINE_MULTIPLIER = 1.5; // 5-line: crit AND clears row/column
-// Non-linear 5s are unreachable in this PoC (straight-line-only match detection,
-// no blob merging — spec 1.4 / agent-prompt rule 9). Constant kept per spec for
-// the future non-linear match support described in Section 2.
+// MK3.3 made non-linear 5+ matches real via blob/merge matching: a merged
+// same-axis blob of 5+ tiles crits (no line clear). Reachable as of MK3.
 export const MATCH_5_NONLINE_MULTIPLIER = 1.5;
 
 export const STARTING_HP_PLAYER_NORMAL = 150;
@@ -47,7 +48,17 @@ export const SHAKE_CHARGE_PER_NEUTRAL_TILE = 1;
 
 export const BOMBER_COST = 7;
 export const BOMBER_ENEMY_CHARGE_RATE = 3; // per enemy turn
-export const BOMBER_COUNTDOWN_TURNS = 3;
+export const BOMBER_COUNTDOWN_TURNS = 2; // MK3.1: shorter fuse (was 3)
+
+// MK3.1: blast radius expanded from 4-orthogonal to the full 3x3 surround —
+// the bomb tile plus all 8 adjacent tiles (orthogonal + diagonal). Diagonal
+// destruction intentionally hits tiles that could not be part of any
+// orthogonal match. All other blast rules unchanged.
+export const BOMB_BLAST_OFFSETS: ReadonlyArray<{ x: number; y: number }> = [
+  { x: 0, y: 0 },
+  { x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 },
+  { x: 1, y: 1 }, { x: 1, y: -1 }, { x: -1, y: 1 }, { x: -1, y: -1 },
+];
 
 export const BUFFER_COST = 13;
 export const BUFFER_ENEMY_CHARGE_RATE = 3;
@@ -55,7 +66,7 @@ export const BUFFER_DAMAGE_BONUS = 5;
 
 export const ATTACKER_COST = 19;
 export const ATTACKER_ENEMY_CHARGE_RATE = 3;
-export const ATTACKER_DAMAGE = 15;
+export const ATTACKER_DAMAGE = 30; // MK3.1: doubled (was 15), both sides per mirrored-stats rule
 
 export const DISABLER_COST = 22;
 export const DISABLER_ENEMY_CHARGE_RATE = 3;

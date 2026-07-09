@@ -21,6 +21,9 @@ let game: Game | null = null;
 let scenario: Scenario = 'normal';
 let busy = false; // true while animations / enemy phase are in flight
 let selection: Pt | null = null;
+// MK3.2: Disabler targeting mode — armed by tapping the charged Disabler;
+// the next tap on an enemy minion fires it, any other tap cancels (free).
+let targeting = false;
 
 function canAct(): boolean {
   return !!game && !busy && !game.state.winner && game.state.phase === 'playerPre';
@@ -62,7 +65,14 @@ function getHud(): Hud | null {
     buffEnemy: buffCount('enemy') * 5,
     turn: s.turn,
     canAct: act,
-    statusText: s.winner ? '' : act ? 'Fire abilities, then swap to match' : '…',
+    statusText: s.winner
+      ? ''
+      : targeting
+        ? 'Tap an enemy minion to disable it'
+        : act
+          ? 'Fire abilities, then swap to match'
+          : '…',
+    targeting,
   };
 }
 
@@ -146,6 +156,7 @@ async function startBattle(s: Scenario): Promise<void> {
   hideDialog();
   game = new Game(s);
   selection = null;
+  targeting = false;
   view.reset(gridViewOf(game.state.board));
   view.setSelection(null);
   busy = true;
@@ -187,6 +198,10 @@ async function doSwap(a: Pt, b: Pt): Promise<void> {
 attachInput(canvas, view, {
   onTap(p: Pt): void {
     if (!canAct()) return;
+    if (targeting) {
+      targeting = false; // tap elsewhere cancels targeting (consumes the tap)
+      return;
+    }
     if (selection && selection.x === p.x && selection.y === p.y) {
       selection = null; // tap the selected tile again: deselect
     } else if (selection && Math.abs(selection.x - p.x) + Math.abs(selection.y - p.y) === 1) {
@@ -202,13 +217,38 @@ attachInput(canvas, view, {
   },
   onDrag(a: Pt, b: Pt): void {
     if (!canAct()) return;
+    if (targeting) {
+      targeting = false;
+      return;
+    }
     selection = null;
     view.setSelection(null);
     void doSwap(a, b);
   },
   onProgram(i: number): void {
     if (!canAct() || !game) return;
+    if (targeting) {
+      targeting = false; // tapping any program (incl. Disabler again) cancels
+      return;
+    }
+    const u = game.state.units.player[i];
+    if (u.type === 'disabler') {
+      // MK3.2: charged Disabler arms targeting mode instead of firing blind
+      if (u.charge >= UNIT_DEFS[u.type].cost) targeting = true;
+      return;
+    }
     const events = game.fireProgram(i);
+    if (!events.length) return;
+    busy = true;
+    void view.play(events).then(() => {
+      busy = false;
+      maybeGameOver();
+    });
+  },
+  onMinion(i: number): void {
+    if (!canAct() || !game || !targeting) return;
+    targeting = false;
+    const events = game.fireProgram(UNIT_ORDER.indexOf('disabler'), i);
     if (!events.length) return;
     busy = true;
     void view.play(events).then(() => {
@@ -218,6 +258,10 @@ attachInput(canvas, view, {
   },
   onShake(): void {
     if (!canAct() || !game) return;
+    if (targeting) {
+      targeting = false;
+      return;
+    }
     const events = game.fireShake();
     if (!events.length) return;
     busy = true;
@@ -229,6 +273,7 @@ attachInput(canvas, view, {
   onMenu(): void {
     // Pause menu only in the make-a-match phase, never mid-resolution (spec 1.12)
     if (!canAct()) return;
+    targeting = false;
     showDialog('PAUSED', '', [
       ['Resume', hideDialog],
       ['Reset', () => void startBattle(scenario)],

@@ -24,6 +24,7 @@ import {
   Scenario,
   Side,
   UNIT_ORDER,
+  UnitState,
   UnitType,
   gridViewOf,
   opponentOf,
@@ -131,20 +132,23 @@ export class Game {
   }
 
   // 1.6.1.b — fire a charged program during the pre-match window.
-  fireProgram(idx: number): GameEvent[] {
+  // MK3.2: the player's Disabler is player-TARGETABLE — `targetIdx` selects
+  // which of the 4 enemy minions to discharge, and is required for it.
+  fireProgram(idx: number, targetIdx?: number): GameEvent[] {
     const s = this.state;
     const events: GameEvent[] = [];
     if (s.phase !== 'playerPre') return events;
     const u = s.units.player[idx];
     if (!u || u.charge < UNIT_DEFS[u.type].cost) return events;
+    if (u.type === 'disabler' && (targetIdx === undefined || !s.units.enemy[targetIdx])) return events;
     u.charge -= UNIT_DEFS[u.type].cost;
     s.phase = 'resolving';
-    this.castUnit('player', u.type, events);
+    this.castUnit('player', u.type, events, targetIdx);
     if (!s.winner) s.phase = 'playerPre';
     return this.collect(events);
   }
 
-  private castUnit(owner: Side, type: UnitType, events: GameEvent[]): void {
+  private castUnit(owner: Side, type: UnitType, events: GameEvent[], targetIdx?: number): void {
     const s = this.state;
     const who = owner === 'player' ? 'You' : 'Enemy';
     switch (type) {
@@ -170,10 +174,29 @@ export class Game {
         break;
       }
       case 'disabler': {
-        // Highest RAW charge among the opponent's 4 units; ties broken randomly.
-        const targets = s.units[opponentOf(owner)];
-        const max = Math.max(...targets.map((t) => t.charge));
-        const pick = s.rng.pick(targets.filter((t) => t.charge === max));
+        // MK3.2 targeting rules (supersede the old highest-raw-charge rule):
+        //  - PLAYER Disabler: player-chosen target (targetIdx), any minion.
+        //  - ENEMY Disabler: fixed, predictable — the player's HIGHEST-COST
+        //    program that currently has any charge (>0), tie-broken by highest
+        //    raw charge, then randomly (cost ties are impossible with distinct
+        //    costs; stated for completeness). If NO player program has any
+        //    charge, it still fires and fizzles (drains nothing).
+        let pick: UnitState | null;
+        if (owner === 'player') {
+          pick = s.units.enemy[targetIdx!];
+        } else {
+          const charged = s.units.player.filter((t) => t.charge > 0);
+          if (!charged.length) {
+            events.push({ t: 'ability', side: owner, unit: type, drained: 0 });
+            events.push({ t: 'msg', text: 'Enemy Disabler fizzled — nothing to drain' });
+            break;
+          }
+          const maxCost = Math.max(...charged.map((t) => UNIT_DEFS[t.type].cost));
+          let pool = charged.filter((t) => UNIT_DEFS[t.type].cost === maxCost);
+          const maxCharge = Math.max(...pool.map((t) => t.charge));
+          pool = pool.filter((t) => t.charge === maxCharge);
+          pick = s.rng.pick(pool);
+        }
         const drained = pick.charge;
         pick.charge = 0;
         events.push({ t: 'ability', side: owner, unit: type, drained });

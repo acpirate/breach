@@ -7,6 +7,7 @@ import { BOARD_HEIGHT, BOARD_SHAKE_COST, BOARD_WIDTH, UNIT_DEFS } from '../src/l
 import { Game } from '../src/logic/game';
 import { detectMatches } from '../src/logic/match';
 import { Scenario } from '../src/logic/types';
+import { botFireAbilities, findBotMove } from './bot';
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`SMOKE FAIL: ${msg}`);
@@ -64,12 +65,8 @@ function runScenario(scenario: Scenario, seed: number): void {
 
   let safety = 0;
   while (!g.state.winner && safety++ < 600) {
-    // pre-match ability phase: fire everything that is charged
-    for (let i = 0; i < 4; i++) {
-      const u = g.state.units.player[i];
-      if (g.state.winner) break;
-      if (u.charge >= UNIT_DEFS[u.type].cost) g.fireProgram(i);
-    }
+    // pre-match ability phase: fire everything that is charged (MK3.4 bot)
+    botFireAbilities(g);
     if (g.state.winner) break;
     if (g.state.shakeCharge >= BOARD_SHAKE_COST && safety % 4 === 0) {
       // MK2.2: shake is a pure anti-lock reshuffle — verify NO damage, NO
@@ -97,10 +94,10 @@ function runScenario(scenario: Scenario, seed: number): void {
     if (g.state.winner) break;
 
     // abilities must be blocked after the match commits — verified below
-    const mv = findValidMove(g.state.board);
+    const mv = findBotMove(g.state.board);
     assert(mv, 'deadlock prevention guarantees a move');
     const r = g.attemptSwap(mv.a, mv.b);
-    assert(r.matched, 'findValidMove swap must produce a match');
+    assert(r.matched, 'bot-selected swap must produce a match');
     if (!g.state.winner) {
       assert(g.fireProgram(0).length === 0, 'abilities must not fire after the match is committed');
       assert(g.fireShake().length === 0, 'shake must not fire after the match is committed');

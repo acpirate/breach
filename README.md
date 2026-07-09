@@ -12,6 +12,15 @@ npm run batch      # headless batch: 100 bot-played battles, aggregate metrics r
 npm run typecheck  # tsc --noEmit
 ```
 
+## MK3 revisions (Section 1-MK3 — Combat Cohesion Pass)
+
+- **MK3.1 Constants:** match damage halved (low 1 / high 2 / neutral 2; charge unchanged); `ATTACKER_DAMAGE` 30; bomb fuse 2 turns and blast expanded to the full 3×3 (`BOMB_BLAST_OFFSETS` named constant).
+- **MK3.2 Disabler:** the player's Disabler is player-targetable — tapping the charged indicator arms a targeting mode (enemy minion boxes highlight; tap one to discharge it, tap anywhere else to cancel free). The enemy Disabler uses a fixed, legible rule: the player's highest-COST program with any charge, tie-break by raw charge then random; fizzles if nothing has charge.
+- **MK3.3 Blob/merge matching:** straight-line 3+ runs are detected per axis (color / shape / neutral, tagged with their value) then merged — same-axis same-value matches that share a tile or touch orthogonally union into one blob, repeated until stable. Blob tier = tile count; line 4+ clears its row/column; non-line 5+ crits with no clear. Cross-axis matches never merge. This makes `MATCH_5_NONLINE_MULTIPLIER` reachable (crits went from ~0.2% to ~2-4% of match damage in bot play).
+- **MK3.4 Bot:** harness bot (`scripts/bot.ts`) prefers any move producing a 4+ match, else first-found. Still a deliberately weak floor indicator.
+- **MK3.5 Metrics:** `npm run batch` splits all aggregates by outcome (player won vs lost) with the bot win rate as the headline calibration number.
+- **MK3.6 Visuals:** special-tile badges centered in the shape glyph; white (player) markers get black outlines; fonts sized to fill their allotted areas.
+
 ## MK2 revisions (Section 1-MK2)
 
 - **MK2.1 Shape rendering:** standard-tile shapes are a white fill with a 1px outline in a darker shade of the tile's own color; each tile also gets a 1px darker-same-color border. Neutral tiles unchanged.

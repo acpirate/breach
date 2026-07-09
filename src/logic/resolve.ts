@@ -10,6 +10,7 @@ import {
   BOARD_HEIGHT,
   BOARD_WIDTH,
   BOARD_SHAKE_COST,
+  BOMB_BLAST_OFFSETS,
   BUFFER_DAMAGE_BONUS,
   CHARGE_PER_TILE_COLOR_MATCH,
   CHARGE_PER_TILE_SHAPE_MATCH,
@@ -23,7 +24,7 @@ import {
   SHAKE_CHARGE_PER_NEUTRAL_TILE,
   UNIT_DEFS,
 } from './constants';
-import { clearsLine, detectMatches, multiplierForLength } from './match';
+import { detectMatches, matchClearsLine, matchMultiplier } from './match';
 import { hasAnyValidMove, randomTile, reshuffleBoard } from './board';
 import { GameEvent, GameState, Pt, Side, Tile, UnitState, UnitType, gridViewOf, opponentOf, tileViewOf } from './types';
 
@@ -147,10 +148,11 @@ export function resolveCascades(state: GameState, owner: Side, events: GameEvent
       if (!cur || m > cur.m) mult.set(k, { p: { x, y }, m });
     };
     for (const match of matches) {
-      const m = multiplierForLength(match.length);
+      const m = matchMultiplier(match);
       for (const c of match.cells) bump(c.x, c.y, m);
-      if (clearsLine(match.length)) {
-        // 4/5-line: the entire row/column is cleared at this match's multiplier.
+      if (matchClearsLine(match)) {
+        // straight-line 4/5+: the entire row/column is cleared at this
+        // match's multiplier (non-line blobs never line-clear)
         if (match.orientation === 'h') {
           const y = match.cells[0].y;
           for (let x = 0; x < BOARD_WIDTH; x++) bump(x, y, m);
@@ -211,8 +213,9 @@ export function resolveDetonation(state: GameState, p: Pt, events: GameEvent[]):
   const owner = bomb.special.owner;
 
   events.push({ t: 'detonate', p });
-  const cells: Pt[] = [p];
-  for (const d of [{ x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 }]) {
+  // MK3.1: blast pattern is the named BOMB_BLAST_OFFSETS constant (full 3x3)
+  const cells: Pt[] = [];
+  for (const d of BOMB_BLAST_OFFSETS) {
     const nx = p.x + d.x;
     const ny = p.y + d.y;
     if (nx >= 0 && nx < BOARD_WIDTH && ny >= 0 && ny < BOARD_HEIGHT && state.board[ny][nx]) {

@@ -2,7 +2,7 @@
 // GameEvents emitted by the logic layer and reads HUD data through a getter.
 // Whitebox/greybox visuals only (spec 1.2).
 
-import { BOARD_HEIGHT, BOARD_WIDTH } from '../logic/constants';
+import { BOARD_HEIGHT, BOARD_WIDTH, BOMB_BLAST_OFFSETS } from '../logic/constants';
 import { Color, GameEvent, Pt, Shape, TileView } from '../logic/types';
 
 export interface HudUnit {
@@ -29,11 +29,13 @@ export interface Hud {
   turn: number;
   canAct: boolean;
   statusText: string;
+  targeting: boolean; // MK3.2: Disabler targeting mode — minion boxes are tap-targets
 }
 
 export type Hit =
   | { kind: 'cell'; p: Pt }
   | { kind: 'program'; idx: number }
+  | { kind: 'minion'; idx: number } // tap-target for the player's Disabler (MK3.2)
   | { kind: 'shake' }
   | { kind: 'menu' }
   | null;
@@ -233,6 +235,9 @@ export class View {
     if (inRect(this.menuRect, x, y)) return { kind: 'menu' };
     for (let i = 0; i < this.programRects.length; i++) {
       if (inRect(this.programRects[i], x, y)) return { kind: 'program', idx: i };
+    }
+    for (let i = 0; i < this.minionRects.length; i++) {
+      if (inRect(this.minionRects[i], x, y)) return { kind: 'minion', idx: i };
     }
     if (inRect(this.shakeRect, x, y)) return { kind: 'shake' };
     const bx = Math.floor((x - this.boardX) / this.cell);
@@ -434,7 +439,7 @@ export class View {
     // message line just above the board
     if (now < this.msgUntil && this.msgText) {
       ctx.fillStyle = '#f0e070';
-      ctx.font = 'bold 14px sans-serif';
+      ctx.font = 'bold 18px sans-serif';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'alphabetic';
       ctx.fillText(this.msgText, w / 2, this.boardY - 6);
@@ -446,7 +451,7 @@ export class View {
       const age = (now - f.born) / 900;
       ctx.globalAlpha = 1 - age;
       ctx.fillStyle = f.color;
-      ctx.font = 'bold 16px sans-serif';
+      ctx.font = 'bold 20px sans-serif';
       ctx.textAlign = 'center';
       ctx.fillText(f.text, f.cx, f.cy + 14 + age * 22);
       ctx.globalAlpha = 1;
@@ -468,30 +473,31 @@ export class View {
     ctx.lineWidth = 1;
     ctx.strokeRect(this.menuRect.x + 0.5, this.menuRect.y + 0.5, this.menuRect.w - 1, this.menuRect.h - 1);
     ctx.fillStyle = '#ddd';
-    ctx.font = 'bold 16px sans-serif';
+    // MK3.6: fonts sized to fill their allotted area
+    ctx.font = `bold ${Math.floor(this.menuRect.h * 0.64)}px sans-serif`;
     ctx.textAlign = 'center';
     ctx.fillText('≡', this.menuRect.x + this.menuRect.w / 2, this.menuRect.y + this.menuRect.h / 2 + 1);
 
     // status line
-    ctx.fillStyle = '#9a9aa8';
-    ctx.font = '12px sans-serif';
+    ctx.fillStyle = '#b8b8c6';
+    ctx.font = '15px sans-serif';
     ctx.textAlign = 'left';
     ctx.fillText(`Turn ${hud.turn}   ${hud.statusText}`, this.pad, this.statusY + 6);
 
     // player programs + shake
     for (let i = 0; i < 4; i++) {
-      this.drawUnitBox(this.programRects[i], hud.programs[i], true);
+      this.drawUnitBox(this.programRects[i], hud.programs[i], true, false);
     }
     this.drawShakeBox(this.shakeRect, hud);
 
-    // enemy minions (always-visible charge)
+    // enemy minions (always-visible charge; highlighted while Disabler targeting)
     for (let i = 0; i < 4; i++) {
-      this.drawUnitBox(this.minionRects[i], hud.minions[i], false);
+      this.drawUnitBox(this.minionRects[i], hud.minions[i], false, hud.targeting);
     }
 
     // buffs
-    ctx.fillStyle = '#9a9aa8';
-    ctx.font = '12px sans-serif';
+    ctx.fillStyle = '#b8b8c6';
+    ctx.font = '15px sans-serif';
     ctx.textAlign = 'left';
     ctx.fillText(`Buffs — you: +${hud.buffPlayer}   enemy: +${hud.buffEnemy}`, this.pad, this.buffY + 6);
   }
@@ -506,19 +512,19 @@ export class View {
     ctx.lineWidth = 1;
     ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
     ctx.fillStyle = '#fff';
-    ctx.font = 'bold 12px sans-serif';
+    ctx.font = `bold ${Math.floor(r.h * 0.64)}px sans-serif`; // MK3.6: fill the bar height
     ctx.textAlign = 'left';
     ctx.fillText(`${label} ${hp}/${max}`, r.x + 6, r.y + r.h / 2 + 1);
   }
 
-  private drawUnitBox(r: Rect, u: HudUnit, interactive: boolean): void {
+  private drawUnitBox(r: Rect, u: HudUnit, interactive: boolean, targetable: boolean): void {
     const ctx = this.ctx;
     const charged = u.charge >= u.cost;
-    ctx.fillStyle = '#2c2c36';
+    ctx.fillStyle = targetable ? '#3c3220' : '#2c2c36';
     ctx.fillRect(r.x, r.y, r.w, r.h);
-    ctx.strokeStyle = charged ? (interactive && u.ready ? '#ffffff' : '#e0a040') : '#555';
-    ctx.lineWidth = charged ? 2 : 1;
-    ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+    ctx.strokeStyle = targetable ? '#ff9500' : charged ? (interactive && u.ready ? '#ffffff' : '#e0a040') : '#555';
+    ctx.lineWidth = targetable ? 3 : charged ? 2 : 1;
+    ctx.strokeRect(r.x + 1.5, r.y + 1.5, r.w - 3, r.h - 3);
 
     // binding swatch (color square with shape glyph, MK2.1 style)
     const sw = 14;
@@ -532,12 +538,13 @@ export class View {
     ctx.stroke();
 
     ctx.fillStyle = '#ddd';
-    ctx.font = 'bold 11px sans-serif';
+    // MK3.6: label/charge text scaled to the box height
+    ctx.font = `bold ${Math.max(12, Math.floor(r.h * 0.28))}px sans-serif`;
     ctx.textAlign = 'left';
-    ctx.fillText(u.label, r.x + 4 + sw + 4, r.y + 11);
+    ctx.fillText(u.label, r.x + 4 + sw + 4, r.y + 12);
 
     ctx.fillStyle = charged ? '#ffe080' : '#aaa';
-    ctx.font = '11px sans-serif';
+    ctx.font = `${Math.max(12, Math.floor(r.h * 0.24))}px sans-serif`;
     ctx.fillText(`${u.charge}/${u.cost}`, r.x + 4, r.y + r.h - 18);
 
     // charge bar
@@ -557,11 +564,11 @@ export class View {
     ctx.lineWidth = charged ? 2 : 1;
     ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
     ctx.fillStyle = '#ddd';
-    ctx.font = 'bold 11px sans-serif';
+    ctx.font = `bold ${Math.max(12, Math.floor(r.h * 0.28))}px sans-serif`;
     ctx.textAlign = 'left';
-    ctx.fillText('SHAKE', r.x + 4, r.y + 11);
+    ctx.fillText('SHAKE', r.x + 4, r.y + 12);
     ctx.fillStyle = charged ? '#ffe080' : '#aaa';
-    ctx.font = '11px sans-serif';
+    ctx.font = `${Math.max(12, Math.floor(r.h * 0.24))}px sans-serif`;
     ctx.fillText(`${hud.shakeCharge}/${hud.shakeCost}`, r.x + 4, r.y + r.h - 18);
     const bw = r.w - 8;
     ctx.fillStyle = '#1c1c24';
@@ -625,7 +632,7 @@ export class View {
       } else if (this.cur.ev.t === 'detonate') {
         ctx.fillStyle = `rgba(255,140,30,${a.toFixed(3)})`;
         const pt = this.cur.ev.p;
-        for (const d of [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 }]) {
+        for (const d of BOMB_BLAST_OFFSETS) {
           ctx.fillRect(this.boardX + (pt.x + d.x) * c, this.boardY + (pt.y + d.y) * c, c, c);
         }
       } else if (this.cur.ev.t === 'board') {
@@ -670,21 +677,31 @@ export class View {
     }
 
     if (view.special) {
-      // ownership: white border = player, black border = enemy (spec 1.11)
+      // ownership: white border = player, black border = enemy (spec 1.11).
+      // MK3.6: white (player) markers get a black outline so they read on
+      // light tile fills.
       const white = view.special.owner === 'player';
+      if (white) {
+        ctx.strokeStyle = '#000000';
+        ctx.lineWidth = 5;
+        ctx.strokeRect(px + 3.5, py + 3.5, c - 7, c - 7);
+      }
       ctx.strokeStyle = white ? '#ffffff' : '#000000';
       ctx.lineWidth = 3;
-      ctx.strokeRect(px + 2.5, py + 2.5, c - 5, c - 5);
-      // badge: bomb countdown number, or "+" for a buff, in the owner's color
-      const br = c * 0.19;
-      const bx = px + br + 4;
-      const by = py + br + 4;
+      ctx.strokeRect(px + 3.5, py + 3.5, c - 7, c - 7);
+      // MK3.6: badge (bomb countdown / buff "+") centered in the shape glyph
+      const br = c * 0.22;
+      const bx = px + c / 2;
+      const by = py + c / 2;
       ctx.fillStyle = white ? '#ffffff' : '#000000';
       ctx.beginPath();
       ctx.arc(bx, by, br, 0, Math.PI * 2);
       ctx.fill();
+      ctx.strokeStyle = white ? '#000000' : '#ffffff';
+      ctx.lineWidth = white ? 2 : 1;
+      ctx.stroke();
       ctx.fillStyle = white ? '#000000' : '#ffffff';
-      ctx.font = `bold ${Math.max(9, Math.floor(br * 1.5))}px sans-serif`;
+      ctx.font = `bold ${Math.max(10, Math.floor(br * 1.5))}px sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(view.special.type === 'bomb' ? String(view.special.countdown ?? '?') : '+', bx, by + 0.5);
