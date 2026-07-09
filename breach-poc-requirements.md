@@ -47,7 +47,7 @@ MATCH_5_NONLINE_MULTIPLIER = 1.5 // 5 in V/T/other config: crit only, no clear, 
 
 STARTING_HP_PLAYER_NORMAL = 150
 STARTING_HP_PLAYER_LOW_SCENARIO = 1   // forced-loss test scenario
-STARTING_HP_ENEMY = 350
+STARTING_HP_ENEMY = 350 // 350 = manual balance tuning, intentionally diverges from spec's original 150
 
 BOARD_SHAKE_COST = 3
 BOARD_SHAKE_STARTS_CHARGED = true
@@ -398,6 +398,70 @@ Add per-battle metrics collection and an end-of-battle display. This introduces 
 
 ---
 
+# Section 1-MK3: Combat Cohesion Pass (BUILD THIS, ON TOP OF MK2)
+
+This section defines a third iteration. It assumes Section 1 and Section 1-MK2 are built and working. Each item is a DELTA against the current build — where MK3 conflicts with an earlier section, MK3 governs; everything not mentioned here is unchanged. Section 2 (Roadmap) remains out of scope.
+
+**Intent of this pass (context, not a build instruction):** The goal is combat-system COHESION, not balance. These are deliberately rough, only-slightly-more-informed replacements for the previous arbitrary values, plus one new matching behavior (blob matching) and better instrumentation (outcome-split metrics). The purpose is to (a) make the battle system feel more intuitively cohesive and (b) generate a second dataset to inform future ability numbers. Do not chase perfect balance. Do not add mechanics beyond what is listed here.
+
+## MK3.1 Combat value changes (constants)
+
+All of these are edits to the single constants module. Do not hardcode elsewhere.
+
+- **Match damage halved.** Halve the per-tile match damage values: `DAMAGE_PER_TILE_LOW_COLOR` 2 → 1, `DAMAGE_PER_TILE_HIGH_COLOR` 4 → 2, `DAMAGE_PER_TILE_NEUTRAL` 3 → 2 (round as written). This is a first-pass tune to give abilities room to matter relative to match damage. Charge values are UNCHANGED — this halves damage only, not charge.
+- **Attacker damage doubled.** `ATTACKER_DAMAGE` 15 → 30. (Applies to both the player's Attacker program and the enemy Attacker minion, per the mirrored-stats rule.)
+- **Bomb buffed on two axes.** `BOMBER_COUNTDOWN_TURNS` 3 → 2 (shorter fuse), and the detonation radius expands from the 4 orthogonal neighbors to the full 3×3 surround — all 8 adjacent tiles (orthogonal + diagonal) around the bomb tile, plus the bomb tile itself. Add a named constant for the blast pattern rather than hardcoding it. All existing blast rules are unchanged (destroyed tiles deal their own type's damage; bombs/buffs caught in the blast are destroyed as normal tiles with no chain; a same-side buff destroyed still counts toward that blast's damage; detonation grants no charge; resulting falls cascade normally). NOTE: diagonal destruction now destroys tiles that could not have been part of any orthogonal match — this is intended.
+
+## MK3.2 Disabler → player-targetable (the one non-trivial change)
+
+Supersedes the Disabler targeting rule in Section 1.10 / constants.
+
+- **Player's Disabler program is now player-TARGETABLE.** When the player fires it, the player chooses WHICH of the 4 enemy minions to fully discharge, rather than it auto-selecting the highest-charge unit. The targeting UI/interaction is left to the implementer's discretion (follow the existing ability-input conventions from Section 1.12 — abilities fire via the top info-area indicators, distinct from gem selection). [DESIGNER NOTE: targeting UX delegated to agent for this pass; flagged for possible future clarification.]
+- **Enemy's Disabler minion uses a fixed, predictable target rule** (not random, not highest-charge): it targets the player's HIGHEST-COST program that currently has any charge (i.e. it prioritizes shutting down the player's most expensive/threatening program), breaking ties by highest current raw charge, then randomly. The point is that the enemy Disabler is legible — the player can anticipate what it will hit and play around it. Document the exact rule chosen in code comments.
+- Rationale: auto-highest-charge made the player's expensive Disabler feel not worth its cost; targetability makes it a tactical tool. The enemy staying predictable supports the low-variance / telegraphed-threat design goal.
+
+## MK3.3 Blob / merge matching (new matching behavior — code-light)
+
+Adds non-linear (L/T/plus/blob) match detection, so that 4- and 5-tile matches can form in non-straight configurations. This finally lets the existing 1.5× crit tier fire in practice (straight-line-5 alone was ~0.2% of damage). A proven algorithm exists from an earlier prototype (Match3Single) — port it rather than deriving new logic.
+
+- **Algorithm:** first detect all straight-line 3+ runs (base matches), then iteratively MERGE any two base matches OF THE SAME MATCH-TYPE whose tiles or adjacent-neighbor tiles overlap, into a single combined match, until no further merges occur. The combined match's tile count determines its tier (4-tier, 5-tier, etc.) and its shape (line vs. non-line) determines clear/crit per the existing 1.4 table.
+- **REQUIRED ADAPTATION for this game's two-axis tiles:** the reference algorithm assumed one type per tile. Here tiles have INDEPENDENT color and shape, and matches form on either axis. So base-match detection must run PER AXIS — scan for color-runs and shape-runs separately — producing matches tagged by their axis+value (e.g. "color:red", "shape:triangle"). The merge step must be axis-aware: a color-match and a shape-match are DIFFERENT match-types and must NOT merge into each other. Only same-axis, same-value matches merge. (The reference code already guards merges by matchType; this just requires color and shape values to be distinct matchType identities.)
+- **RECOMMENDED hardening (cheap, ~3 lines):** wrap the merge pass in a repeat-until-no-merges-occurred loop, to correctly handle 3+-way merge chains where a linking overlap only appears after an earlier merge. Without it, a rare multi-blob case could be under-merged (scored as separate matches). Not a crash either way, but the loop makes it airtight.
+- **DO NOT micro-optimize.** The merge is O(n²) over simultaneous matches with nested coord checks; at 8×8 with a handful of matches this is negligible (microseconds). Keep it naive and correct. Do not replace it with a cleverer algorithm.
+- **Interaction with existing rules (unchanged, but confirm they still hold):** per-destroyed-tile dedup and highest-multiplier-wins (1.4) still apply to blob results; charge is still flat per-tile with no multiplier; the "no tier promotion from mere adjacency" rule is now SUPERSEDED for genuine merges — a merged blob of 4+ same-axis tiles IS a real 4/5-tier match (that was the whole point). Two DIFFERENT-axis matches that merely touch still do not combine.
+- After building, re-read the crit metric — the point of this change is to make crits actually occur, so the crit share of match damage should rise meaningfully above MK2's ~0.2%.
+
+## MK3.4 Bot AI upgrade — prefer 4-matches (floor indicator, one notch up)
+
+Supersedes the bot's move-selection in the smoke/batch harness only (not player-facing).
+
+- The automated bot currently plays the first-found valid move. Upgrade it to: if any available move would produce a 4-match (or larger / a row-column-clear), prefer that move; otherwise fall back to first-found. This mirrors MPQ's enemy-AI tier and is a slightly higher, still-dumb floor.
+- Do NOT go further for this pass: no cascade look-ahead, no 5-match prioritization, no board evaluation. The bot must remain a deliberately weak FLOOR indicator — its job is to lose most games so that human win-rate can be read as a delta above a known-weak baseline. [DESIGNER NOTE: "AI tiers" as a difficulty lever / enemy power-scaling axis is a future roadmap idea, not part of this pass.]
+
+## MK3.5 Metrics — split by outcome (instrumentation upgrade)
+
+Extends MK2.3. Still logic-layer, still event-sourced.
+
+- **Split all batch-aggregated metrics by battle OUTCOME:** report the metric set separately for battles the player WON vs. battles the player LOST (and, where meaningful, player-metrics-in-wins vs player-metrics-in-losses). The averaged-across-all-battles blend hides the most useful information — the losing battles are the more informative half for understanding which enemy abilities actually close out games.
+- This applies to the BATCH/headless harness output (the 100-battle run), which is where outcome-splitting pays off. The single-battle game-over screen from MK2.3 is unchanged (a single battle has a single outcome).
+- Also surface, in the batch output, the overall bot win/loss rate prominently — it is the primary calibration number (design target: a dumb bot should lose the large majority of games; see intent note).
+- Rationale / forward note: outcome-split metrics become increasingly load-bearing as later builds add asynchronous units, more abilities, and environment effects — those create more distinct win/loss paths that a blended average would smear together.
+
+## MK3.6 Visual / UX increments (limited, intentional)
+
+Small, deliberate polish — kept minimal on purpose so a future real "visual pass" is informed by accumulated real-play experience rather than done all at once. Still whitebox scope.
+
+- **Special-tile indicators centered in the shape:** move the countdown number / special-tile indicator to the CENTER of the tile's shape glyph (rather than a corner/overlay position), for better legibility.
+- **Black outline on white (player-owned) special items:** player-owned special tiles use white markers (per 1.11); add a black outline around those white markers so they read clearly against light tile fills. Expanding the glyph a few px or allowing minor overlap to fit the outline is acceptable.
+- **Font sizing paradigm flip:** change the text-sizing approach throughout from "as small as we can get away with" to "as large as possible without overflowing the designated area." Fonts should fill their allotted space. This applies to all UI text (HP, charge meters, labels, metrics rows, dialogs).
+- **Explicitly deferred:** the larger layout overhaul (moving the board to the TOP, stacking the 4+4 units vertically along the screen edges) is NOT part of MK3 — it is a bigger re-architecture best done once mechanics stabilize. Do not attempt it this pass.
+
+## MK3 — Out of scope (parked, unchanged from prior roadmap intent)
+
+Not in MK3; listed so the boundary is explicit. Combat-identity pivots (matches-deal-no-damage-without-Buffer; Buffer-as-permanent-buff); the charging-model exploration (cap-and-discard vs carryover vs bigger pools) and overcharge-to-effect-tiers (which would reopen the charge cap); wildcard/critical-TILE spawning (the MPQ persistent-object mechanic, distinct from blob matching); the utility-only hero-ability redesign and neutral-as-control-rods identity; board-alteration abilities; AI difficulty tiers; and all superstructure (map, build selection, progression, dongles). See Section 2.
+
+---
+
 # Section 2: Roadmap (DO NOT BUILD — CONTEXT ONLY)
 
 This section exists so future work has a documented home and so deferred ideas aren't lost. Nothing in this section should be implemented as part of the PoC. If anything here appears to conflict with Section 1, Section 1 governs for this build.
@@ -630,4 +694,79 @@ Before coding, tell me: any clarifying questions, and a one-line plan for where
 the metrics collector will hook into the existing resolver. Then wait for my
 go-ahead. After building, confirm the shake no longer deals damage/charge and
 that metrics display correctly on both a win and a loss.
+```
+
+# Coding Agent Prompt — MK3 Iteration (Ready to Paste)
+
+```
+This is a third iteration on the existing, working "Breach" build in this repo.
+Section 1 (PoC) and Section 1-MK2 are already complete, verified, and committed.
+Now implement "Section 1-MK3: Combat Cohesion Pass" from breach-poc-requirements.md.
+
+Read Section 1-MK3 in full before making any changes, including its intent note
+(the goal is combat COHESION and a second tuning dataset — NOT perfect balance;
+do not chase balance, do not add mechanics beyond what is listed).
+
+The changes, by area:
+
+1. MK3.1 CONSTANTS — halve match damage (low 2->1, high 4->2, neutral 3->2;
+   charge values unchanged); Attacker damage 15->30; bomb countdown 3->2 and
+   blast radius from 4-orthogonal to the full 3x3 (8 surrounding tiles + the
+   bomb tile). Add a named constant for the blast pattern. All existing blast
+   rules unchanged.
+
+2. MK3.2 DISABLER — the PLAYER's Disabler is now player-TARGETABLE (player picks
+   which enemy minion to discharge; use existing ability-input conventions from
+   1.12; targeting UX is yours to design well). The ENEMY's Disabler uses a
+   fixed PREDICTABLE rule: hit the player's highest-COST program that has any
+   charge, tie-break by highest raw charge then random. Document the rule in
+   comments. This is the only non-trivial code change in the pass.
+
+3. MK3.3 BLOB/MERGE MATCHING — port the proven straight-line-detect ->
+   merge-adjacent-same-type-matches algorithm (from the Match3Single reference
+   already discussed). REQUIRED ADAPTATION: tiles here have INDEPENDENT color
+   and shape and match on either axis, so base-match detection runs PER AXIS
+   (color-runs and shape-runs separately), and the merge step is AXIS-AWARE —
+   color-matches and shape-matches are different match-types and must NOT merge
+   into each other; only same-axis same-value matches merge. RECOMMENDED: wrap
+   the merge in a repeat-until-no-merges loop (~3 lines) to handle multi-way
+   merge chains. DO NOT micro-optimize the O(n^2) merge — it is correct and
+   negligible at 8x8; keep it naive. This makes non-linear 4/5 matches exist so
+   the existing 1.5x crit finally fires. Confirm per-tile dedup + highest-
+   multiplier-wins still hold on blob results.
+
+4. MK3.4 BOT AI — in the smoke/batch harness only, upgrade the bot from
+   first-found-move to: prefer any move that makes a 4-match (or larger / a
+   line clear), else fall back to first-found. NO cascade look-ahead, NO
+   5-prioritization, NO board evaluation. The bot must stay a deliberately weak
+   floor indicator.
+
+5. MK3.5 METRICS — extend the batch/headless harness to SPLIT all aggregated
+   metrics by battle OUTCOME (won vs lost), and surface the overall bot
+   win/loss rate prominently as the primary calibration number. Still
+   logic-layer / event-sourced. The single-battle game-over screen is unchanged.
+
+6. MK3.6 VISUALS (whitebox, minimal) — center the special-tile indicator/
+   countdown in the shape glyph; add a black outline around white player-owned
+   markers (minor glyph expansion/overlap OK); flip font sizing everywhere to
+   "as large as fits the designated area" rather than as small as possible. DO
+   NOT do the board-to-top / units-on-edges layout overhaul — that is deferred.
+
+CRITICAL:
+- These are DELTAS on top of the existing build. Do not rebuild working systems.
+  Where MK3 conflicts with an earlier section, MK3 wins; everything else stays.
+- NO new mechanics beyond those listed. No combat-identity pivots, no charging-
+  model changes, no overcharge, no wildcard tiles, no hero-ability redesign —
+  all explicitly parked (see MK3 "Out of scope").
+- Keep logic/render separation intact. Blob matching and metrics live in the
+  logic layer. Constants stay in the single constants module.
+- Keep MK2 as a clean restore point (it is committed) — these changes should be
+  reviewable as their own diff.
+
+Before writing code, tell me: (1) any clarifying questions; (2) your one-line
+plan for the two-axis base-match detection (how color-runs and shape-runs are
+scanned and tagged so the merge stays axis-aware); and (3) your one-line plan
+for the player Disabler targeting UX. Then wait for my go-ahead. After building,
+report: crit share of match damage (should rise well above ~0.2%), the bot
+win/loss rate, and confirm the outcome-split metrics render in the batch output.
 ```
