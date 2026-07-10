@@ -462,6 +462,46 @@ Not in MK3; listed so the boundary is explicit. Combat-identity pivots (matches-
 
 ---
 
+# Section 1-MK4: Persistence, Logging & Visual Pass (BUILD THIS, ON TOP OF MK3)
+
+Assumes Section 1, MK2, and MK3 are built and working. Each item is a DELTA against the current build — where MK4 conflicts with an earlier section, MK4 governs; everything not mentioned is unchanged. Section 2 (Roadmap) remains out of scope.
+
+**Intent (context, not a build instruction):** Add battle persistence (so a phone backgrounding the game doesn't lose the in-progress battle), lightweight logging (to accumulate real-play data and per-turn debugging records for the more complex mechanics coming next), and one visual fix. No gameplay/combat changes in MK4.
+
+## MK4.1 Save / restore (continuous autosave of in-progress battle)
+
+- Continuously autosave the in-progress battle to browser storage after each state change (or at minimum each turn). On load, the game can restore that exact state. This is invisible/automatic — no save menu.
+- Serialize the LOGIC-LAYER game state to JSON. The renderer rebuilds from restored state. (This works only because logic/render are separated — keep it that way. If any state lives in the renderer, move it into the logic layer.)
+- **Storage:** agent's choice by data size; default to localStorage. Save state (one in-progress battle) is small; if logs grow large they may use IndexedDB — the save and the logs may live in different stores.
+- **Clear on battle-over:** the save is cleared at the MOMENT a win/loss state is reached (not on next load), so returning after a finished battle never resumes a completed battle.
+- **Save-format version stamp:** write a version identifier into the saved state. On attempting to resume, if the stamp is missing or from an incompatible version, treat it as no-valid-save (do not crash) — fail gracefully to a fresh start. (MK5 will change the state shape, so this matters immediately.)
+
+## MK4.2 Continue option (minimal front-end delta)
+
+- Add a **Continue** affordance to the EXISTING scenario-selector screen (do NOT build a separate title/main-menu screen this pass).
+- Continue is shown ONLY when a valid, version-compatible, in-progress save exists; it resumes that battle. Otherwise it is hidden/disabled.
+- Picking a scenario / starting a New Game WIPES any resident save and starts fresh — this doubles as the escape hatch for a wedged or corrupt save (no separate clear-save button needed).
+
+## MK4.3 Logging (logic-layer, event-sourced)
+
+Reuse the SAME logic-layer event stream the metrics collector already consumes (MK2.3) — do not build a parallel event pipeline.
+
+- **Tier 1 — final-metrics log:** on each completed battle, append its final metrics to a persisted, append-only log for later analysis.
+- **Tier 2 — per-turn action+outcome log:** record one entry per turn capturing the action(s) taken and their outcome (damage, charge changes, HP after, abilities fired, detonations, etc.), sufficient to reconstruct what happened that turn without a full board snapshot.
+- **Tier 3 — full board-state-per-turn snapshots: PARKED.** Do not build. Noted only because the MK4.1 serializer makes it cheap to add later when interaction complexity demands it.
+- **Log presentation is OUT OF SCOPE:** no in-app log viewer, charts, or export UI. Record to storage only; logs are read via devtools or a simple console-dump. Do not build log-viewing UI.
+
+## MK4.4 Visual — gems as colored icons
+
+- Change tile rendering from "a shape glyph on a colored field" to "a colored ICON" per the reference-game convention: enlarge the shape so it fills as much of the tile as possible, pushing the shape's defining silhouette toward the tile's edges. This leaves the tile CENTER visually free so the centered special-tile/countdown indicators (from MK3.6) no longer overlap and obscure the shape.
+- Still whitebox scope — this is a legibility change using primitive shapes, not an art pass. Neutral tiles unchanged (static texture).
+
+## MK4 — Out of scope (parked)
+
+Not in MK4: Tier 3 board snapshots; any log-viewing UI; a full title/main-menu screen; and everything from the MK5+ roadmap (enemy matching, special-tile hardening, cascade-depth-as-ability, combat-model experiments, superstructure). See Section 2.
+
+---
+
 # Section 2: Roadmap (DO NOT BUILD — CONTEXT ONLY)
 
 This section exists so future work has a documented home and so deferred ideas aren't lost. Nothing in this section should be implemented as part of the PoC. If anything here appears to conflict with Section 1, Section 1 governs for this build.
@@ -769,4 +809,59 @@ scanned and tagged so the merge stays axis-aware); and (3) your one-line plan
 for the player Disabler targeting UX. Then wait for my go-ahead. After building,
 report: crit share of match damage (should rise well above ~0.2%), the bot
 win/loss rate, and confirm the outcome-split metrics render in the batch output.
+```
+
+# Coding Agent Prompt — MK4 Iteration (Ready to Paste)
+
+```
+This is a fourth iteration on the existing, working "Breach" build in this repo.
+Sections 1, MK2, and MK3 are complete, verified, and committed. Now implement
+"Section 1-MK4: Persistence, Logging & Visual Pass" from breach-poc-requirements.md.
+
+Read Section 1-MK4 in full first. No gameplay/combat changes in this pass — it is
+persistence, logging, and one visual fix only.
+
+1. MK4.1 SAVE/RESTORE — continuously autosave the in-progress battle (serialize
+   the LOGIC-LAYER state to JSON; renderer rebuilds on restore). Default storage
+   localStorage; your choice if size warrants IndexedDB (save and logs may split
+   stores). CLEAR the save the moment a win/loss is reached (not on next load).
+   Write a save-format VERSION STAMP into the state; on resume, an incompatible/
+   missing version is treated as no-valid-save and fails gracefully (never crash).
+
+2. MK4.2 CONTINUE — add a Continue affordance to the EXISTING scenario selector
+   (do NOT build a separate title screen). Show Continue only when a valid,
+   version-compatible in-progress save exists; it resumes that battle. Starting a
+   New Game / picking a scenario WIPES any resident save (this is also the
+   escape hatch for a corrupt save — no separate clear button).
+
+3. MK4.3 LOGGING — reuse the SAME logic-layer event stream the metrics collector
+   already uses (do not build a parallel pipeline). Tier 1: append each completed
+   battle's final metrics to a persisted append-only log. Tier 2: record one
+   action+outcome entry per turn, enough to reconstruct the turn without a full
+   board snapshot. Tier 3 (full board snapshots): DO NOT BUILD, parked. Log
+   PRESENTATION (viewers/charts/export UI): OUT OF SCOPE — record only, read via
+   devtools/console.
+
+4. MK4.4 VISUAL — render tiles as colored ICONS: enlarge the shape to fill the
+   tile so its silhouette sits near the edges, freeing the tile CENTER so the
+   centered special/countdown indicators (MK3.6) no longer overlap the shape.
+   Whitebox scope; neutral tiles unchanged.
+
+CRITICAL:
+- DELTAS on top of the existing build. Do not rebuild working systems. Where MK4
+  conflicts with an earlier section, MK4 wins; everything else stays.
+- NO combat/gameplay changes. Persistence + logging + one visual fix only.
+- Keep logic/render separation intact — save serialization and logging live in
+  the logic layer. Constants stay in the constants module.
+- Reuse the existing metrics event stream for logging; do not create a second one.
+- Keep MK3 as a clean committed restore point.
+- NOTE: enemy starting HP is manually set to 350 in constants — leave it as-is.
+
+Before coding, tell me: (1) any clarifying questions; (2) a one-line plan for
+what the serialized save state includes and where the version stamp lives; and
+(3) confirmation that Tier 1/Tier 2 logging will hook the existing metrics event
+stream, not a new one. Then wait for my go-ahead. After building, verify: a
+mid-battle reload resumes exactly (board, HP, charges, countdowns, buffs); a
+finished battle clears the save so Continue is absent; an incompatible-version
+save fails gracefully; and both log tiers are written and readable via console.
 ```
