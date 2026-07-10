@@ -9,7 +9,9 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "smoke": "tsx scripts/smoke.ts",
-    "batch": "tsx scripts/batch.ts"
+    "batch": "tsx scripts/batch.ts",
+    "logs:dump": "node scripts/logs.cjs dump",
+    "logs:wipe": "node scripts/logs.cjs wipe"
   },
   "devDependencies": {
     "typescript": "^5.6.0",

@@ -55,6 +55,7 @@ export interface GameState {
   scenario: Scenario;
   turn: number;
   metrics: BattleMetrics; // MK2.3 — accumulated in the logic layer
+  battleId: string; // MK4.3 — tags this battle's log entries; survives save/restore
 }
 
 // ---- Render-facing snapshots & events (plain serializable data) ----
@@ -100,7 +101,8 @@ export type GameEvent =
   | { t: 'damage'; target: Side; amount: number; label: string; source: 'match' | 'attacker' | 'bomb'; critExtra?: number; buffBonus?: number }
   | { t: 'msg'; text: string }
   | { t: 'over'; winner: Side }
-  // metrics-only events (no visual representation; renderer skips them)
+  // metrics/logging-only events (no visual representation; renderer skips them)
+  | { t: 'shakeUsed' }
   | { t: 'ability'; side: Side; unit: UnitType; drained?: number }
   | { t: 'chargeWaste'; side: Side; unit: UnitType; amount: number }
   | { t: 'autoReshuffle' }

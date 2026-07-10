@@ -398,11 +398,12 @@ export class View {
         this.msgText = ev.winner === 'player' ? 'Enemy down!' : 'You are down!';
         this.msgUntil = now + 3000;
         break;
-      // metrics-only events (MK2.3): nothing to draw, consume instantly
+      // metrics/logging-only events (MK2.3/MK4.3): nothing to draw
       case 'ability':
       case 'chargeWaste':
       case 'autoReshuffle':
       case 'cascadeDepth':
+      case 'shakeUsed':
         dur = 1;
         break;
     }
@@ -526,12 +527,10 @@ export class View {
     ctx.lineWidth = targetable ? 3 : charged ? 2 : 1;
     ctx.strokeRect(r.x + 1.5, r.y + 1.5, r.w - 3, r.h - 3);
 
-    // binding swatch (color square with shape glyph, MK2.1 style)
+    // binding swatch: colored icon, matching the MK4.4 tile style
     const sw = 14;
+    traceShape(ctx, u.shape, r.x + 4 + sw / 2, r.y + 4 + sw / 2, sw * 0.55);
     ctx.fillStyle = COLOR_HEX[u.color];
-    ctx.fillRect(r.x + 4, r.y + 4, sw, sw);
-    traceShape(ctx, u.shape, r.x + 4 + sw / 2, r.y + 4 + sw / 2, sw * 0.36);
-    ctx.fillStyle = '#ffffff';
     ctx.fill();
     ctx.strokeStyle = DARK_HEX[u.color];
     ctx.lineWidth = 1;
@@ -662,18 +661,17 @@ export class View {
       ctx.drawImage(this.noise, px + 1, py + 1, c - 2, c - 2);
       ctx.imageSmoothingEnabled = true;
     } else {
-      // MK2.1: gem fill + 1px darker-same-color tile border, and the shape as
-      // a WHITE fill with a 1px darker-same-color outline for legibility on
-      // light tiles.
+      // MK4.4: the tile IS a colored icon — the shape enlarged so its
+      // silhouette sits near the tile edges (center stays free for the
+      // MK3.6 centered special badges), filled with the gem color and
+      // outlined in its darker shade. Supersedes MK2.1's white-on-colored-
+      // field style (the field is gone, so white fill lost its purpose).
+      traceShape(ctx, view.shape!, cx, cy, c * 0.46);
       ctx.fillStyle = COLOR_HEX[view.color!];
-      ctx.fillRect(px + 1, py + 1, c - 2, c - 2);
-      ctx.strokeStyle = DARK_HEX[view.color!];
-      ctx.lineWidth = 1;
-      ctx.strokeRect(px + 1.5, py + 1.5, c - 3, c - 3);
-      traceShape(ctx, view.shape!, cx, cy, c * 0.32);
-      ctx.fillStyle = '#ffffff';
       ctx.fill();
-      ctx.stroke(); // same path, same 1px dark stroke style
+      ctx.strokeStyle = DARK_HEX[view.color!];
+      ctx.lineWidth = 2;
+      ctx.stroke();
     }
 
     if (view.special) {

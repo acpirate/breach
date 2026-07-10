@@ -9,10 +9,21 @@ import {
   UNIT_DEFS,
 } from './logic/constants';
 import { Game } from './logic/game';
+import { LOG_VERSION } from './logic/logger';
 import { BattleMetrics } from './logic/metrics';
+import { deserializeGame, serializeGame } from './logic/save';
 import { Pt, Scenario, Side, UNIT_ORDER, gridViewOf } from './logic/types';
 import { attachInput } from './render/input';
 import { Hud, View } from './render/view';
+import {
+  appendMetricsLog,
+  appendTurnLogs,
+  clearBattleSave,
+  loadBattleJson,
+  readLogs,
+  saveBattle,
+  wipeLogs,
+} from './storage';
 
 const canvas = document.getElementById('game') as HTMLCanvasElement;
 const overlay = document.getElementById('overlay') as HTMLDivElement;
@@ -145,13 +156,20 @@ function hideDialog(): void {
 
 function showTitle(): void {
   game = null;
-  showDialog('BREACH — PoC', 'Select scenario', [
-    ['Normal (150 HP vs 150 HP)', () => void startBattle('normal')],
-    ['Forced loss (1 HP vs 150 HP)', () => void startBattle('forcedLoss')],
-  ]);
+  const buttons: [string, () => void][] = [];
+  // MK4.2: Continue appears only when a valid, version-compatible,
+  // in-progress save exists
+  const resumable = deserializeGame(loadBattleJson());
+  if (resumable) {
+    buttons.push([`Continue (turn ${resumable.state.turn}, ${resumable.state.scenario === 'normal' ? 'normal' : 'forced loss'})`, () => void resumeBattle()]);
+  }
+  buttons.push([`Normal (${STARTING_HP_PLAYER_NORMAL} HP vs ${STARTING_HP_ENEMY} HP)`, () => void startBattle('normal')]);
+  buttons.push([`Forced loss (${STARTING_HP_PLAYER_LOW_SCENARIO} HP vs ${STARTING_HP_ENEMY} HP)`, () => void startBattle('forcedLoss')]);
+  showDialog('BREACH — PoC', 'Select scenario', buttons);
 }
 
 async function startBattle(s: Scenario): Promise<void> {
+  clearBattleSave(); // MK4.2: starting fresh wipes any resident save (also the corrupt-save escape hatch)
   scenario = s;
   hideDialog();
   game = new Game(s);
@@ -162,7 +180,48 @@ async function startBattle(s: Scenario): Promise<void> {
   busy = true;
   await view.play(game.startPlayerPhase());
   busy = false;
+  afterAction();
   maybeGameOver();
+}
+
+async function resumeBattle(): Promise<void> {
+  const g = deserializeGame(loadBattleJson());
+  if (!g) {
+    showTitle(); // save vanished/corrupted since the dialog was built
+    return;
+  }
+  hideDialog();
+  game = g;
+  scenario = g.state.scenario;
+  selection = null;
+  targeting = false;
+  view.reset(gridViewOf(game.state.board));
+  view.setSelection(null);
+  console.info(`[breach] state restored (turn ${game.state.turn})`);
+  busy = true;
+  await view.play([{ t: 'msg', text: `Battle resumed — turn ${game.state.turn}` }]);
+  busy = false;
+}
+
+// MK4: after every completed action — drain turn logs, then autosave (stable
+// point) or, the moment the battle is over, clear the save and append the
+// Tier 1 metrics log entry.
+function afterAction(): void {
+  if (!game) return;
+  appendTurnLogs(game.drainTurnLogs());
+  if (game.state.winner) {
+    clearBattleSave();
+    appendMetricsLog({
+      v: LOG_VERSION,
+      battleId: game.state.battleId,
+      endedAt: new Date().toISOString(),
+      scenario: game.state.scenario,
+      winner: game.state.winner,
+      metrics: game.state.metrics,
+    });
+  } else if (game.state.phase === 'playerPre') {
+    saveBattle(serializeGame(game.state), game.state.turn);
+  }
 }
 
 function maybeGameOver(): void {
@@ -190,6 +249,7 @@ async function doSwap(a: Pt, b: Pt): Promise<void> {
   if (r.matched) {
     if (!game.state.winner) await view.play(game.runEnemyPhase());
     if (!game.state.winner) await view.play(game.startPlayerPhase());
+    afterAction();
   }
   busy = false;
   maybeGameOver();
@@ -241,6 +301,7 @@ attachInput(canvas, view, {
     if (!events.length) return;
     busy = true;
     void view.play(events).then(() => {
+      afterAction();
       busy = false;
       maybeGameOver();
     });
@@ -252,6 +313,7 @@ attachInput(canvas, view, {
     if (!events.length) return;
     busy = true;
     void view.play(events).then(() => {
+      afterAction();
       busy = false;
       maybeGameOver();
     });
@@ -266,6 +328,7 @@ attachInput(canvas, view, {
     if (!events.length) return;
     busy = true;
     void view.play(events).then(() => {
+      afterAction();
       busy = false;
       maybeGameOver();
     });
@@ -283,3 +346,14 @@ attachInput(canvas, view, {
 });
 
 showTitle();
+
+// MK4.3 console-dump helpers (sanctioned log access — no viewing UI):
+//   breachLogs()               -> { metrics: [...], turns: [...] }
+//   breachWipe({ save: true }) -> wipes logs (and optionally the battle save)
+const helpers = window as unknown as Record<string, unknown>;
+helpers.breachLogs = () => readLogs();
+helpers.breachWipe = (opts?: { save?: boolean }) => {
+  wipeLogs();
+  if (opts?.save) clearBattleSave();
+  console.info(`[breach] logs wiped${opts?.save ? ' (and battle save)' : ''}`);
+};

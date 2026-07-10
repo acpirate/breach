@@ -5,6 +5,7 @@ export interface RNG {
   int(n: number): number; // integer in [0, n)
   pick<T>(a: T[]): T;
   shuffle<T>(a: T[]): T[]; // in-place Fisher-Yates, returns the same array
+  getState(): number; // MK4.1: internal state, so a saved battle resumes deterministically
 }
 
 export function makeRNG(seed?: number): RNG {
@@ -27,5 +28,8 @@ export function makeRNG(seed?: number): RNG {
       }
       return a;
     },
+    // makeRNG(seed) treats its argument as the raw internal state, so
+    // makeRNG(rng.getState()) resumes the exact sequence.
+    getState: () => s,
   };
 }

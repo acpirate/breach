@@ -13,6 +13,7 @@ import {
   UNIT_DEFS,
 } from './constants';
 import { generateInitialBoard, reshuffleBoard, swap } from './board';
+import { TurnLogEntry, TurnLogger } from './logger';
 import { detectMatches } from './match';
 import { consumeEvents, createBattleMetrics } from './metrics';
 import { addUnitCharge, buffBonus, dealDamage, resolveCascades, resolveDetonation } from './resolve';
@@ -33,11 +34,15 @@ import {
 
 export class Game {
   state: GameState;
+  private logger: TurnLogger;
+  private pendingTurnLogs: TurnLogEntry[] = [];
 
   constructor(scenario: Scenario, seed?: number) {
     const rng = makeRNG(seed);
     const gen = { rng, nextId: 1 };
     const board = generateInitialBoard(gen);
+    const battleId = `b${Date.now().toString(36)}-${scenario}`;
+    this.logger = new TurnLogger(battleId);
     this.state = {
       board,
       rng,
@@ -57,15 +62,38 @@ export class Game {
       scenario,
       turn: 1,
       metrics: createBattleMetrics(),
+      battleId,
     };
   }
 
-  // MK2.3 — every event batch a public action produces is routed through the
-  // logic-layer metrics collector before being handed to the renderer.
+  // MK4.1 — rebuild a Game from a deserialized (already validated) state.
+  // Bypasses the constructor's board generation; the turn logger resumes
+  // under the same battleId (the interrupted turn's partial entry is lost,
+  // which is acceptable for Tier 2).
+  static restore(state: GameState): Game {
+    const g = Object.create(Game.prototype) as Game;
+    g.state = state;
+    g.logger = new TurnLogger(state.battleId);
+    g.pendingTurnLogs = [];
+    return g;
+  }
+
+  // MK4.3 — the orchestrator drains finalized per-turn log entries after each
+  // action and hands them to the platform storage adapter.
+  drainTurnLogs(): TurnLogEntry[] {
+    const out = this.pendingTurnLogs;
+    this.pendingTurnLogs = [];
+    return out;
+  }
+
+  // MK2.3/MK4.3 — every event batch a public action produces is routed
+  // through the logic-layer metrics collector AND the turn logger (same
+  // stream, no parallel pipeline) before being handed to the renderer.
   private collect(events: GameEvent[]): GameEvent[] {
     consumeEvents(this.state.metrics, events);
     this.state.metrics.turns = this.state.turn;
     this.state.metrics.winner = this.state.winner;
+    this.pendingTurnLogs.push(...this.logger.consume(this.state, events));
     return events;
   }
 
@@ -126,6 +154,7 @@ export class Game {
     if (s.phase !== 'playerPre' || s.shakeCharge < BOARD_SHAKE_COST) return events;
     s.shakeCharge -= BOARD_SHAKE_COST;
     reshuffleBoard(s);
+    events.push({ t: 'shakeUsed' }); // logging-only marker (MK4.3)
     events.push({ t: 'msg', text: 'Board shake!' });
     events.push({ t: 'board', grid: gridViewOf(s.board) });
     return this.collect(events);

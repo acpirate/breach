@@ -12,6 +12,17 @@ npm run batch      # headless batch: 100 bot-played battles, aggregate metrics r
 npm run typecheck  # tsc --noEmit
 ```
 
+## MK4 revisions (Section 1-MK4 — Persistence, Logging & Visual Pass)
+
+No gameplay changes. Additions:
+
+- **MK4.1 Save/restore:** the in-progress battle autosaves to localStorage at every stable point (battle start, after each ability, after each completed turn). `src/logic/save.ts` serializes the full logic-layer state — board, HP, charges, countdowns, metrics, and the RNG's internal state (resumes are deterministic) — in a `{version: "mk4", state}` envelope. Missing/incompatible/corrupt saves fail gracefully to a fresh start. The save is cleared the moment a battle ends. Console logs `[breach] state saved/restored (turn N)`.
+- **MK4.2 Continue:** the scenario selector shows a Continue button only when a valid, version-compatible in-progress save exists; starting any new game wipes the resident save (doubles as the corrupt-save escape hatch). Quit mid-battle keeps the save, so Continue reappears.
+- **MK4.3 Logging:** `src/logic/logger.ts` consumes the same event stream as the metrics collector (no second pipeline). Tier 1: final metrics per completed battle. Tier 2: one action+outcome entry per turn. All entries tagged `v: "mk4"`. Capped at `MAX_METRIC_LOG_ENTRIES`/`MAX_TURN_LOG_ENTRIES` (oldest evicted). Tier 3 (board snapshots) parked. Access:
+  - Browser console: `breachLogs()` to dump, `breachWipe({save: true})` to wipe.
+  - Dev-server sink: in dev, entries also POST to a Vite middleware that appends them to `logs/breach-logs.jsonl` on the dev machine — this captures logs from a phone playing over the LAN. `npm run logs:dump` pretty-prints to `logs/breach-logs.txt`; `npm run logs:wipe` deletes the server files.
+- **MK4.4 Gems as colored icons:** tiles render as enlarged colored shapes (silhouette near the tile edges, darker-shade outline) instead of glyphs on colored fields, leaving the center free for the special-tile badges. Supersedes MK2.1's white-fill rule. Neutral static tiles unchanged.
+
 ## MK3 revisions (Section 1-MK3 — Combat Cohesion Pass)
 
 - **MK3.1 Constants:** match damage halved (low 1 / high 2 / neutral 2; charge unchanged); `ATTACKER_DAMAGE` 30; bomb fuse 2 turns and blast expanded to the full 3×3 (`BOMB_BLAST_OFFSETS` named constant).

@@ -6,6 +6,7 @@ import { findValidMove, swap } from '../src/logic/board';
 import { BOARD_HEIGHT, BOARD_SHAKE_COST, BOARD_WIDTH, UNIT_DEFS } from '../src/logic/constants';
 import { Game } from '../src/logic/game';
 import { detectMatches } from '../src/logic/match';
+import { deserializeGame, serializeGame } from '../src/logic/save';
 import { Scenario } from '../src/logic/types';
 import { botFireAbilities, findBotMove } from './bot';
 
@@ -123,8 +124,48 @@ function runScenario(scenario: Scenario, seed: number): void {
   );
 }
 
+// MK4.1: save/restore round trip — headless, pure logic (no storage APIs)
+function testSaveRoundTrip(): void {
+  const g = new Game('normal', 42);
+  g.startPlayerPhase();
+  for (let i = 0; i < 3 && !g.state.winner; i++) {
+    const mv = findBotMove(g.state.board);
+    assert(mv, 'move available');
+    g.attemptSwap(mv.a, mv.b);
+    if (!g.state.winner) g.runEnemyPhase();
+    if (!g.state.winner) g.startPlayerPhase();
+  }
+  assert(!g.state.winner, 'battle still in progress at save point');
+  const json = serializeGame(g.state);
+  const r = deserializeGame(json);
+  assert(r, 'valid save must deserialize');
+  assert(serializeGame(r.state) === json, 'restored state must re-serialize identically');
+  assert(r.state.turn === g.state.turn && r.state.battleId === g.state.battleId, 'turn/battleId survive');
+  // the restored game must play to completion under the bot
+  let safety = 0;
+  while (!r.state.winner && safety++ < 600) {
+    botFireAbilities(r);
+    if (r.state.winner) break;
+    const mv = findBotMove(r.state.board);
+    assert(mv, 'restored game has moves');
+    r.attemptSwap(mv.a, mv.b);
+    if (!r.state.winner) r.runEnemyPhase();
+    if (!r.state.winner) r.startPlayerPhase();
+  }
+  assert(r.state.winner, 'restored game plays to completion');
+  // graceful failure paths (never crash, never resume)
+  const tampered = JSON.parse(json) as { version: string };
+  tampered.version = 'mk999';
+  assert(deserializeGame(JSON.stringify(tampered)) === null, 'incompatible version -> no save');
+  assert(deserializeGame('{"not":"a save"}') === null, 'wrong shape -> no save');
+  assert(deserializeGame('garbage{{{') === null, 'corrupt JSON -> no save');
+  assert(deserializeGame(null) === null, 'missing -> no save');
+  console.log('save round-trip OK');
+}
+
 for (let seed = 1; seed <= 10; seed++) {
   runScenario('normal', seed);
   runScenario('forcedLoss', 1000 + seed);
 }
+testSaveRoundTrip();
 console.log('SMOKE OK');
