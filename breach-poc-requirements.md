@@ -502,6 +502,81 @@ Not in MK4: Tier 3 board snapshots; any log-viewing UI; a full title/main-menu s
 
 ---
 
+# Section 1-MK5: Enemy Matching + Configurable Battle Modifiers (BUILD THIS, ON TOP OF MK4)
+
+Assumes Sections 1, MK2, MK3, MK4 are built and working. Each item is a DELTA against the current build — where MK5 conflicts with an earlier section, MK5 governs; everything not mentioned is unchanged. Section 2 (Roadmap) remains out of scope.
+
+**Intent (context, not a build instruction):** Two things. (1) The headline mechanic: the enemy stops being a passive threat-clock and becomes a real opponent that matches on the shared board — testing whether a matching enemy *feels* like an opponent. (2) A set of defaulted-off, per-battle configuration flags that turn several parked design questions into cheap, flippable experiments, and which double as the skeleton for future run-variety ("battle types" with different rules). No new abilities, no unit HP/KO, no action-point economy — those are separate future work.
+
+## MK5.1 Enemy matching (the headline mechanic)
+
+When enabled (see `ENEMY_MATCHING` flag in MK5.2), the enemy becomes a **pure symmetric mirror** of the player:
+
+- **The enemy's fixed +N/turn charge clock is REMOVED.** All enemy units now charge from MATCHING, exactly as the player's programs do (per-tile, per the existing flat charge rules). The `*_ENEMY_CHARGE_RATE` constants become inert when this flag is on.
+- **Same bindings:** enemy units charge off the SAME color+shape pairs as the player's corresponding programs. Both sides therefore compete for the same tiles on the shared board. This is intentional — the tile contention IS the interactivity being tested.
+- **Shared board:** unchanged. One grid, both sides match on it.
+- **The enemy turn becomes a REAL turn**, structurally identical to the player's: fire any/all charged abilities (pre-match) → make exactly one match → the match and its cascades resolve (damage, charge, detonations) → turn passes. The enemy's match resolves under all the same rules as the player's (per-destroyed-tile dedup, tier/crit multipliers, blob merging, buff bonuses, etc.).
+- **Enemy brain = the EXISTING bot** (the MK3.4 "prefer a 4-match if available, else first-found" logic), repointed to play for the enemy side. Do NOT write a new AI. The move-selection heuristic is side-agnostic; parameterize the existing bot by which side it is playing for. The bot's tier is therefore also the enemy's difficulty knob (future work — not a setting in this pass).
+- When `ENEMY_MATCHING` is OFF (the default), the enemy behaves exactly as it does today: fixed charge clock, no board matching. Both paths must work.
+
+## MK5.2 Battle configuration flags
+
+Four per-battle flags. **All defaults preserve current behavior EXCEPT `HACKER_BONUS_ENABLED`, which defaults to OFF (a deliberate change — see below).**
+
+| Flag | Default | Effect when set |
+|---|---|---|
+| `ENEMY_MATCHING` | **OFF** | Enemy matches on the shared board and charges from matches (MK5.1). Off = current timer-clock enemy. |
+| `HACKER_BONUS_ENABLED` | **OFF** (changed) | On = the Hacker's +`HACKER_BONUS_DAMAGE`/+`HACKER_BONUS_CHARGE` bonus on its designated high color applies (current behavior). **Off = no Hacker color bonus at all** — every color is symmetric. |
+| `SINGLE_AXIS_PAYOUT` | **OFF** | On = a match pays out only on the axis it was matched on: a COLOR-match charges/damages only via color; a SHAPE-match only via shape. Off = current behavior (a match pays out on both axes). |
+| `MAX_CASCADE_STEPS` | **Infinite** | An integer cap on cascade depth. When capped at N, tiles still fall and refill after step N, but those falling tiles produce NO new matches (resolution stops). See MK5.3 for the 0 case and the UI. |
+
+**Why `HACKER_BONUS_ENABLED` defaults OFF:** the Hacker's flat color bonus is an arbitrary placeholder that distorts the charge/damage economy (it is a major reason the Bomber over-charges, and it makes one color asymmetric). Defaulting it off gives a clean, symmetric baseline for reading data. It is preserved as a flag so build-identity effects can be revisited later. NOTE: this means the first battle after MK5 ships will play differently from MK4 even before any flag is touched — this is intended, not a bug.
+
+**`SINGLE_AXIS_PAYOUT` — required edge-case ruling (state explicitly, do not guess):** a single destroyed tile may participate in BOTH a color-match and a shape-match in the same resolution (they are separate matches — cross-axis matches never merge — but the tile belongs to both). Under dedup the tile is destroyed once. Under `SINGLE_AXIS_PAYOUT`, that tile **pays out on BOTH axes**, because the flag restricts payout PER MATCH, not per tile: the color-match pays its tiles via color, the shape-match pays its tiles via shape, and a tile in both is paid by both matches. Do not "fix" this into a single payout.
+
+## MK5.3 Config UI
+
+**Menu / scenario scene — configure the battle before starting:**
+- All four flags are settable client-side, per battle.
+- **Cascade cap control:** an **"Infinite?" toggle**. When ON (default), no cap. When OFF, an **integer input, range 0–9**, becomes active/visible.
+  - **0 is explicitly VALID and means ZERO cascades**: the initial match resolves, tiles fall and refill, but no falling tile produces a new match — the board goes inert after the first resolution. This is a real, intended game mode, not an error case.
+  - Internally, "infinite" must be a sentinel (null / -1 / Infinity), NOT a large integer.
+  - A 0–9 range is sufficient (observed cascades have topped out around 10; 9 vs. infinite is not meaningfully different in practice).
+- **"Reset to Defaults" button** — the ONLY thing that resets the config (see persistence below).
+
+**Battle scene — the existing pause/settings menu displays the ACTIVE config, read-only.** The player can always check which rules the current battle is running under. It is not editable mid-battle.
+
+## MK5.4 Config persistence & lifecycle
+
+- **Config persists across sessions** (store it alongside the save, e.g. localStorage). Nothing resets it implicitly.
+- **Returning to the menu does NOT reset it.** Navigation is not a reset.
+- **"Reset to Defaults" is the only explicit reset.**
+- **Restart (from the battle-conclusion screen) ALWAYS reuses the exact config of the battle just played**, unconditionally, regardless of what the menu config currently says. A restart is the same battle; its rules are part of its identity.
+
+**Config is part of the SAVE STATE (critical):**
+- The active config is serialized INTO the save at battle start. It is part of that battle's identity, not a global setting.
+- On **Continue**, the battle resumes under **the SAVE's config**, not the menu's current config. The save's config is **authoritative and immutable** for that battle's lifetime — do NOT merge, reconcile, or update it from the menu.
+- **If the save's config DIFFERS from the current menu config**, then on resuming that battle, **automatically open the existing pause/config panel at battle start**, with an explanatory line at the top — e.g. *"This battle is using the configuration it was started with, not your current settings."* — and the battle's actual active config displayed beneath it. The player must explicitly dismiss it to proceed. This is a forced **acknowledgment**, not a passive notice, so a tester cannot unknowingly play a battle under rules they think they changed.
+- This auto-open triggers **only when the configs actually differ**. A resume with a matching config starts normally, with no interruption.
+- When the battle ends the save clears (per MK4.1); the next new battle uses the MENU's config as normal.
+
+## MK5.5 Logging — stamp the config
+
+- **Every battle record — Tier 1 (final metrics) AND Tier 2 (per-turn) — must stamp the ACTIVE config** alongside the existing version stamp.
+- Rationale: once flags exist, a log entry is uninterpretable without knowing which rules were active. "Abilities were 60% of damage" means nothing if you don't know whether `SINGLE_AXIS_PAYOUT` was on. The config stamp is what makes cross-config comparison possible weeks later.
+
+## MK5.6 New metric — charge-source contention
+
+- Track, per side: **how often that side's matches/cascades destroyed tiles bound to the OTHER side's units** (i.e. tiles whose color or shape matches an opposing unit's binding).
+- Purpose: with `ENEMY_MATCHING` on and same bindings on a shared board, both sides fish the same tiles. If play feels swingy, this metric distinguishes *contention-driven* swing (each side strip-mining the other's charge sources, esp. via cascades) from mere *cascade-variance* swing. That distinction determines whether "different bindings" becomes the next experiment.
+- Logic-layer / event-sourced, same as all other metrics. Include it in the batch output and the game-over metrics display.
+
+## MK5 — Out of scope (parked)
+
+Not in MK5: action-point turn economy; no-match-damage mode; unit HP / knockout / debuffs; additional abilities per unit (deliberately deferred — until match/ability weight is settled, more abilities are "dangling keys"); a battle-type *authoring* system (the flags exist and are settable; battle-types-as-run-content comes later); AI difficulty tiers as a setting; per-side or ability-driven cascade rules; special-tile hardening; overcharge. See Section 2 and the design backlog.
+
+---
+
 # Section 2: Roadmap (DO NOT BUILD — CONTEXT ONLY)
 
 This section exists so future work has a documented home and so deferred ideas aren't lost. Nothing in this section should be implemented as part of the PoC. If anything here appears to conflict with Section 1, Section 1 governs for this build.
@@ -864,4 +939,101 @@ stream, not a new one. Then wait for my go-ahead. After building, verify: a
 mid-battle reload resumes exactly (board, HP, charges, countdowns, buffs); a
 finished battle clears the save so Continue is absent; an incompatible-version
 save fails gracefully; and both log tiers are written and readable via console.
+```
+
+# Coding Agent Prompt — MK5 Iteration (Ready to Paste)
+
+```
+This is a fifth iteration on the existing, working "Breach" build in this repo.
+Sections 1, MK2, MK3, and MK4 are complete, verified, and committed. Now implement
+"Section 1-MK5: Enemy Matching + Configurable Battle Modifiers" from
+breach-poc-requirements.md.
+
+Read Section 1-MK5 in full before making changes, including its intent note. This
+is the biggest build since the PoC. Two parts: (1) the enemy becomes a real
+matching opponent, and (2) four per-battle config flags that make several design
+questions cheaply testable.
+
+1. MK5.1 ENEMY MATCHING — when the ENEMY_MATCHING flag is on: remove the enemy's
+   fixed +N/turn charge clock; ALL enemy units charge from MATCHING, exactly like
+   the player's programs (same per-tile flat charge rules). Enemy units use the
+   SAME color+shape bindings as the player's corresponding programs (both sides
+   compete for the same tiles on the shared board — this contention is intentional).
+   The enemy turn becomes a REAL turn, structurally identical to the player's:
+   fire charged abilities pre-match -> make exactly one match -> resolve the match
+   and its cascades under all the same rules (dedup, tiers/crits, blob merging,
+   buffs). REUSE THE EXISTING BOT (the MK3.4 prefer-4-else-first-found logic) as
+   the enemy's brain — do NOT write a new AI; the heuristic is side-agnostic, so
+   parameterize the existing bot by which side it plays for. When the flag is OFF
+   (the default) the enemy behaves exactly as it does today. BOTH paths must work.
+
+2. MK5.2 CONFIG FLAGS — four per-battle flags:
+   - ENEMY_MATCHING (default OFF)
+   - HACKER_BONUS_ENABLED (default OFF — a DELIBERATE change; off means no Hacker
+     color bonus at all, giving a clean symmetric baseline. The first battle after
+     MK5 will therefore play differently than MK4 even with no flags touched. This
+     is intended.)
+   - SINGLE_AXIS_PAYOUT (default OFF; on = a color-match pays out only via color,
+     a shape-match only via shape)
+   - MAX_CASCADE_STEPS (default INFINITE, via a sentinel — null/-1/Infinity, NOT a
+     large integer)
+   REQUIRED EDGE-CASE RULING, do not guess: under SINGLE_AXIS_PAYOUT, a tile that
+   is in BOTH a color-match and a shape-match in the same resolution is destroyed
+   once (dedup) but PAYS OUT ON BOTH AXES — the flag restricts payout per MATCH,
+   not per tile. Do not collapse this to a single payout.
+
+3. MK5.3 CONFIG UI — on the menu/scenario scene, all four flags are settable per
+   battle. Cascade cap uses an "Infinite?" toggle; when OFF, an integer input of
+   range 0-9 becomes active. ZERO IS VALID AND MEANS ZERO CASCADES (the initial
+   match resolves, tiles fall/refill, but nothing that falls can match — the board
+   goes inert). Add a "Reset to Defaults" button. On the BATTLE scene, the existing
+   pause/settings menu displays the ACTIVE config, read-only (not editable in-battle).
+
+4. MK5.4 CONFIG PERSISTENCE — config persists across sessions and across returns to
+   the menu; NOTHING resets it implicitly. "Reset to Defaults" is the only explicit
+   reset. RESTART from the battle-conclusion screen ALWAYS reuses the exact config of
+   the battle just played, unconditionally.
+   CRITICAL — CONFIG IS PART OF THE SAVE STATE: serialize the active config into the
+   save at battle start. On Continue, the battle resumes under THE SAVE'S config, not
+   the menu's — the save's config is authoritative and immutable for that battle's
+   lifetime (never merge/reconcile from the menu). If the save's config DIFFERS from
+   the current menu config, then on resume AUTOMATICALLY OPEN the existing pause/config
+   panel at battle start, with an explanatory line at top ("This battle is using the
+   configuration it was started with, not your current settings.") and the battle's
+   actual config shown beneath. The player must dismiss it to proceed — a forced
+   acknowledgment, not a passive notice. Only trigger this when the configs actually
+   differ.
+
+5. MK5.5 LOGGING — stamp the ACTIVE CONFIG into every battle record, Tier 1 and Tier 2,
+   alongside the existing version stamp. Without it, flagged battles produce data that
+   cannot be attributed later.
+
+6. MK5.6 NEW METRIC — charge-source contention: per side, how often that side's
+   matches/cascades destroyed tiles bound to the OTHER side's units. Logic-layer /
+   event-sourced like all other metrics; include in the batch output and the game-over
+   metrics display.
+
+CRITICAL:
+- DELTAS on top of the existing build. Do not rebuild working systems. Where MK5
+  conflicts with an earlier section, MK5 wins; everything else stays.
+- NO new abilities, NO unit HP/knockout, NO action-point economy, NO no-match-damage
+  mode, NO battle-type authoring system — all explicitly parked (see MK5 "Out of scope").
+- Reuse the existing bot for the enemy brain. Reuse the existing pause panel for the
+  config display. Reuse the existing metrics event stream for the new metric and the
+  config stamping. Do not build parallel systems.
+- Keep logic/render separation intact. Constants/flags in the constants module; the
+  per-battle config is runtime state passed at battle start (and serialized into the save).
+- Keep MK4 as a clean committed restore point.
+- NOTE: enemy starting HP is manually set to 350 in constants — leave it as-is.
+
+Before writing code, tell me: (1) any clarifying questions; (2) your one-line plan for
+parameterizing the existing bot to play either side; and (3) your one-line plan for where
+the per-battle config lives at runtime and how it gets into the save envelope. Then wait
+for my go-ahead.
+
+After building, report: the bot win/loss rate with ENEMY_MATCHING on vs off (both should
+run); the charge-source contention numbers with enemy matching on; and confirm (a) a
+resumed battle with a divergent config force-opens the config panel, (b) restart reuses
+the prior battle's config, (c) cascade cap 0 behaves as specified, and (d) the config is
+stamped in both log tiers.
 ```
