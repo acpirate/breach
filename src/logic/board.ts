@@ -27,8 +27,9 @@ function emptyBoard(): Board {
 
 // Would placing tile t at (x,y) complete a horizontal or vertical run of 3
 // with the two already-placed tiles to its left / above it? (Used during
-// row-major fills to avoid pre-existing matches.)
-function completesRun(board: Board, x: number, y: number, t: Tile): boolean {
+// row-major fills to avoid pre-existing matches, and by the MK5 constrained
+// refill to bias replacement tiles away from new matches.)
+export function completesRun(board: Board, x: number, y: number, t: Tile): boolean {
   const trip = (a: Cell, b: Cell): boolean => {
     if (!a || !b) return false;
     if (t.kind === 'neutral') return a.kind === 'neutral' && b.kind === 'neutral';

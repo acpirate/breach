@@ -42,6 +42,15 @@ export interface UnitState { type: UnitType; charge: number; }
 export type Scenario = 'normal' | 'forcedLoss';
 export type Phase = 'playerPre' | 'resolving' | 'enemy' | 'over';
 
+// MK5.2 — per-battle configuration flags. Runtime state (part of GameState
+// and the save envelope), not global constants; defaults live in constants.ts.
+export interface BattleConfig {
+  enemyMatching: boolean; // MK5.1: enemy matches on the shared board (no charge clock)
+  hackerBonusEnabled: boolean; // off = no Hacker color bonus at all (symmetric baseline)
+  singleAxisPayout: boolean; // on = a match grants CHARGE only on its own axis (damage unchanged)
+  maxCascadeSteps: number | null; // null = infinite (sentinel, NOT a large integer); 0-9 otherwise
+}
+
 export interface GameState {
   board: Board;
   rng: RNG;
@@ -56,6 +65,7 @@ export interface GameState {
   turn: number;
   metrics: BattleMetrics; // MK2.3 — accumulated in the logic layer
   battleId: string; // MK4.3 — tags this battle's log entries; survives save/restore
+  config: BattleConfig; // MK5.2 — authoritative and immutable for this battle's lifetime
 }
 
 // ---- Render-facing snapshots & events (plain serializable data) ----
@@ -106,4 +116,7 @@ export type GameEvent =
   | { t: 'ability'; side: Side; unit: UnitType; drained?: number }
   | { t: 'chargeWaste'; side: Side; unit: UnitType; amount: number }
   | { t: 'autoReshuffle' }
-  | { t: 'cascadeDepth'; side: Side; depth: number };
+  | { t: 'cascadeDepth'; side: Side; depth: number }
+  // MK5.6 — per match step: destroyed-tile count and how many of those tiles
+  // were bound to the OPPOSING side's units (charge-source contention)
+  | { t: 'tileStats'; side: Side; destroyed: number; contested: number };

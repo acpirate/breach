@@ -12,6 +12,20 @@ npm run batch      # headless batch: 100 bot-played battles, aggregate metrics r
 npm run typecheck  # tsc --noEmit
 ```
 
+## MK5 revisions (Section 1-MK5 — Enemy Matching + Configurable Battle Modifiers)
+
+- **MK5.1 Enemy matching:** with the `enemyMatching` flag on, the enemy's fixed charge clock is removed and it becomes a real matching opponent on the shared board — a structurally identical turn (fire charged abilities → make one match via the existing bot heuristic → resolve under all the same rules), charging only from matches on the same bindings as the player. Flag off (default) = the original timer-clock enemy. Both paths work.
+- **MK5.2 Config flags** (`BattleConfig`, runtime state on `GameState`, defaults in `constants.ts`):
+  - `enemyMatching` (default OFF)
+  - `hackerBonusEnabled` (default **OFF** — deliberate: the flat color bonus distorted the economy; off gives a symmetric baseline, so the first MK5 battle plays differently from MK4 even untouched)
+  - `singleAxisPayout` (default OFF; on = a match grants **charge** only on its matched axis — damage is unchanged, since damage is color-derived. Per-match ruling: a tile in both a color- and shape-match is destroyed once but pays both axes)
+  - `maxCascadeSteps` (default **infinite** via `null` sentinel; 0–9 otherwise). At a cap, refill tiles are rejection-rolled so no refill completes a match; matches from existing tiles falling together still resolve. Cap 0 = the initial match resolves, then the board goes inert.
+- **MK5.3/5.4 Config UI & lifecycle:** the scenario menu has checkboxes, an "Infinite cascades" toggle with a 0–9 input, and "Reset to Defaults" (the only reset). Config persists across sessions (`breach:config`), is **serialized into the save** and is authoritative/immutable for that battle. On Continue, if the save's config differs from the menu's, a forced acknowledgment panel auto-opens showing the battle's actual config. Restart (conclusion screen or pause) always reuses the just-played battle's config. The pause menu shows the active config read-only.
+- **MK5.5 Logging:** every Tier 1 and Tier 2 log entry stamps the active config alongside the version (now `mk5`). Old-version log entries persist until explicitly cleared.
+- **MK5.6 Contention metric:** per side, how many destroyed match-tiles were bound to the *opposing* side's units — surfaced in the batch output and the game-over metrics.
+
+`npm run batch` now runs 100 battles in **both** enemy modes, outcome-split.
+
 ## MK4 revisions (Section 1-MK4 — Persistence, Logging & Visual Pass)
 
 No gameplay changes. Additions:

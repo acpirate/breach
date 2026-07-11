@@ -13,12 +13,14 @@ import {
   UNIT_DEFS,
 } from './constants';
 import { generateInitialBoard, reshuffleBoard, swap } from './board';
+import { findBotMove } from './bot';
 import { TurnLogEntry, TurnLogger } from './logger';
 import { detectMatches } from './match';
 import { consumeEvents, createBattleMetrics } from './metrics';
 import { addUnitCharge, buffBonus, dealDamage, resolveCascades, resolveDetonation } from './resolve';
 import { makeRNG } from './rng';
 import {
+  BattleConfig,
   GameEvent,
   GameState,
   Pt,
@@ -37,7 +39,7 @@ export class Game {
   private logger: TurnLogger;
   private pendingTurnLogs: TurnLogEntry[] = [];
 
-  constructor(scenario: Scenario, seed?: number) {
+  constructor(scenario: Scenario, config: BattleConfig, seed?: number) {
     const rng = makeRNG(seed);
     const gen = { rng, nextId: 1 };
     const board = generateInitialBoard(gen);
@@ -63,7 +65,17 @@ export class Game {
       turn: 1,
       metrics: createBattleMetrics(),
       battleId,
+      // copied: the battle's config is immutable for its lifetime (MK5.4) —
+      // later menu edits must not leak into a running battle
+      config: { ...config },
     };
+  }
+
+  // MK5.2: allowed match steps before refills become constrained.
+  // A swap-initiated resolution gets its initial match plus `cap` cascades.
+  private matchBudget(): number | null {
+    const cap = this.state.config.maxCascadeSteps;
+    return cap === null ? null : cap + 1;
   }
 
   // MK4.1 — rebuild a Game from a deserialized (already validated) state.
@@ -280,12 +292,19 @@ export class Game {
       return { matched: false, events };
     }
     s.phase = 'resolving'; // match committed — no further abilities this turn
-    resolveCascades(s, 'player', events);
+    resolveCascades(s, 'player', events, this.matchBudget());
     return { matched: true, events: this.collect(events) };
   }
 
-  // 1.6.2 — enemy phase: tick own countdowns, cast all charged minions in
-  // randomized order, then every minion gains its fixed charge rate.
+  // 1.6.2 — enemy phase. Two modes (MK5.1):
+  //  - ENEMY_MATCHING off (default): tick own countdowns, cast all charged
+  //    minions in randomized order, then every minion gains its fixed charge
+  //    rate (the original timer-clock enemy).
+  //  - ENEMY_MATCHING on: a REAL turn, structurally identical to the
+  //    player's — tick, fire charged abilities pre-match, then make exactly
+  //    one match (existing bot heuristic) which resolves under all the same
+  //    rules. The fixed charge clock is REMOVED; enemy units charge from
+  //    matching only, via the same bindings as the player's programs.
   runEnemyPhase(): GameEvent[] {
     const s = this.state;
     const events: GameEvent[] = [];
@@ -305,9 +324,21 @@ export class Game {
     }
     if (s.winner) return this.collect(events);
 
-    for (const u of s.units.enemy) {
-      const wasted = addUnitCharge(u, UNIT_DEFS[u.type].enemyChargeRate);
-      if (wasted > 0) events.push({ t: 'chargeWaste', side: 'enemy', unit: u.type, amount: wasted });
+    if (s.config.enemyMatching) {
+      // deadlock prevention guarantees a move after every settle; the guard
+      // is defensive only
+      const mv = findBotMove(s.board);
+      if (mv) {
+        swap(s.board, mv.a, mv.b);
+        events.push({ t: 'swap', a: mv.a, b: mv.b });
+        resolveCascades(s, 'enemy', events, this.matchBudget());
+        if (s.winner) return this.collect(events);
+      }
+    } else {
+      for (const u of s.units.enemy) {
+        const wasted = addUnitCharge(u, UNIT_DEFS[u.type].enemyChargeRate);
+        if (wasted > 0) events.push({ t: 'chargeWaste', side: 'enemy', unit: u.type, amount: wasted });
+      }
     }
     s.turn += 1;
     return this.collect(events);

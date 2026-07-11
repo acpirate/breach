@@ -4,7 +4,7 @@
 // nothing below may be hardcoded anywhere else in the codebase.
 // ============================================================================
 
-import { Color, Shape, UnitType } from './types';
+import { BattleConfig, Color, Shape, UnitType } from './types';
 
 export const BOARD_WIDTH = 8;
 export const BOARD_HEIGHT = 8;
@@ -77,6 +77,16 @@ export const CHARGE_CAP_EQUALS_COST = true;
 
 export const HACKER_BONUS_DAMAGE = 1; // extra damage per bonus-color tile (player match events only)
 export const HACKER_BONUS_CHARGE = 1; // extra charge per bonus-color tile to color-matching player units
+
+// MK5.2 — per-battle config defaults. All preserve current behavior EXCEPT
+// hackerBonusEnabled, which defaults OFF (deliberate: the flat color bonus
+// distorts the charge/damage economy; off gives a clean symmetric baseline).
+export const DEFAULT_BATTLE_CONFIG: BattleConfig = {
+  enemyMatching: false,
+  hackerBonusEnabled: false,
+  singleAxisPayout: false,
+  maxCascadeSteps: null, // null = infinite (sentinel)
+};
 
 // ============================================================================
 // Agent-discretion assignments (approved by the designer)

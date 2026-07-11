@@ -26,6 +26,10 @@ export interface SideMetrics {
   critExtra: number;
   largestHit: number; // biggest single damage event (match step, ability, or bomb)
   deepestCascade: number; // max steps in one move/detonation (1 = no cascading)
+  // MK5.6 — charge-source contention: of the tiles this side destroyed in
+  // match steps, how many were bound (by color or shape) to an opposing unit
+  tilesDestroyed: number;
+  contentionTiles: number;
   units: Record<UnitType, UnitMetrics>;
 }
 
@@ -47,6 +51,8 @@ function emptySide(): SideMetrics {
     critExtra: 0,
     largestHit: 0,
     deepestCascade: 0,
+    tilesDestroyed: 0,
+    contentionTiles: 0,
     units,
   };
 }
@@ -96,6 +102,12 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
       case 'cascadeDepth': {
         const sm = m.sides[ev.side];
         if (ev.depth > sm.deepestCascade) sm.deepestCascade = ev.depth;
+        break;
+      }
+      case 'tileStats': {
+        const sm = m.sides[ev.side];
+        sm.tilesDestroyed += ev.destroyed;
+        sm.contentionTiles += ev.contested;
         break;
       }
       default:

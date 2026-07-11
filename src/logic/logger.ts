@@ -9,10 +9,11 @@
 // Tier 3 (full board snapshots): PARKED — deliberately not built.
 
 import { BattleMetrics } from './metrics';
-import { GameEvent, GameState, Scenario, Side, opponentOf } from './types';
+import { BattleConfig, GameEvent, GameState, Scenario, Side, opponentOf } from './types';
 
 // Version tag stamped on every log entry (designer-set; placeholder scheme).
-export const LOG_VERSION = 'mk4';
+// Older-version entries remain in the logs until explicitly cleared.
+export const LOG_VERSION = 'mk5';
 
 // Log-size caps — directly controlled here, comfortably under the ~5MB
 // localStorage quota (entries are a few hundred bytes each). The storage
@@ -30,6 +31,7 @@ interface SideDamage {
 export interface TurnLogEntry {
   v: string; // LOG_VERSION
   battleId: string;
+  config: BattleConfig; // MK5.5 — active config; entries are uninterpretable without it
   turn: number;
   actions: string[]; // committed swaps, shakes, abilities fired (both sides)
   damage: Record<Side, SideDamage>; // dealt BY each side this turn
@@ -43,6 +45,7 @@ export interface TurnLogEntry {
 export interface MetricLogEntry {
   v: string; // LOG_VERSION
   battleId: string;
+  config: BattleConfig; // MK5.5 — active config stamp
   endedAt: string; // ISO timestamp
   scenario: Scenario;
   winner: Side;
@@ -59,11 +62,12 @@ export class TurnLogger {
 
   constructor(private battleId: string) {}
 
-  private fresh(turn: number): TurnLogEntry {
+  private fresh(state: GameState): TurnLogEntry {
     return {
       v: LOG_VERSION,
       battleId: this.battleId,
-      turn,
+      config: { ...state.config },
+      turn: state.turn,
       actions: [],
       damage: freshDamage(),
       detonations: 0,
@@ -77,7 +81,7 @@ export class TurnLogger {
   // (The turn counter advances at the end of the enemy phase, so a batch's
   // events always belong to the entry opened before it.)
   consume(state: GameState, events: GameEvent[]): TurnLogEntry[] {
-    if (!this.current) this.current = this.fresh(state.turn);
+    if (!this.current) this.current = this.fresh(state);
     const e = this.current;
     for (const ev of events) {
       switch (ev.t) {
@@ -116,7 +120,7 @@ export class TurnLogger {
       };
       if (state.winner) e.result = state.winner;
       done.push(e);
-      this.current = state.winner ? null : this.fresh(state.turn);
+      this.current = state.winner ? null : this.fresh(state);
     }
     return done;
   }

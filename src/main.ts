@@ -3,6 +3,7 @@
 
 import {
   BOARD_SHAKE_COST,
+  DEFAULT_BATTLE_CONFIG,
   STARTING_HP_ENEMY,
   STARTING_HP_PLAYER_LOW_SCENARIO,
   STARTING_HP_PLAYER_NORMAL,
@@ -12,7 +13,7 @@ import { Game } from './logic/game';
 import { LOG_VERSION } from './logic/logger';
 import { BattleMetrics } from './logic/metrics';
 import { deserializeGame, serializeGame } from './logic/save';
-import { Pt, Scenario, Side, UNIT_ORDER, gridViewOf } from './logic/types';
+import { BattleConfig, Pt, Scenario, Side, UNIT_ORDER, gridViewOf } from './logic/types';
 import { attachInput } from './render/input';
 import { Hud, View } from './render/view';
 import {
@@ -20,8 +21,10 @@ import {
   appendTurnLogs,
   clearBattleSave,
   loadBattleJson,
+  loadMenuConfig,
   readLogs,
   saveBattle,
+  saveMenuConfig,
   wipeLogs,
 } from './storage';
 
@@ -35,6 +38,18 @@ let selection: Pt | null = null;
 // MK3.2: Disabler targeting mode — armed by tapping the charged Disabler;
 // the next tap on an enemy minion fires it, any other tap cancels (free).
 let targeting = false;
+// MK5.4: the menu's battle config — persisted, never implicitly reset. A
+// running battle uses ITS OWN immutable copy (game.state.config), not this.
+let menuConfig: BattleConfig = loadMenuConfig();
+
+function configsEqual(a: BattleConfig, b: BattleConfig): boolean {
+  return (
+    a.enemyMatching === b.enemyMatching &&
+    a.hackerBonusEnabled === b.hackerBonusEnabled &&
+    a.singleAxisPayout === b.singleAxisPayout &&
+    a.maxCascadeSteps === b.maxCascadeSteps
+  );
+}
 
 function canAct(): boolean {
   return !!game && !busy && !game.state.winner && game.state.phase === 'playerPre';
@@ -142,6 +157,8 @@ function metricsElement(m: BattleMetrics): HTMLElement {
     row(`Crit bonus damage (1.5x extra): ${fmt(sm.critExtra)} (${critPct}% of match damage)`);
     row(`Largest single hit: ${fmt(sm.largestHit)}`);
     row(`Deepest cascade: ${sm.deepestCascade} step${sm.deepestCascade === 1 ? '' : 's'}`);
+    const contPct = sm.tilesDestroyed > 0 ? ((sm.contentionTiles / sm.tilesDestroyed) * 100).toFixed(1) : '0.0';
+    row(`Opponent-bound tiles destroyed: ${sm.contentionTiles} of ${sm.tilesDestroyed} (${contPct}%)`);
     for (const t of UNIT_ORDER) {
       const u = sm.units[t];
       row(`${UNIT_DEFS[t].label}: fired ${u.fires}, effect ${fmt(u.effect)}, charge wasted ${fmt(u.chargeWasted)}`);
@@ -152,6 +169,104 @@ function metricsElement(m: BattleMetrics): HTMLElement {
 
 function hideDialog(): void {
   overlay.classList.add('hidden');
+}
+
+// MK5.3 — menu config panel: all four flags settable per battle. Persists on
+// every change; "Reset to Defaults" is the only reset.
+function configPanel(): HTMLElement {
+  const wrap = document.createElement('div');
+  wrap.className = 'config';
+  const head = document.createElement('div');
+  head.className = 'cfghead';
+  head.textContent = 'BATTLE CONFIG';
+  wrap.appendChild(head);
+
+  const check = (label: string, key: 'enemyMatching' | 'hackerBonusEnabled' | 'singleAxisPayout'): void => {
+    const l = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = menuConfig[key];
+    cb.addEventListener('change', () => {
+      menuConfig = { ...menuConfig, [key]: cb.checked };
+      saveMenuConfig(menuConfig);
+    });
+    l.appendChild(cb);
+    l.appendChild(document.createTextNode(` ${label}`));
+    wrap.appendChild(l);
+  };
+  check('Enemy matching', 'enemyMatching');
+  check('Hacker color bonus', 'hackerBonusEnabled');
+  check('Single-axis payout', 'singleAxisPayout');
+
+  // cascade cap: "Infinite?" toggle + 0-9 integer input (0 = zero cascades)
+  const capRow = document.createElement('label');
+  const inf = document.createElement('input');
+  inf.type = 'checkbox';
+  inf.checked = menuConfig.maxCascadeSteps === null;
+  capRow.appendChild(inf);
+  capRow.appendChild(document.createTextNode(' Infinite cascades'));
+  wrap.appendChild(capRow);
+
+  const numRow = document.createElement('label');
+  numRow.appendChild(document.createTextNode('Cascade cap (0–9) '));
+  const num = document.createElement('input');
+  num.type = 'number';
+  num.min = '0';
+  num.max = '9';
+  num.step = '1';
+  num.value = String(menuConfig.maxCascadeSteps ?? 0);
+  num.disabled = inf.checked;
+  numRow.appendChild(num);
+  numRow.style.display = inf.checked ? 'none' : '';
+  wrap.appendChild(numRow);
+
+  const readCap = (): number => Math.max(0, Math.min(9, Math.floor(Number(num.value) || 0)));
+  inf.addEventListener('change', () => {
+    num.disabled = inf.checked;
+    numRow.style.display = inf.checked ? 'none' : '';
+    menuConfig = { ...menuConfig, maxCascadeSteps: inf.checked ? null : readCap() };
+    saveMenuConfig(menuConfig);
+  });
+  num.addEventListener('change', () => {
+    num.value = String(readCap());
+    if (!inf.checked) {
+      menuConfig = { ...menuConfig, maxCascadeSteps: readCap() };
+      saveMenuConfig(menuConfig);
+    }
+  });
+
+  const reset = document.createElement('button');
+  reset.className = 'cfgreset';
+  reset.textContent = 'Reset to Defaults';
+  reset.addEventListener('click', () => {
+    menuConfig = { ...DEFAULT_BATTLE_CONFIG };
+    saveMenuConfig(menuConfig);
+    showTitle(); // rebuild the panel with default values
+  });
+  wrap.appendChild(reset);
+  return wrap;
+}
+
+// Read-only config summary (pause panel + divergent-resume acknowledgment)
+function configSummary(c: BattleConfig, heading: string): HTMLElement {
+  const wrap = document.createElement('div');
+  wrap.className = 'config readonly';
+  const head = document.createElement('div');
+  head.className = 'cfghead';
+  head.textContent = heading;
+  wrap.appendChild(head);
+  const rows = [
+    `Enemy matching: ${c.enemyMatching ? 'ON' : 'OFF'}`,
+    `Hacker color bonus: ${c.hackerBonusEnabled ? 'ON' : 'OFF'}`,
+    `Single-axis payout: ${c.singleAxisPayout ? 'ON' : 'OFF'}`,
+    `Cascade cap: ${c.maxCascadeSteps === null ? 'Infinite' : c.maxCascadeSteps}`,
+  ];
+  for (const r of rows) {
+    const d = document.createElement('div');
+    d.textContent = r;
+    wrap.appendChild(d);
+  }
+  return wrap;
 }
 
 function showTitle(): void {
@@ -165,14 +280,16 @@ function showTitle(): void {
   }
   buttons.push([`Normal (${STARTING_HP_PLAYER_NORMAL} HP vs ${STARTING_HP_ENEMY} HP)`, () => void startBattle('normal')]);
   buttons.push([`Forced loss (${STARTING_HP_PLAYER_LOW_SCENARIO} HP vs ${STARTING_HP_ENEMY} HP)`, () => void startBattle('forcedLoss')]);
-  showDialog('BREACH — PoC', 'Select scenario', buttons);
+  showDialog('BREACH — PoC', 'Select scenario', buttons, configPanel());
 }
 
-async function startBattle(s: Scenario): Promise<void> {
+// MK5.4: `cfg` is supplied by Restart paths (a restart is the same battle —
+// its rules are part of its identity); new games use the menu's config.
+async function startBattle(s: Scenario, cfg?: BattleConfig): Promise<void> {
   clearBattleSave(); // MK4.2: starting fresh wipes any resident save (also the corrupt-save escape hatch)
   scenario = s;
   hideDialog();
-  game = new Game(s);
+  game = new Game(s, cfg ?? menuConfig);
   selection = null;
   targeting = false;
   view.reset(gridViewOf(game.state.board));
@@ -201,6 +318,18 @@ async function resumeBattle(): Promise<void> {
   busy = true;
   await view.play([{ t: 'msg', text: `Battle resumed — turn ${game.state.turn}` }]);
   busy = false;
+  // MK5.4: the save's config is authoritative for this battle. If it differs
+  // from the current menu config, force an acknowledgment — auto-open the
+  // config panel; the player must dismiss it to proceed (the overlay blocks
+  // all board/ability input until then). Only when they actually differ.
+  if (!configsEqual(game.state.config, menuConfig)) {
+    showDialog(
+      'BATTLE CONFIG',
+      'This battle is using the configuration it was started with, not your current settings.',
+      [['Understood', hideDialog]],
+      configSummary(game.state.config, 'ACTIVE BATTLE CONFIG'),
+    );
+  }
 }
 
 // MK4: after every completed action — drain turn logs, then autosave (stable
@@ -214,6 +343,7 @@ function afterAction(): void {
     appendMetricsLog({
       v: LOG_VERSION,
       battleId: game.state.battleId,
+      config: { ...game.state.config }, // MK5.5 — config stamp
       endedAt: new Date().toISOString(),
       scenario: game.state.scenario,
       winner: game.state.winner,
@@ -228,11 +358,14 @@ function maybeGameOver(): void {
   if (!game?.state.winner) return;
   busy = true; // lock input for good
   const won = game.state.winner === 'player';
+  // MK5.4: Restart ALWAYS reuses the exact config of the battle just played,
+  // regardless of the current menu config
+  const cfg = { ...game.state.config };
   showDialog(
     won ? 'VICTORY' : 'DEFEAT',
     won ? 'Enemy system breached.' : 'Your connection was severed.',
     [
-      ['Reset', () => void startBattle(scenario)],
+      ['Reset', () => void startBattle(scenario, cfg)],
       ['Quit', showTitle],
     ],
     metricsElement(game.state.metrics),
@@ -334,14 +467,22 @@ attachInput(canvas, view, {
     });
   },
   onMenu(): void {
-    // Pause menu only in the make-a-match phase, never mid-resolution (spec 1.12)
-    if (!canAct()) return;
+    // Pause menu only in the make-a-match phase, never mid-resolution (spec 1.12).
+    // MK5.3: displays the ACTIVE battle config, read-only; MK5.4: mid-battle
+    // Reset also reuses this battle's config (same battle identity).
+    if (!canAct() || !game) return;
     targeting = false;
-    showDialog('PAUSED', '', [
-      ['Resume', hideDialog],
-      ['Reset', () => void startBattle(scenario)],
-      ['Quit', showTitle],
-    ]);
+    const cfg = { ...game.state.config };
+    showDialog(
+      'PAUSED',
+      '',
+      [
+        ['Resume', hideDialog],
+        ['Reset', () => void startBattle(scenario, cfg)],
+        ['Quit', showTitle],
+      ],
+      configSummary(cfg, 'ACTIVE BATTLE CONFIG'),
+    );
   },
 });
 

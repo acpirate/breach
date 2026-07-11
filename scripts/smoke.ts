@@ -3,11 +3,11 @@
 // turn. Run with `npm run smoke`.
 
 import { findValidMove, swap } from '../src/logic/board';
-import { BOARD_HEIGHT, BOARD_SHAKE_COST, BOARD_WIDTH, UNIT_DEFS } from '../src/logic/constants';
+import { BOARD_HEIGHT, BOARD_SHAKE_COST, BOARD_WIDTH, DEFAULT_BATTLE_CONFIG, UNIT_DEFS } from '../src/logic/constants';
 import { Game } from '../src/logic/game';
 import { detectMatches } from '../src/logic/match';
 import { deserializeGame, serializeGame } from '../src/logic/save';
-import { Scenario } from '../src/logic/types';
+import { BattleConfig, Scenario } from '../src/logic/types';
 import { botFireAbilities, findBotMove } from './bot';
 
 function assert(cond: unknown, msg: string): asserts cond {
@@ -59,8 +59,8 @@ function testInvalidSwapDoesNotConsumeTurn(g: Game): void {
   }
 }
 
-function runScenario(scenario: Scenario, seed: number): void {
-  const g = new Game(scenario, seed);
+function runScenario(scenario: Scenario, seed: number, config: BattleConfig = DEFAULT_BATTLE_CONFIG, label = ''): void {
+  const g = new Game(scenario, config, seed);
   g.startPlayerPhase();
   testInvalidSwapDoesNotConsumeTurn(g);
 
@@ -107,9 +107,13 @@ function runScenario(scenario: Scenario, seed: number): void {
     if (!g.state.winner) g.runEnemyPhase();
     if (!g.state.winner) g.startPlayerPhase();
     checkInvariants(g);
+    // under a cascade cap, resolution must never leave matches on the board
+    if (!g.state.winner && config.maxCascadeSteps !== null) {
+      assert(detectMatches(g.state.board).length === 0, 'capped battle left unresolved matches on board');
+    }
   }
 
-  assert(g.state.winner, `${scenario} (seed ${seed}) should reach game over`);
+  assert(g.state.winner, `${scenario}${label} (seed ${seed}) should reach game over`);
   assert(g.state.hp[g.state.winner] > 0, 'winner must have positive HP');
   // MK2.3: metrics must be populated on both win and loss outcomes
   const m = g.state.metrics;
@@ -118,15 +122,19 @@ function runScenario(scenario: Scenario, seed: number): void {
   assert(m.sides[g.state.winner].totalDamage > 0, 'winning side must have dealt damage');
   const tallied = m.sides[g.state.winner].matchDamage + m.sides[g.state.winner].attackerDamage + m.sides[g.state.winner].bombDamage;
   assert(tallied === m.sides[g.state.winner].totalDamage, 'damage source split must sum to total');
+  // MK5.1: with enemy matching on, the enemy must actually destroy tiles
+  if (config.enemyMatching) {
+    assert(m.sides.enemy.tilesDestroyed > 0, 'matching enemy should have destroyed tiles');
+  }
   console.log(
-    `${scenario} seed=${seed}: winner=${g.state.winner} turns=${g.state.turn} ` +
+    `${scenario}${label} seed=${seed}: winner=${g.state.winner} turns=${g.state.turn} ` +
       `hp(player=${Math.max(0, g.state.hp.player)}, enemy=${Math.max(0, g.state.hp.enemy)})`,
   );
 }
 
 // MK4.1: save/restore round trip — headless, pure logic (no storage APIs)
 function testSaveRoundTrip(): void {
-  const g = new Game('normal', 42);
+  const g = new Game('normal', { ...DEFAULT_BATTLE_CONFIG, enemyMatching: true, maxCascadeSteps: 4 }, 42);
   g.startPlayerPhase();
   for (let i = 0; i < 3 && !g.state.winner; i++) {
     const mv = findBotMove(g.state.board);
@@ -141,6 +149,7 @@ function testSaveRoundTrip(): void {
   assert(r, 'valid save must deserialize');
   assert(serializeGame(r.state) === json, 'restored state must re-serialize identically');
   assert(r.state.turn === g.state.turn && r.state.battleId === g.state.battleId, 'turn/battleId survive');
+  assert(r.state.config.enemyMatching && r.state.config.maxCascadeSteps === 4, 'config survives the round trip');
   // the restored game must play to completion under the bot
   let safety = 0;
   while (!r.state.winner && safety++ < 600) {
@@ -163,9 +172,20 @@ function testSaveRoundTrip(): void {
   console.log('save round-trip OK');
 }
 
+// default config (both scenarios)
 for (let seed = 1; seed <= 10; seed++) {
   runScenario('normal', seed);
   runScenario('forcedLoss', 1000 + seed);
+}
+// MK5.1: enemy matching on — both scenarios complete, enemy destroys tiles
+for (let seed = 1; seed <= 5; seed++) {
+  runScenario('normal', 2000 + seed, { ...DEFAULT_BATTLE_CONFIG, enemyMatching: true }, ' [enemyMatch]');
+  runScenario('forcedLoss', 3000 + seed, { ...DEFAULT_BATTLE_CONFIG, enemyMatching: true }, ' [enemyMatch]');
+}
+// MK5.2: cascade cap 0 (zero cascades) and single-axis payout both run clean
+for (let seed = 1; seed <= 5; seed++) {
+  runScenario('normal', 4000 + seed, { ...DEFAULT_BATTLE_CONFIG, maxCascadeSteps: 0 }, ' [cap0]');
+  runScenario('normal', 5000 + seed, { ...DEFAULT_BATTLE_CONFIG, singleAxisPayout: true }, ' [singleAxis]');
 }
 testSaveRoundTrip();
 console.log('SMOKE OK');

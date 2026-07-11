@@ -404,6 +404,7 @@ export class View {
       case 'autoReshuffle':
       case 'cascadeDepth':
       case 'shakeUsed':
+      case 'tileStats':
         dur = 1;
         break;
     }
