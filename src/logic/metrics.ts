@@ -30,6 +30,9 @@ export interface SideMetrics {
   // match steps, how many were bound (by color or shape) to an opposing unit
   tilesDestroyed: number;
   contentionTiles: number;
+  // MK6.7 — buffer damage added: sum over damage events of (dealt − what
+  // would have been dealt with zero active buff stacks). Stacking-safe.
+  bufferDamageAdded: number;
   units: Record<UnitType, UnitMetrics>;
 }
 
@@ -37,6 +40,9 @@ export interface BattleMetrics {
   turns: number;
   autoReshuffles: number; // match-lock count: automatic deadlock reshuffles fired
   winner: Side | null;
+  // MK6.6 — RAW per-turn think-times (input-available -> move-committed),
+  // never pre-aggregated; medians are computed at display/analysis time
+  thinkTimesMs: number[];
   sides: Record<Side, SideMetrics>;
 }
 
@@ -53,6 +59,7 @@ function emptySide(): SideMetrics {
     deepestCascade: 0,
     tilesDestroyed: 0,
     contentionTiles: 0,
+    bufferDamageAdded: 0,
     units,
   };
 }
@@ -62,6 +69,7 @@ export function createBattleMetrics(): BattleMetrics {
     turns: 0,
     autoReshuffles: 0,
     winner: null,
+    thinkTimesMs: [],
     sides: { player: emptySide(), enemy: emptySide() },
   };
 }
@@ -85,6 +93,7 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
           sm.units.bomber.effect += ev.amount;
         }
         sm.units.buffer.effect += ev.buffBonus ?? 0;
+        sm.bufferDamageAdded += ev.buffBonus ?? 0; // MK6.7 (== dealt − zero-buff dealt)
         break;
       }
       case 'ability': {
@@ -110,6 +119,9 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
         sm.contentionTiles += ev.contested;
         break;
       }
+      case 'thinkTime':
+        m.thinkTimesMs.push(ev.ms);
+        break;
       default:
         break;
     }

@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "smoke": "tsx scripts/smoke.ts",
     "batch": "tsx scripts/batch.ts",
+    "hpladder": "tsx scripts/hpladder.ts",
     "logs:dump": "node scripts/logs.cjs dump",
     "logs:wipe": "node scripts/logs.cjs wipe"
   },

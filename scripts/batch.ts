@@ -3,7 +3,7 @@
 // SPLIT BY OUTCOME, for BOTH enemy modes (ENEMY_MATCHING off and on).
 // Run with `npm run batch`.
 
-import { DEFAULT_BATTLE_CONFIG, STARTING_HP_ENEMY, STARTING_HP_PLAYER_NORMAL, UNIT_DEFS } from '../src/logic/constants';
+import { DEFAULT_BATTLE_CONFIG, UNIT_DEFS } from '../src/logic/constants';
 import { Game } from '../src/logic/game';
 import { BattleMetrics } from '../src/logic/metrics';
 import { BattleConfig, UNIT_ORDER } from '../src/logic/types';
@@ -12,7 +12,7 @@ import { botFireAbilities, findBotMove } from './bot';
 const N = 100;
 
 function playOne(seed: number, config: BattleConfig): BattleMetrics {
-  const g = new Game('normal', config, seed);
+  const g = new Game(config, seed);
   g.startPlayerPhase();
   let safety = 0;
   while (!g.state.winner && safety++ < 2000) {
@@ -40,7 +40,9 @@ function report(label: string, group: BattleMetrics[]): void {
   for (const side of ['player', 'enemy'] as const) {
     const s = group.map((m) => m.sides[side]);
     console.log(`--- ${side.toUpperCase()} (averages per battle) ---`);
-    console.log(`  Total damage: ${f1(avg(s.map((x) => x.totalDamage)))}  (match ${f1(avg(s.map((x) => x.matchDamage)))}, attacker ${f1(avg(s.map((x) => x.attackerDamage)))}, bomb ${f1(avg(s.map((x) => x.bombDamage)))})`);
+    const abilityPcts = s.map((x) => (x.totalDamage > 0 ? ((x.attackerDamage + x.bombDamage) / x.totalDamage) * 100 : 0));
+    console.log(`  Total damage: ${f1(avg(s.map((x) => x.totalDamage)))}  (match ${f1(avg(s.map((x) => x.matchDamage)))}, attacker ${f1(avg(s.map((x) => x.attackerDamage)))}, bomb ${f1(avg(s.map((x) => x.bombDamage)))})  ability share ${f1(avg(abilityPcts))}%`);
+    console.log(`  Buffer damage added: ${f1(avg(s.map((x) => x.bufferDamageAdded)))}`);
     const critPcts = s.map((x) => (x.matchDamage > 0 ? (x.critExtra / x.matchDamage) * 100 : 0));
     console.log(`  Crit bonus damage: ${f1(avg(s.map((x) => x.critExtra)))} (avg ${f1(avg(critPcts))}% of match damage)`);
     console.log(`  Largest single hit: avg ${f1(avg(s.map((x) => x.largestHit)))}, max ${max(s.map((x) => x.largestHit))}`);
@@ -64,11 +66,15 @@ function runMode(label: string, config: BattleConfig): void {
   console.log(`\n############################################################`);
   console.log(`#  ${label}`);
   console.log(`#  BOT WIN RATE: ${won.length}/${N} won, ${lost.length}/${N} lost (${((won.length / N) * 100).toFixed(1)}% wins)`);
-  console.log(`#  normal scenario, player ${STARTING_HP_PLAYER_NORMAL} HP vs enemy ${STARTING_HP_ENEMY} HP, seeds 1-${N}`);
+  console.log(`#  player ${config.playerHp} HP vs enemy ${config.enemyHp} HP, seeds 1-${N}`);
   console.log(`############################################################`);
   report('BATTLES THE PLAYER WON', won);
   report('BATTLES THE PLAYER LOST', lost);
 }
 
-runMode('ENEMY_MATCHING OFF (default config)', { ...DEFAULT_BATTLE_CONFIG });
-runMode('ENEMY_MATCHING ON', { ...DEFAULT_BATTLE_CONFIG, enemyMatching: true });
+const D = DEFAULT_BATTLE_CONFIG;
+// MK6 matrix: enemy mode x no-match-damage, all under the new defaults (cap-0)
+runMode('ENEMY_MATCHING OFF (new default config: cap-0)', { ...D });
+runMode('ENEMY_MATCHING ON', { ...D, enemyMatching: true });
+runMode('NO_MATCH_DAMAGE ON (enemy matching off)', { ...D, noMatchDamage: true });
+runMode('NO_MATCH_DAMAGE ON + ENEMY_MATCHING ON', { ...D, noMatchDamage: true, enemyMatching: true });

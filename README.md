@@ -12,6 +12,19 @@ npm run batch      # headless batch: 100 bot-played battles, aggregate metrics r
 npm run typecheck  # tsc --noEmit
 ```
 
+## MK6 revisions (Section 1-MK6 — Shape Damage, No-Match-Damage, Instrumentation & QoL)
+
+- **MK6.1 Shape damage:** shapes get their own damage tiers, symmetric with color (LOW 1 / HIGH 2). **HIGH shapes: Square, Cross, Diamond · LOW: Triangle, Star, Circle** — assigned so every unit binds one HIGH axis + one LOW axis (no unit's tiles are double-weighted). A color-match damages via the tile's color tier, a shape-match via its shape tier; a tile destroyed by both pays once at the higher applicable value. Supersedes the MK5 color-fallback stopgap.
+- **MK6.2 `NO_MATCH_DAMAGE` flag** (default OFF): matches deal zero damage; charge is unchanged (the denial contest survives); abilities become the only damage source. **Bomb detonations still deal full damage** — a detonation is an ability effect, not a match.
+- **MK6.3 Cap-0 is the default** (`maxCascadeSteps: 0`; the Infinite toggle and 0–9 input are unchanged).
+- **MK6.4 HP in config:** `playerHp`/`enemyHp` (1–9999) are menu-settable, persisted, saved, and stamped into logs. The forced-loss scenario and the Scenario concept are **removed** — the menu is config + one Play button (+ Continue when a save exists).
+- **MK6.5 Character sheet:** read-only pause-menu panel with damage tiers per axis, charge values, unit costs, and **both sides'** bindings (built to display divergent bindings when that experiment lands).
+- **MK6.6 Think-time metrics:** raw per-turn think-times measured strictly from input-available → match-committed (abilities/invalid swaps leave the clock running), logged unaggregated; medians computed at display. Battle wall-clock in the Tier 1 log.
+- **MK6.7 Buffer attribution:** per-side `bufferDamageAdded` (= dealt − zero-buff-dealt, stacking-safe) in metrics, game-over display, and batch output.
+- **MK6.8 Logging:** `logs:dump` is now lossless (version, config, contention, timing, buffer fields all included) and reads date-stamped files — the sink writes `logs/breach-logs-YYYY-MM-DD.jsonl`, rolling daily.
+- **MK6.9 Visuals:** special tiles lose the perimeter outline (the centered white/black badge is the ownership signal); floating damage numbers are large and outlined.
+- **New harness:** `npm run hpladder` — symmetric-HP ladder (100/500/2000, both enemy modes, 100 seeds per cell). `npm run batch` runs a 4-mode matrix (enemy matching × no-match-damage) with ability-share and buffer columns.
+
 ## MK5 revisions (Section 1-MK5 — Enemy Matching + Configurable Battle Modifiers)
 
 - **MK5.1 Enemy matching:** with the `enemyMatching` flag on, the enemy's fixed charge clock is removed and it becomes a real matching opponent on the shared board — a structurally identical turn (fire charged abilities → make one match via the existing bot heuristic → resolve under all the same rules), charging only from matches on the same bindings as the player. Flag off (default) = the original timer-clock enemy. Both paths work.

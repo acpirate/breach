@@ -3,17 +3,26 @@
 
 import {
   BOARD_SHAKE_COST,
+  CHARGE_PER_TILE_COLOR_MATCH,
+  CHARGE_PER_TILE_SHAPE_MATCH,
+  DAMAGE_PER_TILE_HIGH_COLOR,
+  DAMAGE_PER_TILE_HIGH_SHAPE,
+  DAMAGE_PER_TILE_LOW_COLOR,
+  DAMAGE_PER_TILE_LOW_SHAPE,
+  DAMAGE_PER_TILE_NEUTRAL,
   DEFAULT_BATTLE_CONFIG,
-  STARTING_HP_ENEMY,
-  STARTING_HP_PLAYER_LOW_SCENARIO,
-  STARTING_HP_PLAYER_NORMAL,
+  HIGH_COLORS,
+  HIGH_SHAPES,
+  LOW_COLORS,
+  LOW_SHAPES,
   UNIT_DEFS,
+  UnitDef,
 } from './logic/constants';
 import { Game } from './logic/game';
 import { LOG_VERSION } from './logic/logger';
 import { BattleMetrics } from './logic/metrics';
 import { deserializeGame, serializeGame } from './logic/save';
-import { BattleConfig, Pt, Scenario, Side, UNIT_ORDER, gridViewOf } from './logic/types';
+import { BattleConfig, Color, Pt, Shape, Side, UNIT_ORDER, gridViewOf } from './logic/types';
 import { attachInput } from './render/input';
 import { Hud, View } from './render/view';
 import {
@@ -32,9 +41,12 @@ const canvas = document.getElementById('game') as HTMLCanvasElement;
 const overlay = document.getElementById('overlay') as HTMLDivElement;
 
 let game: Game | null = null;
-let scenario: Scenario = 'normal';
 let busy = false; // true while animations / enemy phase are in flight
 let selection: Pt | null = null;
+// MK6.6 — think-time clock: stamped when the turn's input actually unlocks,
+// read when the match commits. Abilities/invalid swaps leave it running.
+let thinkStart: number | null = null;
+let battleStartAt = 0; // wall-clock anchor for this session's battle
 // MK3.2: Disabler targeting mode — armed by tapping the charged Disabler;
 // the next tap on an enemy minion fires it, any other tap cancels (free).
 let targeting = false;
@@ -47,8 +59,17 @@ function configsEqual(a: BattleConfig, b: BattleConfig): boolean {
     a.enemyMatching === b.enemyMatching &&
     a.hackerBonusEnabled === b.hackerBonusEnabled &&
     a.singleAxisPayout === b.singleAxisPayout &&
-    a.maxCascadeSteps === b.maxCascadeSteps
+    a.maxCascadeSteps === b.maxCascadeSteps &&
+    a.noMatchDamage === b.noMatchDamage &&
+    a.playerHp === b.playerHp &&
+    a.enemyHp === b.enemyHp
   );
+}
+
+// input just unlocked into the make-a-match phase → start the think clock
+function endBusy(): void {
+  busy = false;
+  thinkStart = canAct() ? performance.now() : null;
 }
 
 function canAct(): boolean {
@@ -70,12 +91,11 @@ function getHud(): Hud | null {
   if (!game) return null;
   const s = game.state;
   const act = canAct();
-  const hpMaxPlayer = s.scenario === 'normal' ? STARTING_HP_PLAYER_NORMAL : STARTING_HP_PLAYER_LOW_SCENARIO;
   return {
     hpPlayer: Math.max(0, s.hp.player),
-    hpPlayerMax: hpMaxPlayer,
+    hpPlayerMax: s.config.playerHp, // MK6.4: HP lives in the config
     hpEnemy: Math.max(0, s.hp.enemy),
-    hpEnemyMax: STARTING_HP_ENEMY,
+    hpEnemyMax: s.config.enemyHp,
     programs: s.units.player.map((u) => {
       const d = UNIT_DEFS[u.type];
       return { label: d.label, cost: d.cost, charge: u.charge, ready: act && u.charge >= d.cost, color: d.color, shape: d.shape };
@@ -159,12 +179,26 @@ function metricsElement(m: BattleMetrics): HTMLElement {
     row(`Deepest cascade: ${sm.deepestCascade} step${sm.deepestCascade === 1 ? '' : 's'}`);
     const contPct = sm.tilesDestroyed > 0 ? ((sm.contentionTiles / sm.tilesDestroyed) * 100).toFixed(1) : '0.0';
     row(`Opponent-bound tiles destroyed: ${sm.contentionTiles} of ${sm.tilesDestroyed} (${contPct}%)`);
+    row(`Buffer damage added: ${fmt(sm.bufferDamageAdded)}`); // MK6.7
     for (const t of UNIT_ORDER) {
       const u = sm.units[t];
       row(`${UNIT_DEFS[t].label}: fired ${u.fires}, effect ${fmt(u.effect)}, charge wasted ${fmt(u.chargeWasted)}`);
     }
   }
+
+  // MK6.6 — timing (median computed here at display time; raw values logged)
+  row('TIMING', true);
+  const med = median(m.thinkTimesMs);
+  row(`Median think-time: ${med === null ? 'n/a' : `${(med / 1000).toFixed(1)}s`} (${m.thinkTimesMs.length} moves)`);
+  row(`Battle wall-clock: ${((Date.now() - battleStartAt) / 1000).toFixed(0)}s (this session)`);
   return wrap;
+}
+
+function median(xs: number[]): number | null {
+  if (!xs.length) return null;
+  const s = [...xs].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
 function hideDialog(): void {
@@ -181,7 +215,7 @@ function configPanel(): HTMLElement {
   head.textContent = 'BATTLE CONFIG';
   wrap.appendChild(head);
 
-  const check = (label: string, key: 'enemyMatching' | 'hackerBonusEnabled' | 'singleAxisPayout'): void => {
+  const check = (label: string, key: 'enemyMatching' | 'hackerBonusEnabled' | 'singleAxisPayout' | 'noMatchDamage'): void => {
     const l = document.createElement('label');
     const cb = document.createElement('input');
     cb.type = 'checkbox';
@@ -197,6 +231,29 @@ function configPanel(): HTMLElement {
   check('Enemy matching', 'enemyMatching');
   check('Hacker color bonus', 'hackerBonusEnabled');
   check('Single-axis payout', 'singleAxisPayout');
+  check('No match damage', 'noMatchDamage'); // MK6.2
+
+  // MK6.4 — starting HP inputs (1-9999)
+  const hpInput = (label: string, key: 'playerHp' | 'enemyHp'): void => {
+    const l = document.createElement('label');
+    l.appendChild(document.createTextNode(`${label} `));
+    const n = document.createElement('input');
+    n.type = 'number';
+    n.min = '1';
+    n.max = '9999';
+    n.step = '1';
+    n.value = String(menuConfig[key]);
+    n.addEventListener('change', () => {
+      const v = Math.max(1, Math.min(9999, Math.floor(Number(n.value) || 1)));
+      n.value = String(v);
+      menuConfig = { ...menuConfig, [key]: v };
+      saveMenuConfig(menuConfig);
+    });
+    l.appendChild(n);
+    wrap.appendChild(l);
+  };
+  hpInput('Player HP', 'playerHp');
+  hpInput('Enemy HP', 'enemyHp');
 
   // cascade cap: "Infinite?" toggle + 0-9 integer input (0 = zero cascades)
   const capRow = document.createElement('label');
@@ -259,12 +316,52 @@ function configSummary(c: BattleConfig, heading: string): HTMLElement {
     `Enemy matching: ${c.enemyMatching ? 'ON' : 'OFF'}`,
     `Hacker color bonus: ${c.hackerBonusEnabled ? 'ON' : 'OFF'}`,
     `Single-axis payout: ${c.singleAxisPayout ? 'ON' : 'OFF'}`,
+    `No match damage: ${c.noMatchDamage ? 'ON' : 'OFF'}`,
     `Cascade cap: ${c.maxCascadeSteps === null ? 'Infinite' : c.maxCascadeSteps}`,
+    `Starting HP: you ${c.playerHp} / enemy ${c.enemyHp}`,
   ];
   for (const r of rows) {
     const d = document.createElement('div');
     d.textContent = r;
     wrap.appendChild(d);
+  }
+  return wrap;
+}
+
+// MK6.5 — character sheet: the game's numbers, readable in-game. Built
+// against per-side unit defs because bindings MAY diverge in future
+// experiments — no hardcoded shared table.
+const COLOR_NAMES: Record<Color, string> = {
+  [Color.Red]: 'Red', [Color.Yellow]: 'Yellow', [Color.Magenta]: 'Magenta',
+  [Color.Green]: 'Green', [Color.Cyan]: 'Cyan', [Color.Blue]: 'Blue',
+};
+const SHAPE_NAMES: Record<Shape, string> = {
+  [Shape.Circle]: 'Circle', [Shape.Square]: 'Square', [Shape.Triangle]: 'Triangle',
+  [Shape.Diamond]: 'Diamond', [Shape.Star]: 'Star', [Shape.Cross]: 'Cross',
+};
+
+function characterSheet(playerDefs: Record<string, UnitDef>, enemyDefs: Record<string, UnitDef>): HTMLElement {
+  const wrap = document.createElement('div');
+  wrap.className = 'config readonly';
+  const row = (text: string, head = false): void => {
+    const d = document.createElement('div');
+    if (head) d.className = 'cfghead';
+    d.textContent = text;
+    wrap.appendChild(d);
+  };
+  row('CHARACTER SHEET', true);
+  row(`Color damage — HIGH (${DAMAGE_PER_TILE_HIGH_COLOR}): ${HIGH_COLORS.map((c) => COLOR_NAMES[c]).join(', ')}`);
+  row(`Color damage — LOW (${DAMAGE_PER_TILE_LOW_COLOR}): ${LOW_COLORS.map((c) => COLOR_NAMES[c]).join(', ')}`);
+  row(`Shape damage — HIGH (${DAMAGE_PER_TILE_HIGH_SHAPE}): ${HIGH_SHAPES.map((s) => SHAPE_NAMES[s]).join(', ')}`);
+  row(`Shape damage — LOW (${DAMAGE_PER_TILE_LOW_SHAPE}): ${LOW_SHAPES.map((s) => SHAPE_NAMES[s]).join(', ')}`);
+  row(`Neutral damage: ${DAMAGE_PER_TILE_NEUTRAL} (matches only other neutrals; refills your Shake)`);
+  row(`Charge: +${CHARGE_PER_TILE_COLOR_MATCH} per tile of a unit's bound color, +${CHARGE_PER_TILE_SHAPE_MATCH} per bound shape`);
+  for (const [label, defs] of [['YOUR UNITS', playerDefs], ['ENEMY UNITS', enemyDefs]] as const) {
+    row(label, true);
+    for (const t of UNIT_ORDER) {
+      const d = defs[t];
+      row(`${d.label} — cost ${d.cost} — ${COLOR_NAMES[d.color]} + ${SHAPE_NAMES[d.shape]}`);
+    }
   }
   return wrap;
 }
@@ -276,27 +373,27 @@ function showTitle(): void {
   // in-progress save exists
   const resumable = deserializeGame(loadBattleJson());
   if (resumable) {
-    buttons.push([`Continue (turn ${resumable.state.turn}, ${resumable.state.scenario === 'normal' ? 'normal' : 'forced loss'})`, () => void resumeBattle()]);
+    buttons.push([`Continue (turn ${resumable.state.turn})`, () => void resumeBattle()]);
   }
-  buttons.push([`Normal (${STARTING_HP_PLAYER_NORMAL} HP vs ${STARTING_HP_ENEMY} HP)`, () => void startBattle('normal')]);
-  buttons.push([`Forced loss (${STARTING_HP_PLAYER_LOW_SCENARIO} HP vs ${STARTING_HP_ENEMY} HP)`, () => void startBattle('forcedLoss')]);
-  showDialog('BREACH — PoC', 'Select scenario', buttons, configPanel());
+  // MK6.4: single Play button — the config (flags + HP) IS the battle setup
+  buttons.push(['Play', () => void startBattle()]);
+  showDialog('BREACH — PoC', 'Configure and play', buttons, configPanel());
 }
 
 // MK5.4: `cfg` is supplied by Restart paths (a restart is the same battle —
 // its rules are part of its identity); new games use the menu's config.
-async function startBattle(s: Scenario, cfg?: BattleConfig): Promise<void> {
+async function startBattle(cfg?: BattleConfig): Promise<void> {
   clearBattleSave(); // MK4.2: starting fresh wipes any resident save (also the corrupt-save escape hatch)
-  scenario = s;
   hideDialog();
-  game = new Game(s, cfg ?? menuConfig);
+  game = new Game(cfg ?? menuConfig);
   selection = null;
   targeting = false;
+  battleStartAt = Date.now();
   view.reset(gridViewOf(game.state.board));
   view.setSelection(null);
   busy = true;
   await view.play(game.startPlayerPhase());
-  busy = false;
+  endBusy();
   afterAction();
   maybeGameOver();
 }
@@ -309,15 +406,15 @@ async function resumeBattle(): Promise<void> {
   }
   hideDialog();
   game = g;
-  scenario = g.state.scenario;
   selection = null;
   targeting = false;
+  battleStartAt = Date.now(); // wall-clock counts this session (MK6.6 discretion)
   view.reset(gridViewOf(game.state.board));
   view.setSelection(null);
   console.info(`[breach] state restored (turn ${game.state.turn})`);
   busy = true;
   await view.play([{ t: 'msg', text: `Battle resumed — turn ${game.state.turn}` }]);
-  busy = false;
+  endBusy();
   // MK5.4: the save's config is authoritative for this battle. If it differs
   // from the current menu config, force an acknowledgment — auto-open the
   // config panel; the player must dismiss it to proceed (the overlay blocks
@@ -343,10 +440,10 @@ function afterAction(): void {
     appendMetricsLog({
       v: LOG_VERSION,
       battleId: game.state.battleId,
-      config: { ...game.state.config }, // MK5.5 — config stamp
+      config: { ...game.state.config }, // MK5.5 — config stamp (HP included)
       endedAt: new Date().toISOString(),
-      scenario: game.state.scenario,
       winner: game.state.winner,
+      wallClockMs: Date.now() - battleStartAt, // MK6.6
       metrics: game.state.metrics,
     });
   } else if (game.state.phase === 'playerPre') {
@@ -365,7 +462,7 @@ function maybeGameOver(): void {
     won ? 'VICTORY' : 'DEFEAT',
     won ? 'Enemy system breached.' : 'Your connection was severed.',
     [
-      ['Reset', () => void startBattle(scenario, cfg)],
+      ['Reset', () => void startBattle(cfg)],
       ['Quit', showTitle],
     ],
     metricsElement(game.state.metrics),
@@ -376,15 +473,20 @@ function maybeGameOver(): void {
 
 async function doSwap(a: Pt, b: Pt): Promise<void> {
   if (!game) return;
+  // MK6.6: think-time = input-available -> this committed move (only recorded
+  // if the swap matches; the clock keeps running through invalid attempts)
+  const thinkMs = thinkStart !== null ? performance.now() - thinkStart : undefined;
   busy = true;
-  const r = game.attemptSwap(a, b);
+  const r = game.attemptSwap(a, b, thinkMs);
   await view.play(r.events);
   if (r.matched) {
     if (!game.state.winner) await view.play(game.runEnemyPhase());
     if (!game.state.winner) await view.play(game.startPlayerPhase());
     afterAction();
+    endBusy(); // move committed: next turn's think clock starts fresh
+  } else {
+    busy = false; // invalid swap: the think clock keeps running (Q4)
   }
-  busy = false;
   maybeGameOver();
 }
 
@@ -468,20 +570,24 @@ attachInput(canvas, view, {
   },
   onMenu(): void {
     // Pause menu only in the make-a-match phase, never mid-resolution (spec 1.12).
-    // MK5.3: displays the ACTIVE battle config, read-only; MK5.4: mid-battle
-    // Reset also reuses this battle's config (same battle identity).
+    // MK5.3: active config read-only; MK6.5: character sheet alongside it;
+    // MK5.4: mid-battle Reset reuses this battle's config (same identity).
     if (!canAct() || !game) return;
     targeting = false;
     const cfg = { ...game.state.config };
+    const panels = document.createElement('div');
+    panels.className = 'panelscroll';
+    panels.appendChild(configSummary(cfg, 'ACTIVE BATTLE CONFIG'));
+    panels.appendChild(characterSheet(UNIT_DEFS, UNIT_DEFS)); // sides share defs today; MAY diverge later
     showDialog(
       'PAUSED',
       '',
       [
         ['Resume', hideDialog],
-        ['Reset', () => void startBattle(scenario, cfg)],
+        ['Reset', () => void startBattle(cfg)],
         ['Quit', showTitle],
       ],
-      configSummary(cfg, 'ACTIVE BATTLE CONFIG'),
+      panels,
     );
   },
 });

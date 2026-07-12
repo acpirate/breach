@@ -7,9 +7,6 @@ import {
   BOARD_SHAKE_COST,
   BOARD_SHAKE_STARTS_CHARGED,
   BOMBER_COUNTDOWN_TURNS,
-  STARTING_HP_ENEMY,
-  STARTING_HP_PLAYER_LOW_SCENARIO,
-  STARTING_HP_PLAYER_NORMAL,
   UNIT_DEFS,
 } from './constants';
 import { generateInitialBoard, reshuffleBoard, swap } from './board';
@@ -24,7 +21,6 @@ import {
   GameEvent,
   GameState,
   Pt,
-  Scenario,
   Side,
   UNIT_ORDER,
   UnitState,
@@ -39,11 +35,13 @@ export class Game {
   private logger: TurnLogger;
   private pendingTurnLogs: TurnLogEntry[] = [];
 
-  constructor(scenario: Scenario, config: BattleConfig, seed?: number) {
+  // MK6.4: no more scenarios — the config (including starting HP) IS the
+  // battle's identity.
+  constructor(config: BattleConfig, seed?: number) {
     const rng = makeRNG(seed);
     const gen = { rng, nextId: 1 };
     const board = generateInitialBoard(gen);
-    const battleId = `b${Date.now().toString(36)}-${scenario}`;
+    const battleId = `b${Date.now().toString(36)}`;
     this.logger = new TurnLogger(battleId);
     this.state = {
       board,
@@ -51,8 +49,8 @@ export class Game {
       nextId: gen.nextId,
       nextSeq: 1,
       hp: {
-        player: scenario === 'normal' ? STARTING_HP_PLAYER_NORMAL : STARTING_HP_PLAYER_LOW_SCENARIO,
-        enemy: STARTING_HP_ENEMY,
+        player: config.playerHp,
+        enemy: config.enemyHp,
       },
       units: {
         player: UNIT_ORDER.map((t) => ({ type: t, charge: 0 })),
@@ -61,7 +59,6 @@ export class Game {
       shakeCharge: BOARD_SHAKE_STARTS_CHARGED ? BOARD_SHAKE_COST : 0,
       phase: 'playerPre',
       winner: null,
-      scenario,
       turn: 1,
       metrics: createBattleMetrics(),
       battleId,
@@ -276,8 +273,10 @@ export class Game {
   }
 
   // 1.6.1.c/d — the turn-ending match. A swap producing no match reverts and
-  // does NOT consume the turn.
-  attemptSwap(a: Pt, b: Pt): { matched: boolean; events: GameEvent[] } {
+  // does NOT consume the turn. `thinkMs` (MK6.6) is the orchestrator-measured
+  // input-available -> move-committed delta, recorded only when the match
+  // commits (invalid swaps leave the clock running upstream).
+  attemptSwap(a: Pt, b: Pt, thinkMs?: number): { matched: boolean; events: GameEvent[] } {
     const s = this.state;
     const events: GameEvent[] = [];
     if (s.phase !== 'playerPre') return { matched: false, events };
@@ -291,6 +290,7 @@ export class Game {
       events.push({ t: 'noMatch' });
       return { matched: false, events };
     }
+    if (thinkMs !== undefined) events.push({ t: 'thinkTime', ms: Math.max(0, Math.round(thinkMs)) });
     s.phase = 'resolving'; // match committed — no further abilities this turn
     resolveCascades(s, 'player', events, this.matchBudget());
     return { matched: true, events: this.collect(events) };

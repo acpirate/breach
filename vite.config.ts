@@ -11,7 +11,15 @@ import { defineConfig, Plugin } from 'vite';
 
 function breachLogSink(): Plugin {
   const dir = path.resolve(process.cwd(), 'logs');
-  const file = path.join(dir, 'breach-logs.jsonl');
+  // MK6.8b: date-stamped files — a new file rolls automatically on a new day
+  // (a day/session tends to be one experiment, so it becomes the natural
+  // unit of analysis). Computed per write, which also covers a dev server
+  // left running across midnight.
+  const fileForToday = (): string => {
+    const d = new Date();
+    const stamp = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    return path.join(dir, `breach-logs-${stamp}.jsonl`);
+  };
   return {
     name: 'breach-log-sink',
     apply: 'serve',
@@ -30,7 +38,7 @@ function breachLogSink(): Plugin {
           try {
             JSON.parse(body); // only append well-formed lines
             fs.mkdirSync(dir, { recursive: true });
-            fs.appendFileSync(file, body.trim() + '\n');
+            fs.appendFileSync(fileForToday(), body.trim() + '\n');
             res.end('ok');
           } catch {
             res.statusCode = 400;

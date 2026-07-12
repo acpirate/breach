@@ -12,9 +12,9 @@ import { makeRNG } from './rng';
 import { GameState } from './types';
 
 // Save-format version (designer-set placeholder scheme; bump on state-shape
-// changes). MK5 added BattleConfig to the state shape — mk4 saves fail
-// gracefully to a fresh start, as designed.
-export const SAVE_VERSION = 'mk5';
+// changes). MK6 removed the scenario field and extended BattleConfig — older
+// saves fail gracefully to a fresh start, as designed.
+export const SAVE_VERSION = 'mk6';
 
 export function serializeGame(state: GameState): string {
   const { rng, ...plain } = state;
@@ -44,7 +44,10 @@ export function deserializeGame(json: string | null): Game | null {
       typeof c.enemyMatching !== 'boolean' ||
       typeof c.hackerBonusEnabled !== 'boolean' ||
       typeof c.singleAxisPayout !== 'boolean' ||
-      !(c.maxCascadeSteps === null || (Number.isInteger(c.maxCascadeSteps) && c.maxCascadeSteps >= 0 && c.maxCascadeSteps <= 9))
+      typeof c.noMatchDamage !== 'boolean' ||
+      !(c.maxCascadeSteps === null || (Number.isInteger(c.maxCascadeSteps) && c.maxCascadeSteps >= 0 && c.maxCascadeSteps <= 9)) ||
+      !(Number.isInteger(c.playerHp) && c.playerHp >= 1 && c.playerHp <= 9999) ||
+      !(Number.isInteger(c.enemyHp) && c.enemyHp >= 1 && c.enemyHp <= 9999)
     ) {
       return null;
     }

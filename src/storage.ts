@@ -76,7 +76,10 @@ export function loadMenuConfig(): BattleConfig {
       typeof c.enemyMatching !== 'boolean' ||
       typeof c.hackerBonusEnabled !== 'boolean' ||
       typeof c.singleAxisPayout !== 'boolean' ||
-      !(c.maxCascadeSteps === null || (Number.isInteger(c.maxCascadeSteps) && c.maxCascadeSteps >= 0 && c.maxCascadeSteps <= 9))
+      typeof c.noMatchDamage !== 'boolean' ||
+      !(c.maxCascadeSteps === null || (Number.isInteger(c.maxCascadeSteps) && c.maxCascadeSteps >= 0 && c.maxCascadeSteps <= 9)) ||
+      !(Number.isInteger(c.playerHp) && c.playerHp >= 1 && c.playerHp <= 9999) ||
+      !(Number.isInteger(c.enemyHp) && c.enemyHp >= 1 && c.enemyHp <= 9999)
     ) {
       return { ...DEFAULT_BATTLE_CONFIG };
     }
@@ -85,6 +88,9 @@ export function loadMenuConfig(): BattleConfig {
       hackerBonusEnabled: c.hackerBonusEnabled,
       singleAxisPayout: c.singleAxisPayout,
       maxCascadeSteps: c.maxCascadeSteps,
+      noMatchDamage: c.noMatchDamage,
+      playerHp: c.playerHp,
+      enemyHp: c.enemyHp,
     };
   } catch {
     return { ...DEFAULT_BATTLE_CONFIG };

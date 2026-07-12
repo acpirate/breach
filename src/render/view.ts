@@ -384,7 +384,7 @@ export class View {
           cx: r.x + r.w / 2,
           cy: r.y + r.h + 12,
           born: now,
-          color: '#ff7070',
+          color: '#ff5a5a',
         });
         break;
       }
@@ -405,6 +405,7 @@ export class View {
       case 'cascadeDepth':
       case 'shakeUsed':
       case 'tileStats':
+      case 'thinkTime':
         dur = 1;
         break;
     }
@@ -447,15 +448,19 @@ export class View {
       ctx.fillText(this.msgText, w / 2, this.boardY - 6);
     }
 
-    // floating damage numbers
-    this.floats = this.floats.filter((f) => now - f.born < 900);
+    // floating damage numbers — MK6.9b: transient UI can afford to be loud;
+    // big, bright, dark-outlined so the feedback is impossible to miss
+    this.floats = this.floats.filter((f) => now - f.born < 1000);
     for (const f of this.floats) {
-      const age = (now - f.born) / 900;
-      ctx.globalAlpha = 1 - age;
-      ctx.fillStyle = f.color;
-      ctx.font = 'bold 20px sans-serif';
+      const age = (now - f.born) / 1000;
+      ctx.globalAlpha = age < 0.7 ? 1 : 1 - (age - 0.7) / 0.3;
+      ctx.font = 'bold 40px sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText(f.text, f.cx, f.cy + 14 + age * 22);
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = '#000000';
+      ctx.strokeText(f.text, f.cx, f.cy + 24 + age * 30);
+      ctx.fillStyle = f.color;
+      ctx.fillText(f.text, f.cx, f.cy + 24 + age * 30);
       ctx.globalAlpha = 1;
     }
   }
@@ -676,18 +681,11 @@ export class View {
     }
 
     if (view.special) {
-      // ownership: white border = player, black border = enemy (spec 1.11).
-      // MK3.6: white (player) markers get a black outline so they read on
-      // light tile fills.
+      // MK6.9a: the tile-perimeter ownership outline is REMOVED (it distorted
+      // the enlarged icons and was redundant). Ownership now reads solely
+      // from the centered badge: white fill = player, black fill = enemy
+      // (spec 1.11 convention, preserved).
       const white = view.special.owner === 'player';
-      if (white) {
-        ctx.strokeStyle = '#000000';
-        ctx.lineWidth = 5;
-        ctx.strokeRect(px + 3.5, py + 3.5, c - 7, c - 7);
-      }
-      ctx.strokeStyle = white ? '#ffffff' : '#000000';
-      ctx.lineWidth = 3;
-      ctx.strokeRect(px + 3.5, py + 3.5, c - 7, c - 7);
       // MK3.6: badge (bomb countdown / buff "+") centered in the shape glyph
       const br = c * 0.22;
       const bx = px + c / 2;

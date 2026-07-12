@@ -63,6 +63,13 @@ canvas {
   margin-top: 8px;
 }
 
+/* MK6.5: scrollable container for pause-menu panels (config + char sheet) */
+.panelscroll {
+  overflow-y: auto;
+  min-height: 0;
+  max-height: 44vh;
+}
+
 /* MK5.3 battle-config panel (menu: editable; pause/ack: read-only) */
 .config {
   margin-top: 12px;

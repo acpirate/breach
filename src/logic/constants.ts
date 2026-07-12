@@ -21,6 +21,12 @@ export const DAMAGE_PER_TILE_LOW_COLOR = 1;
 export const DAMAGE_PER_TILE_HIGH_COLOR = 2;
 export const DAMAGE_PER_TILE_NEUTRAL = 2;
 
+// MK6.1: SHAPE gets its own damage tiers, symmetric with color (LOW=1,
+// HIGH=2). A COLOR-match damages via the tile's color tier; a SHAPE-match
+// via its shape tier (supersedes the MK5 stopgap of falling back to color).
+export const DAMAGE_PER_TILE_LOW_SHAPE = 1;
+export const DAMAGE_PER_TILE_HIGH_SHAPE = 2;
+
 // Charge is ALWAYS flat per qualifying destroyed tile — it never uses the
 // damage multiplier table below.
 export const CHARGE_PER_TILE_COLOR_MATCH = 1;
@@ -35,7 +41,9 @@ export const MATCH_5_LINE_MULTIPLIER = 1.5; // 5-line: crit AND clears row/colum
 export const MATCH_5_NONLINE_MULTIPLIER = 1.5;
 
 export const STARTING_HP_PLAYER_NORMAL = 150;
-export const STARTING_HP_PLAYER_LOW_SCENARIO = 1; // forced-loss test scenario
+// Deprecated by MK6.4 (forced-loss scenario removed — playerHp:1 in the
+// config is the same test); kept for tunables-block parity.
+export const STARTING_HP_PLAYER_LOW_SCENARIO = 1;
 export const STARTING_HP_ENEMY = 350; // designer-set for MK2 iteration
 
 export const BOARD_SHAKE_COST = 3;
@@ -78,24 +86,38 @@ export const CHARGE_CAP_EQUALS_COST = true;
 export const HACKER_BONUS_DAMAGE = 1; // extra damage per bonus-color tile (player match events only)
 export const HACKER_BONUS_CHARGE = 1; // extra charge per bonus-color tile to color-matching player units
 
-// MK5.2 — per-battle config defaults. All preserve current behavior EXCEPT
-// hackerBonusEnabled, which defaults OFF (deliberate: the flat color bonus
-// distorts the charge/damage economy; off gives a clean symmetric baseline).
+// MK5.2/MK6 — per-battle config defaults. hackerBonusEnabled defaults OFF
+// (MK5: symmetric baseline). maxCascadeSteps defaults 0 as of MK6.3 (cap-0
+// tested dramatically better: stable board, specials survive, abilities
+// matter more, closer battles). HP defaults are the MK6.4 config exposure of
+// the former fixed scenario values.
 export const DEFAULT_BATTLE_CONFIG: BattleConfig = {
   enemyMatching: false,
   hackerBonusEnabled: false,
   singleAxisPayout: false,
-  maxCascadeSteps: null, // null = infinite (sentinel)
+  maxCascadeSteps: 0, // MK6.3: cap-0 is the new default (null = infinite)
+  noMatchDamage: false, // MK6.2
+  playerHp: STARTING_HP_PLAYER_NORMAL,
+  enemyHp: STARTING_HP_ENEMY,
 };
 
 // ============================================================================
 // Agent-discretion assignments (approved by the designer)
 // ============================================================================
 
-// Color damage tiers: warm colors are HIGH (4 dmg/tile), cool colors are LOW
-// (2 dmg/tile). Mnemonic: "warm hits harder."
+// Color damage tiers: warm colors are HIGH, cool colors are LOW.
+// Mnemonic: "warm hits harder."
 export const HIGH_COLORS: Color[] = [Color.Red, Color.Yellow, Color.Magenta];
 export const LOW_COLORS: Color[] = [Color.Green, Color.Cyan, Color.Blue];
+
+// MK6.1 shape damage tiers (agent-assigned, approved): chosen so every unit's
+// binding pairs one HIGH axis with one LOW axis — Bomber Red(H)+Triangle(L),
+// Buffer Green(L)+Square(H), Attacker Yellow(H)+Star(L), Disabler
+// Blue(L)+Cross(H) — so no unit's bound tiles are double-high or double-low
+// and all four carry identical damage weight. Unbound shapes split too
+// (Diamond HIGH, Circle LOW).
+export const HIGH_SHAPES: Shape[] = [Shape.Square, Shape.Cross, Shape.Diamond];
+export const LOW_SHAPES: Shape[] = [Shape.Triangle, Shape.Star, Shape.Circle];
 
 // Hacker passive bonus color: Red (a HIGH color, the most visually salient).
 // Applies to PLAYER-owned match events only.

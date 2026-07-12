@@ -15,12 +15,15 @@ import {
   CHARGE_PER_TILE_COLOR_MATCH,
   CHARGE_PER_TILE_SHAPE_MATCH,
   DAMAGE_PER_TILE_HIGH_COLOR,
+  DAMAGE_PER_TILE_HIGH_SHAPE,
   DAMAGE_PER_TILE_LOW_COLOR,
+  DAMAGE_PER_TILE_LOW_SHAPE,
   DAMAGE_PER_TILE_NEUTRAL,
   HACKER_BONUS_CHARGE,
   HACKER_BONUS_COLOR,
   HACKER_BONUS_DAMAGE,
   HIGH_COLORS,
+  HIGH_SHAPES,
   SHAKE_CHARGE_PER_NEUTRAL_TILE,
   UNIT_DEFS,
 } from './constants';
@@ -38,13 +41,33 @@ export function buffBonus(state: GameState, side: Side): number {
   return n * BUFFER_DAMAGE_BONUS;
 }
 
-// Per-tile base damage value. The Hacker passive (+1 on Red) applies only to
-// PLAYER-owned MATCH events — never to bomb blasts and never to enemy events —
-// and only when the battle config enables it (MK5.2: default OFF).
-export function baseDamage(t: Tile, owner: Side, fromMatch: boolean, hackerOn: boolean): number {
+// Per-tile damage for BLAST destruction (not a match — no axis): a tile's
+// "own type's normal value" is its color tier / neutral value, per Section 1.
+export function baseDamage(t: Tile): number {
   if (t.kind === 'neutral') return DAMAGE_PER_TILE_NEUTRAL;
-  let v = HIGH_COLORS.includes(t.color!) ? DAMAGE_PER_TILE_HIGH_COLOR : DAMAGE_PER_TILE_LOW_COLOR;
-  if (hackerOn && fromMatch && owner === 'player' && t.color === HACKER_BONUS_COLOR) v += HACKER_BONUS_DAMAGE;
+  return HIGH_COLORS.includes(t.color!) ? DAMAGE_PER_TILE_HIGH_COLOR : DAMAGE_PER_TILE_LOW_COLOR;
+}
+
+// MK6.1 — per-tile damage for MATCH destruction, resolved on the axis(es)
+// that destroyed the tile: color-axis (and neutral-axis line sweeps hitting
+// standard tiles, which have no shape/color stake in a neutral match — treated
+// like blast destruction) pay the tile's COLOR tier; shape-axis pays its
+// SHAPE tier. A tile destroyed via both axes is counted ONCE at the higher
+// applicable value (mirror of the highest-multiplier-wins rule).
+// The Hacker passive (+1 on Red, player match events, config-gated) rides the
+// color-tier value.
+function matchTileDamage(t: Tile, axes: Set<MatchCondition>, owner: Side, hackerOn: boolean): number {
+  if (t.kind === 'neutral') return DAMAGE_PER_TILE_NEUTRAL;
+  let v = 0;
+  if (axes.has('color') || axes.has('neutral')) {
+    let c = HIGH_COLORS.includes(t.color!) ? DAMAGE_PER_TILE_HIGH_COLOR : DAMAGE_PER_TILE_LOW_COLOR;
+    if (hackerOn && owner === 'player' && t.color === HACKER_BONUS_COLOR) c += HACKER_BONUS_DAMAGE;
+    v = c;
+  }
+  if (axes.has('shape')) {
+    const s = HIGH_SHAPES.includes(t.shape!) ? DAMAGE_PER_TILE_HIGH_SHAPE : DAMAGE_PER_TILE_LOW_SHAPE;
+    if (s > v) v = s;
+  }
   return v;
 }
 
@@ -245,7 +268,7 @@ export function resolveCascades(state: GameState, owner: Side, events: GameEvent
       const t = state.board[p.y][p.x];
       if (!t) continue;
       destroyed.push(p);
-      const base = baseDamage(t, owner, true, hackerOn);
+      const base = matchTileDamage(t, axes, owner, hackerOn); // MK6.1: axis-resolved
       raw += base * m;
       if (m > 1) critExtra += base * (m - 1);
       if (t.kind === 'standard' && (BOUND_COLORS.has(t.color!) || BOUND_SHAPES.has(t.shape!))) contested++;
@@ -259,14 +282,20 @@ export function resolveCascades(state: GameState, owner: Side, events: GameEvent
     events.push({ t: 'destroy', cells: destroyed });
     for (const p of destroyed) state.board[p.y][p.x] = null;
 
-    // Fractional crit sums are floored (documented in README).
-    dealDamage(
-      state,
-      opponentOf(owner),
-      Math.floor(raw) + bonus,
-      { source: 'match', label: owner === 'player' ? 'match' : 'enemy match', critExtra, buffBonus: bonus },
-      events,
-    );
+    // MK6.2 NO_MATCH_DAMAGE: matches deal ZERO damage — no damage event at
+    // all (the buff bonus must not leak through on a zero base). Charge,
+    // destruction, contention, and cascading above are untouched; bomb
+    // DETONATIONS are unaffected (they resolve in resolveDetonation).
+    if (!state.config.noMatchDamage) {
+      // Fractional crit sums are floored (documented in README).
+      dealDamage(
+        state,
+        opponentOf(owner),
+        Math.floor(raw) + bonus,
+        { source: 'match', label: owner === 'player' ? 'match' : 'enemy match', critExtra, buffBonus: bonus },
+        events,
+      );
+    }
     applyGravityAndRefill(state, events, budget !== null && steps >= budget);
   }
   if (steps > 0) events.push({ t: 'cascadeDepth', side: owner, depth: steps });
@@ -297,7 +326,7 @@ export function resolveDetonation(state: GameState, p: Pt, events: GameEvent[]):
 
   const bonus = buffBonus(state, owner);
   let raw = 0;
-  for (const c of cells) raw += baseDamage(state.board[c.y][c.x]!, owner, false, false);
+  for (const c of cells) raw += baseDamage(state.board[c.y][c.x]!);
 
   events.push({ t: 'destroy', cells });
   for (const c of cells) state.board[c.y][c.x] = null;

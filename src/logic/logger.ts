@@ -9,11 +9,11 @@
 // Tier 3 (full board snapshots): PARKED — deliberately not built.
 
 import { BattleMetrics } from './metrics';
-import { BattleConfig, GameEvent, GameState, Scenario, Side, opponentOf } from './types';
+import { BattleConfig, GameEvent, GameState, Side, opponentOf } from './types';
 
 // Version tag stamped on every log entry (designer-set; placeholder scheme).
 // Older-version entries remain in the logs until explicitly cleared.
-export const LOG_VERSION = 'mk5';
+export const LOG_VERSION = 'mk6';
 
 // Log-size caps — directly controlled here, comfortably under the ~5MB
 // localStorage quota (entries are a few hundred bytes each). The storage
@@ -39,16 +39,17 @@ export interface TurnLogEntry {
   reshuffles: number;
   hpAfter: Record<Side, number>;
   chargesAfter: { player: number[]; enemy: number[]; shake: number };
+  thinkMs?: number; // MK6.6 — RAW think-time for this turn's committed move (no aggregation)
   result?: Side; // present on a battle's final entry: who won
 }
 
 export interface MetricLogEntry {
   v: string; // LOG_VERSION
   battleId: string;
-  config: BattleConfig; // MK5.5 — active config stamp
+  config: BattleConfig; // MK5.5 — active config stamp (HP included as of MK6.4)
   endedAt: string; // ISO timestamp
-  scenario: Scenario;
   winner: Side;
+  wallClockMs?: number; // MK6.6 — total battle wall-clock (this session)
   metrics: BattleMetrics;
 }
 
@@ -106,6 +107,9 @@ export class TurnLogger {
           e.damage[dealer].total += ev.amount;
           break;
         }
+        case 'thinkTime':
+          e.thinkMs = ev.ms;
+          break;
         default:
           break;
       }
