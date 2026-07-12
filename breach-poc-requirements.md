@@ -577,6 +577,95 @@ Not in MK5: action-point turn economy; no-match-damage mode; unit HP / knockout 
 
 ---
 
+# Section 1-MK6: Shape Damage, No-Match-Damage, Instrumentation & QoL (BUILD THIS, ON TOP OF MK5)
+
+Assumes Sections 1, MK2–MK5 are built and working. Each item is a DELTA against the current build — where MK6 conflicts with an earlier section, MK6 governs; everything not mentioned is unchanged. Section 2 (Roadmap) remains out of scope.
+
+**Intent (context, not a build instruction):** MK5's enemy-matching change was the project's biggest success — the matching-denial contest is now the game's engine. Two things follow. (1) The logs show the ABILITY layer is not carrying weight (abilities are 16–33% of damage; the enemy often deals 100% of its damage via matches alone). MK6 adds the tools to fix that: a `NO_MATCH_DAMAGE` experiment, shape damage (so the two axes are real), and buffer-damage attribution so ability contribution is finally measurable. (2) Cap-0 cascades tested dramatically better than uncapped, so cap-0 becomes the new default. Plus a batch of instrumentation and QoL fixes. No new abilities, no unit HP/KO, no escalating cascade cap (that's a future headline mechanic).
+
+## MK6.1 Shape damage — make the axes symmetric
+
+Currently COLOR carries two payloads (damage + charge) while SHAPE carries only one (charge). The axes were never symmetric; `SINGLE_AXIS_PAYOUT` exposed this (a shape-match had no damage value of its own, and the MK5 stopgap fell back to the tile's color for damage).
+
+- **Give SHAPE its own damage tiers, mirroring color's structure.** Add `DAMAGE_PER_TILE_LOW_SHAPE` and `DAMAGE_PER_TILE_HIGH_SHAPE`, with 3 of the 6 shapes designated LOW and 3 designated HIGH (agent assigns and documents, same as the color tiers).
+- **Values: symmetric with the current (MK3-halved) color values — LOW = 1, HIGH = 2.** Neutral stays as-is.
+- **Damage resolution:** a COLOR-match resolves damage per tile via that tile's COLOR tier. A SHAPE-match resolves damage per tile via that tile's SHAPE tier. (This supersedes the MK5 stopgap where shape-matches used the tile's color for damage.)
+- **Blob matches** are already tagged by axis (color-blob vs shape-blob), so they resolve on their own axis. Unchanged.
+- **Charge is unchanged** (still flat 1 per qualifying tile per axis).
+- **DESIGN NOTE (do not implement):** a deliberately ASYMMETRIC version (shape = economy axis, low/no damage; color = aggression axis) is an attractive future direction tied to faction identity — but MK6 uses the SYMMETRIC version deliberately, so `SINGLE_AXIS_PAYOUT` can be read without a "color is obviously better" confound.
+
+## MK6.2 `NO_MATCH_DAMAGE` flag (new config flag, default OFF)
+
+The top experiment. Tests whether the ability layer can carry the game while PRESERVING the matching-denial contest that makes the game good.
+
+- When ON: **matches deal ZERO damage** (color-matches and shape-matches alike).
+- **Match CHARGE is UNCHANGED** — still flat per-tile, both axes. This is the whole point: the denial contest survives because both sides are still fighting over the same tiles, just for charge instead of damage.
+- **Abilities become the only damage source.**
+- **CRITICAL CARVE-OUT — bomb detonations STILL deal their normal per-destroyed-tile damage.** A detonation is an ABILITY effect, not a match. Do NOT implement this as "destroyed tiles deal no damage" — that would silently gut bombs, which are the best-performing ability in the game. The rule is specifically: *matches* deal no damage; *detonations* are unaffected.
+- **Buffer's damage bonus applies to ABILITY damage only** when this flag is on (its match-damage half is inert, since match damage is zero).
+- Crit multipliers become moot for damage (nothing to multiply). No special handling needed — just confirm nothing divides-by-zero or crashes on a zero base.
+
+## MK6.3 Cap-0 cascades become the DEFAULT
+
+- **`MAX_CASCADE_STEPS` now DEFAULTS TO 0** (was: infinite/sentinel). The "Infinite?" toggle and the 0–9 integer input remain exactly as built in MK5.3 — only the DEFAULT changes.
+- Rationale (context): cap-0 tested dramatically better — the board stays stable, so deliberate board manipulation (denying the opponent a 4-match, reading post-match position) is far more tactically satisfying; special tiles SURVIVE instead of being cascaded away; ability share of damage rose from 16–20% to 21–33%; battles got longer and much closer (variance moved from "who got the lucky cascade" to "who played better"). Dual-axis matching still prevents deadlock, so stability costs nothing in playability.
+
+## MK6.4 Expose HP as config parameters, and collapse the scenario selector
+
+- **Add `PLAYER_STARTING_HP` and `ENEMY_STARTING_HP` to the per-battle config** (settable on the menu screen, alongside the existing flags; persisted and stamped into the save and logs like every other config value).
+- Rationale: with the sides now symmetric (MK5), **HP is the dominant balance lever** — but it currently requires an edit-and-rebuild to change. Exposing it allows dialing 150v350 → 200v200 → 250v250 between battles to find where the fight actually lives.
+- **REMOVE the forced-loss scenario.** It existed only because there was no other way to force-test the loss path — it was a workaround for a missing knob. With HP exposed, "player starts at 1 HP" is simply a config you set.
+- **Collapse the scenario selector to a single "Play" button.** The menu screen is now: the config controls (flags + HP) and a Play button (plus Continue when a valid in-progress save exists, per MK4.2, and Reset to Defaults per MK5.3).
+- Current defaults remain player 150 / enemy 350 unless changed in the menu.
+
+## MK6.5 Character sheet (new pause-menu panel)
+
+A reference panel in the existing pause menu, alongside the config display. It is read-only.
+
+Contents:
+- **Damage values:** per color (LOW/HIGH tiers), per shape (LOW/HIGH tiers, new in MK6.1), and neutral.
+- **Charge values:** per color and per shape.
+- **Unit bindings — which color + shape charges each of the 4 units — FOR BOTH SIDES.**
+- **Unit costs** (7 / 13 / 19 / 22).
+
+Rationale: (a) with two damage axes there is currently NOWHERE in the game to see what any of the numbers are — it's only playable by the person who designed them; (b) it doubles as pseudo-HELP for any player who isn't the designer; (c) it is **strategically load-bearing** — with same bindings on a shared board, reading the opponent's bindings is what tells you which tiles are contested; (d) it doubles as a debugging aid — when a flag changes payout rules, the sheet is where you SEE the rules changed rather than inferring from behavior.
+
+**Build the display assuming the two sides' bindings MAY DIVERGE.** Different-bindings is a live future experiment and faction axis-identity would make them differ by design — do NOT hardcode a single shared table. Unit descriptions/lore can come later; values + bindings are enough.
+
+## MK6.6 Timing metrics — think-time as an engagement proxy
+
+- Track and log **per-turn real-time deltas** and **total battle wall-clock**.
+- **What to measure (this determines whether the metric works at all):** the clock runs from **player-input-available → player-committed-a-move**. Do NOT measure turn-start to turn-start. Turn wall-clock includes cascade animations, ability resolution, and the enemy's turn — none of which is the player thinking. If you measure turn-to-turn, **cap-0 would show SHORTER think-times purely because there is less animation, inverting the signal.**
+- **Log RAW per-turn timestamps. Do NOT pre-aggregate into an average.** Analysis reads the MEDIAN and spread downstream; a few 300-second outliers (player walked away, phone locked) would poison a mean but will not move a median.
+- Rationale: per-turn think-time is a proxy for **how often the board is actually making the player think** — a 2-second turn was obvious; a 25-second turn was real scanning. No current metric touches this, and it is the closest thing to a fun-meter available from a log. It also lets configs be compared on the axis that matters: win rate and damage cannot tell you which mode is more engrossing, but a median think-time shift can.
+- **Save/background edge cases: agent's discretion.** Either pause the clock or accept the gap — since analysis reads medians, outliers wash out either way. Do not over-engineer this.
+
+## MK6.7 Buffer damage attribution
+
+- Currently the Buffer's +5 is folded into whatever it amplified (match / attacker / bomb damage), so **the Buffer's entire damage contribution is invisible** — it could be contributing nothing or 60/battle and the logs would read identically.
+- **Add a single per-side total: "buffer damage added."** Defined as: for each damage event, `(damage_dealt − damage_that_would_have_been_dealt_with_zero_active_buff_stacks)`, summed across the battle. This is unambiguous and correctly handles stacking (multiple buff tiles) without double-counting.
+- **Do NOT add a per-source split** (buffer-on-match vs buffer-on-ability) this pass. The one scenario where the split would matter is `NO_MATCH_DAMAGE`, and there it can be inferred by comparing buffer-total with the flag off vs on.
+- Include it in the batch output and the game-over metrics display, like all other metrics.
+
+## MK6.8 Logging fixes
+
+- **`logs:dump` pretty-printer is LOSSY — fix the formatter.** The raw JSONL is CORRECT and COMPLETE (config, version, and contention fields are all present per battle, exactly as MK5.5 specced). But the human-readable dump **strips `entry.config`, `entry.v`, and the contention fields**. The data was never lost — the view is. Fix the dump to include them. (MK6's new timing and buffer metrics must also appear in the dump.)
+- **Date-stamped log files.** Roll a new log file when the dev server starts on a new day (e.g. `logs/breach-logs-2026-07-11.jsonl`). A day/session tends to be one experiment, so this makes it the natural unit of analysis instead of one growing pile needing date-filtering.
+
+## MK6.9 Visual / UX fixes
+
+- **Remove the tile-perimeter ownership outline on special tiles.** With MK4.4's enlarged icons, the outline around the TILE now visibly distorts the shape (squaring off corners, fighting the silhouette that was enlarged for legibility), and it is redundant — the centered badge already conveys ownership unambiguously via its own white/black fill.
+  - **GUARD: keep the badge's white=player / black=enemy fill convention.** That IS the ownership signal now. Remove only the tile-perimeter outline; do not strip ownership indication entirely.
+- **Make the floating damage/charge popup numbers MUCH bigger.** The current popups are tiny and dark. **Transient UI can afford to be loud precisely because it is transient** — a number that lives for a few hundred milliseconds and vanishes should be impossible to miss. Briefly occluding part of the board is acceptable and costs nothing (the player is reading the outcome of their move at that instant, not the board), whereas a number too small to read costs the feedback entirely. This is the same principle as MK3.6's font-size flip, applied to a component added afterwards.
+
+## MK6 — Out of scope (parked)
+
+Not in MK6: the **escalating cascade cap** (cap starts at 0 and climbs over the battle as an organic timer — a future headline mechanic, needs its own design pass); cascade-manipulation abilities; action-point turn economy; unit HP / knockout / debuffs; additional abilities per unit (still deliberately deferred — abilities must be made to MATTER before more are added); axis-identity factions (gated on the superstructure/loadout layer); overcharge and the charging-model exploration; special-tile hardening (largely superseded by cap-0); different-bindings; AI difficulty tiers. See Section 2 and the design backlog.
+
+**Note on `SINGLE_AXIS_PAYOUT`:** already built (MK5) and tested — it produced a negative result (fewer abilities charged, so abilities mattered LESS) because it forced a choice between axes before the axes differed in kind. **Leave the flag in, defaulted OFF.** MK6.1's shape damage is what makes it potentially meaningful; retest it after this build.
+
+---
+
 # Section 2: Roadmap (DO NOT BUILD — CONTEXT ONLY)
 
 This section exists so future work has a documented home and so deferred ideas aren't lost. Nothing in this section should be implemented as part of the PoC. If anything here appears to conflict with Section 1, Section 1 governs for this build.
@@ -1036,4 +1125,118 @@ run); the charge-source contention numbers with enemy matching on; and confirm (
 resumed battle with a divergent config force-opens the config panel, (b) restart reuses
 the prior battle's config, (c) cascade cap 0 behaves as specified, and (d) the config is
 stamped in both log tiers.
+```
+
+# Coding Agent Prompt — MK6 Iteration (Ready to Paste)
+
+```
+This is a sixth iteration on the existing, working "Breach" build in this repo.
+Sections 1 and MK2-MK5 are complete, verified, and committed. Now implement
+"Section 1-MK6: Shape Damage, No-Match-Damage, Instrumentation & QoL" from
+breach-poc-requirements.md.
+
+Read Section 1-MK6 in full first, including its intent note. Context for why:
+MK5's enemy-matching change made the matching-denial contest the game's engine —
+that part works. But the logs show the ABILITY layer is NOT carrying weight
+(abilities are 16-33% of damage; the enemy often deals 100% of its damage through
+matches alone). MK6 adds the tools to address that, makes cap-0 the default, and
+clears a batch of instrumentation/QoL debt. NO new abilities and NO new combat
+mechanics beyond the NO_MATCH_DAMAGE flag.
+
+1. MK6.1 SHAPE DAMAGE (make the axes symmetric) — currently COLOR carries damage +
+   charge while SHAPE carries only charge. Add DAMAGE_PER_TILE_LOW_SHAPE and
+   DAMAGE_PER_TILE_HIGH_SHAPE (LOW=1, HIGH=2, symmetric with the current halved
+   color values); assign 3 of the 6 shapes LOW and 3 HIGH and DOCUMENT the split.
+   A COLOR-match now resolves damage via each tile's COLOR tier; a SHAPE-match
+   resolves damage via each tile's SHAPE tier. This SUPERSEDES the MK5 stopgap
+   where shape-matches fell back to the tile's color for damage. Blob matches are
+   already axis-tagged, so they resolve on their own axis. Charge is unchanged.
+
+2. MK6.2 NO_MATCH_DAMAGE (new config flag, default OFF) — when ON, matches deal
+   ZERO damage (both axes). Match CHARGE is UNCHANGED (this is the point — the
+   denial contest survives; both sides still fight over the same tiles, for charge
+   instead of damage). Abilities become the only damage source.
+   *** CRITICAL CARVE-OUT: bomb detonations STILL deal their normal per-destroyed-
+   tile damage. A detonation is an ABILITY effect, not a match. Do NOT implement
+   this as "destroyed tiles deal no damage" — that would silently gut bombs, the
+   best-performing ability in the game. The rule is: MATCHES deal no damage;
+   DETONATIONS are unaffected. ***
+   Buffer's bonus applies to ABILITY damage only when this flag is on. Confirm
+   nothing crashes/divides-by-zero with a zero damage base.
+
+3. MK6.3 CAP-0 IS THE NEW DEFAULT — MAX_CASCADE_STEPS now defaults to 0 (was
+   infinite). The "Infinite?" toggle and 0-9 input from MK5.3 are unchanged; only
+   the DEFAULT changes. (Cap-0 tested dramatically better: stable board, special
+   tiles survive, ability share rose, battles longer and closer.)
+
+4. MK6.4 EXPOSE HP AS CONFIG + COLLAPSE THE SCENARIO SELECTOR — add
+   PLAYER_STARTING_HP and ENEMY_STARTING_HP to the per-battle config (menu-settable,
+   persisted, stamped into save and logs like every other config value). HP is now
+   the dominant balance lever and currently needs a rebuild to change.
+   THEN: REMOVE the forced-loss scenario entirely (it was only a workaround for the
+   missing HP knob — "player starts at 1 HP" is now just a config) and COLLAPSE the
+   scenario selector to a single "Play" button. The menu becomes: config controls
+   (flags + HP) + Play + Continue (when a valid save exists) + Reset to Defaults.
+   Defaults stay player 150 / enemy 350.
+
+5. MK6.5 CHARACTER SHEET — a read-only reference panel in the existing pause menu,
+   beside the config display. Shows: damage values per color (LOW/HIGH) and per
+   shape (LOW/HIGH) and neutral; charge values per axis; UNIT BINDINGS (which color
+   + shape charges each of the 4 units) FOR BOTH SIDES; and unit costs (7/13/19/22).
+   BUILD IT ASSUMING THE TWO SIDES' BINDINGS MAY DIVERGE — do not hardcode a single
+   shared table (different-bindings is a live future experiment).
+
+6. MK6.6 TIMING METRICS — track per-turn real-time deltas and total battle wall-clock.
+   *** Measure from PLAYER-INPUT-AVAILABLE -> PLAYER-COMMITTED-A-MOVE. Do NOT measure
+   turn-start to turn-start: turn wall-clock includes animations, ability resolution,
+   and the enemy's turn, none of which is the player thinking — and measuring
+   turn-to-turn would make cap-0 show SHORTER think-times purely from less
+   animation, INVERTING the signal. ***
+   LOG RAW TIMESTAMPS; do NOT pre-aggregate into an average (analysis reads medians;
+   a few AFK outliers would poison a mean). Save/background edge cases: your
+   discretion — don't over-engineer.
+
+7. MK6.7 BUFFER DAMAGE ATTRIBUTION — the Buffer's +5 is currently folded into whatever
+   it amplified, so its entire contribution is invisible. Add ONE per-side total:
+   "buffer damage added" = for each damage event, (damage_dealt − damage_that_would_
+   have_been_dealt_with_zero_active_buff_stacks), summed. Handles stacking without
+   double-counting. Do NOT add a per-source split this pass. Include in batch output
+   and the game-over metrics display.
+
+8. MK6.8 LOGGING FIXES — (a) the logs:dump pretty-printer is LOSSY: the raw JSONL is
+   correct and complete, but the dump STRIPS entry.config, entry.v, and the contention
+   fields. Fix the FORMATTER (the logging is fine) and make sure MK6's new timing and
+   buffer metrics appear in the dump too. (b) Roll a NEW date-stamped log file when the
+   dev server starts on a new day (e.g. logs/breach-logs-2026-07-11.jsonl).
+
+9. MK6.9 VISUAL/UX — (a) REMOVE the tile-perimeter ownership outline on special tiles:
+   with the enlarged icons it now distorts the shape and is redundant. *** GUARD: KEEP
+   the badge's white=player / black=enemy fill — that IS the ownership signal now.
+   Remove only the tile outline; do not strip ownership indication. *** (b) Make the
+   floating damage/charge popup numbers MUCH BIGGER — they're currently tiny and dark.
+   Transient UI can afford to be loud BECAUSE it's transient; briefly occluding part of
+   the board is fine (the player is reading their move's outcome, not the board), while
+   a number too small to read costs the feedback entirely.
+
+CRITICAL:
+- DELTAS on top of the existing build. Do not rebuild working systems. Where MK6
+  conflicts with an earlier section, MK6 wins; everything else stays.
+- NO new abilities. NO unit HP/knockout. NO escalating cascade cap. NO action-point
+  economy. All parked (see MK6 "Out of scope").
+- SINGLE_AXIS_PAYOUT already exists (MK5) and tested negative. LEAVE IT IN, defaulted
+  OFF. MK6.1's shape damage is what may make it meaningful — do not remove it.
+- Keep logic/render separation. New metrics go in the logic layer on the EXISTING event
+  stream — do not create a parallel pipeline. Constants in the constants module.
+- Keep MK5 as a clean committed restore point.
+
+Before writing code, tell me: (1) any clarifying questions; (2) your LOW/HIGH split for
+the 6 shapes; and (3) your one-line plan for where the think-time clock starts and stops
+(this is the part most likely to be implemented backwards — see the warning in item 6).
+Then wait for my go-ahead.
+
+After building, report: (a) ability share of damage with NO_MATCH_DAMAGE off vs on;
+(b) buffer damage added, per side; (c) median per-turn think-time; and confirm (d) bombs
+STILL deal detonation damage under NO_MATCH_DAMAGE, (e) the dump now includes config,
+version, contention, timing, and buffer fields, and (f) HP is settable from the menu and
+the forced-loss scenario is gone.
 ```
