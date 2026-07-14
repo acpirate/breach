@@ -5,10 +5,10 @@
 // first valid move. No look-ahead, no board evaluation — this tier doubles as
 // the enemy's difficulty knob later (future work, not a setting now).
 
-import { BOARD_HEIGHT, BOARD_WIDTH } from './constants';
+import { BOARD_HEIGHT, BOARD_WIDTH, UNIT_DEFS } from './constants';
 import { swap } from './board';
 import { detectMatches } from './match';
-import { Board, Pt } from './types';
+import { BattleConfig, Board, Pt } from './types';
 
 export function findBotMove(board: Board): { a: Pt; b: Pt } | null {
   const dirs = [{ dx: 1, dy: 0 }, { dx: 0, dy: 1 }];
@@ -31,4 +31,83 @@ export function findBotMove(board: Board): { a: Pt; b: Pt } | null {
     }
   }
   return firstValid;
+}
+
+// MK7.13 — charge-aware tier for NO_MATCH_DAMAGE: prefer-4 is a DAMAGE
+// heuristic and under NMD it optimizes for a quantity that no longer exists.
+// This tier scores each valid move by how many matched tiles feed the mover's
+// unit bindings (color or shape), i.e. it matches for CHARGE. Still one dumb
+// selection rule — the bot remains a floor indicator.
+const BOT_BOUND_COLORS = new Set(Object.values(UNIT_DEFS).map((d) => d.color));
+const BOT_BOUND_SHAPES = new Set(Object.values(UNIT_DEFS).map((d) => d.shape));
+
+export function findChargeMove(board: Board): { a: Pt; b: Pt } | null {
+  const dirs = [{ dx: 1, dy: 0 }, { dx: 0, dy: 1 }];
+  let best: { a: Pt; b: Pt } | null = null;
+  let bestScore = -1;
+  for (let y = 0; y < BOARD_HEIGHT; y++) {
+    for (let x = 0; x < BOARD_WIDTH; x++) {
+      for (const d of dirs) {
+        const nx = x + d.dx;
+        const ny = y + d.dy;
+        if (nx >= BOARD_WIDTH || ny >= BOARD_HEIGHT) continue;
+        const a: Pt = { x, y };
+        const b: Pt = { x: nx, y: ny };
+        swap(board, a, b);
+        const matches = detectMatches(board);
+        let score = -1;
+        if (matches.length) {
+          score = 0;
+          const seen = new Set<number>();
+          for (const m of matches) {
+            for (const c of m.cells) {
+              const k = c.y * BOARD_WIDTH + c.x;
+              if (seen.has(k)) continue;
+              seen.add(k);
+              const t = board[c.y][c.x];
+              if (!t || t.kind !== 'standard') continue;
+              if (BOT_BOUND_COLORS.has(t.color!)) score++;
+              if (BOT_BOUND_SHAPES.has(t.shape!)) score++;
+            }
+          }
+        }
+        swap(board, a, b);
+        if (score > bestScore) {
+          bestScore = score;
+          best = { a, b };
+        }
+      }
+    }
+  }
+  return bestScore >= 0 ? best : null;
+}
+
+// Config-aware selection: the NMD charge-aware tier applies only when
+// noMatchDamage is on AND the nmdChargeAwareBot sub-option (designer
+// addendum, default on) hasn't been switched back to the classic heuristic.
+export function pickBotMove(board: Board, config: BattleConfig): { a: Pt; b: Pt } | null {
+  if (config.noMatchDamage && config.nmdChargeAwareBot) return findChargeMove(board);
+  return findBotMove(board);
+}
+
+// MK7.7/MK7.8 — hint helper: a move that produces a 4+ match, if one exists
+// (the hint system shows nothing otherwise).
+export function findHintMove(board: Board): { a: Pt; b: Pt } | null {
+  const dirs = [{ dx: 1, dy: 0 }, { dx: 0, dy: 1 }];
+  for (let y = 0; y < BOARD_HEIGHT; y++) {
+    for (let x = 0; x < BOARD_WIDTH; x++) {
+      for (const d of dirs) {
+        const nx = x + d.dx;
+        const ny = y + d.dy;
+        if (nx >= BOARD_WIDTH || ny >= BOARD_HEIGHT) continue;
+        const a: Pt = { x, y };
+        const b: Pt = { x: nx, y: ny };
+        swap(board, a, b);
+        const big = detectMatches(board).some((m) => m.length >= 4);
+        swap(board, a, b);
+        if (big) return { a, b };
+      }
+    }
+  }
+  return null;
 }

@@ -8,9 +8,10 @@ import {
   BOARD_SHAKE_STARTS_CHARGED,
   BOMBER_COUNTDOWN_TURNS,
   UNIT_DEFS,
+  effectiveCost,
 } from './constants';
 import { generateInitialBoard, reshuffleBoard, swap } from './board';
-import { findBotMove } from './bot';
+import { pickBotMove } from './bot';
 import { TurnLogEntry, TurnLogger } from './logger';
 import { detectMatches } from './match';
 import { consumeEvents, createBattleMetrics } from './metrics';
@@ -102,7 +103,21 @@ export class Game {
     consumeEvents(this.state.metrics, events);
     this.state.metrics.turns = this.state.turn;
     this.state.metrics.winner = this.state.winner;
-    this.pendingTurnLogs.push(...this.logger.consume(this.state, events));
+    const finalized = this.logger.consume(this.state, events);
+    // MK7.6 — round metrics derive from the turn log's per-turn damage totals
+    // (a "round" = one game turn), still the same single event stream.
+    for (const entry of finalized) {
+      for (const side of ['player', 'enemy'] as const) {
+        const sm = this.state.metrics.sides[side];
+        const total = entry.damage[side].total;
+        if (total > sm.biggestRound) sm.biggestRound = total;
+        if (total > 0) {
+          sm.roundDamageSum += total;
+          sm.roundDamageCount++;
+        }
+      }
+    }
+    this.pendingTurnLogs.push(...finalized);
     return events;
   }
 
@@ -177,9 +192,9 @@ export class Game {
     const events: GameEvent[] = [];
     if (s.phase !== 'playerPre') return events;
     const u = s.units.player[idx];
-    if (!u || u.charge < UNIT_DEFS[u.type].cost) return events;
+    if (!u || u.charge < effectiveCost(s.config, u.type)) return events;
     if (u.type === 'disabler' && (targetIdx === undefined || !s.units.enemy[targetIdx])) return events;
-    u.charge -= UNIT_DEFS[u.type].cost;
+    u.charge -= effectiveCost(s.config, u.type);
     s.phase = 'resolving';
     this.castUnit('player', u.type, events, targetIdx);
     if (!s.winner) s.phase = 'playerPre';
@@ -276,7 +291,7 @@ export class Game {
   // does NOT consume the turn. `thinkMs` (MK6.6) is the orchestrator-measured
   // input-available -> move-committed delta, recorded only when the match
   // commits (invalid swaps leave the clock running upstream).
-  attemptSwap(a: Pt, b: Pt, thinkMs?: number): { matched: boolean; events: GameEvent[] } {
+  attemptSwap(a: Pt, b: Pt, thinkMs?: number, hintShown?: boolean): { matched: boolean; events: GameEvent[] } {
     const s = this.state;
     const events: GameEvent[] = [];
     if (s.phase !== 'playerPre') return { matched: false, events };
@@ -291,8 +306,9 @@ export class Game {
       return { matched: false, events };
     }
     if (thinkMs !== undefined) events.push({ t: 'thinkTime', ms: Math.max(0, Math.round(thinkMs)) });
+    if (hintShown) events.push({ t: 'hintShown' }); // MK7.7: excludable from think-time analysis
     s.phase = 'resolving'; // match committed — no further abilities this turn
-    resolveCascades(s, 'player', events, this.matchBudget());
+    resolveCascades(s, 'player', events, this.matchBudget(), 'match', new Set());
     return { matched: true, events: this.collect(events) };
   }
 
@@ -315,28 +331,29 @@ export class Game {
     this.tickBombs('enemy', events);
     if (s.winner) return this.collect(events);
 
-    const ready = s.units.enemy.filter((u) => u.charge >= UNIT_DEFS[u.type].cost);
+    const ready = s.units.enemy.filter((u) => u.charge >= effectiveCost(s.config, u.type));
     s.rng.shuffle(ready);
     for (const u of ready) {
       if (s.winner) break;
-      u.charge -= UNIT_DEFS[u.type].cost;
+      u.charge -= effectiveCost(s.config, u.type);
       this.castUnit('enemy', u.type, events);
     }
     if (s.winner) return this.collect(events);
 
     if (s.config.enemyMatching) {
       // deadlock prevention guarantees a move after every settle; the guard
-      // is defensive only
-      const mv = findBotMove(s.board);
+      // is defensive only. MK7.13: move selection is config-aware (charge-
+      // seeking under NMD unless the sub-option disables it).
+      const mv = pickBotMove(s.board, s.config);
       if (mv) {
         swap(s.board, mv.a, mv.b);
         events.push({ t: 'swap', a: mv.a, b: mv.b });
-        resolveCascades(s, 'enemy', events, this.matchBudget());
+        resolveCascades(s, 'enemy', events, this.matchBudget(), 'match', new Set());
         if (s.winner) return this.collect(events);
       }
     } else {
       for (const u of s.units.enemy) {
-        const wasted = addUnitCharge(u, UNIT_DEFS[u.type].enemyChargeRate);
+        const wasted = addUnitCharge(s, u, UNIT_DEFS[u.type].enemyChargeRate);
         if (wasted > 0) events.push({ t: 'chargeWaste', side: 'enemy', unit: u.type, amount: wasted });
       }
     }

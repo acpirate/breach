@@ -7,7 +7,7 @@ import { DEFAULT_BATTLE_CONFIG, UNIT_DEFS } from '../src/logic/constants';
 import { Game } from '../src/logic/game';
 import { BattleMetrics } from '../src/logic/metrics';
 import { BattleConfig, UNIT_ORDER } from '../src/logic/types';
-import { botFireAbilities, findBotMove } from './bot';
+import { botFireAbilities, botMove } from './bot';
 
 const N = 100;
 
@@ -18,7 +18,7 @@ function playOne(seed: number, config: BattleConfig): BattleMetrics {
   while (!g.state.winner && safety++ < 2000) {
     botFireAbilities(g);
     if (g.state.winner) break;
-    const mv = findBotMove(g.state.board);
+    const mv = botMove(g);
     if (!mv) throw new Error('deadlock prevention failed');
     g.attemptSwap(mv.a, mv.b);
     if (!g.state.winner) g.runEnemyPhase();
@@ -41,8 +41,11 @@ function report(label: string, group: BattleMetrics[]): void {
     const s = group.map((m) => m.sides[side]);
     console.log(`--- ${side.toUpperCase()} (averages per battle) ---`);
     const abilityPcts = s.map((x) => (x.totalDamage > 0 ? ((x.attackerDamage + x.bombDamage) / x.totalDamage) * 100 : 0));
-    console.log(`  Total damage: ${f1(avg(s.map((x) => x.totalDamage)))}  (match ${f1(avg(s.map((x) => x.matchDamage)))}, attacker ${f1(avg(s.map((x) => x.attackerDamage)))}, bomb ${f1(avg(s.map((x) => x.bombDamage)))})  ability share ${f1(avg(abilityPcts))}%`);
-    console.log(`  Buffer damage added: ${f1(avg(s.map((x) => x.bufferDamageAdded)))}`);
+    // MK7.3/7.4: four DISJOINT causal buckets (match+bomb+atk+buffer = total)
+    console.log(`  Total damage: ${f1(avg(s.map((x) => x.totalDamage)))}  [match ${f1(avg(s.map((x) => x.matchDamage)))} | bomb ${f1(avg(s.map((x) => x.bombDamage)))} | atk ${f1(avg(s.map((x) => x.attackerDamage)))} | buffer ${f1(avg(s.map((x) => x.bufferDamageAdded)))}]  ability share ${f1(avg(abilityPcts))}%`);
+    console.log(`  Cascade (RNG-refill) damage, any cause: ${f1(avg(s.map((x) => x.cascadeDamage)))}`);
+    console.log(`  Match dmg by axis: color ${f1(avg(s.map((x) => x.matchDamageColor)))} / shape ${f1(avg(s.map((x) => x.matchDamageShape)))}`);
+    console.log(`  Biggest round: avg ${f1(avg(s.map((x) => x.biggestRound)))}, max ${max(s.map((x) => x.biggestRound))}   Avg nonzero round: ${f1(avg(s.map((x) => (x.roundDamageCount ? x.roundDamageSum / x.roundDamageCount : 0))))}`);
     const critPcts = s.map((x) => (x.matchDamage > 0 ? (x.critExtra / x.matchDamage) * 100 : 0));
     console.log(`  Crit bonus damage: ${f1(avg(s.map((x) => x.critExtra)))} (avg ${f1(avg(critPcts))}% of match damage)`);
     console.log(`  Largest single hit: avg ${f1(avg(s.map((x) => x.largestHit)))}, max ${max(s.map((x) => x.largestHit))}`);
@@ -73,8 +76,10 @@ function runMode(label: string, config: BattleConfig): void {
 }
 
 const D = DEFAULT_BATTLE_CONFIG;
-// MK6 matrix: enemy mode x no-match-damage, all under the new defaults (cap-0)
-runMode('ENEMY_MATCHING OFF (new default config: cap-0)', { ...D });
+// MK7 matrix: baseline modes + flat-cost diagnostic + NMD (charge-aware bot)
+runMode('DEFAULT (cap-0, costs 7/13/19/22)', { ...D });
 runMode('ENEMY_MATCHING ON', { ...D, enemyMatching: true });
-runMode('NO_MATCH_DAMAGE ON (enemy matching off)', { ...D, noMatchDamage: true });
-runMode('NO_MATCH_DAMAGE ON + ENEMY_MATCHING ON', { ...D, noMatchDamage: true, enemyMatching: true });
+runMode('FLAT_ABILITY_COST ON (all cost 7)', { ...D, flatAbilityCost: true });
+runMode('FLAT_ABILITY_COST + ENEMY_MATCHING', { ...D, flatAbilityCost: true, enemyMatching: true });
+runMode('NO_MATCH_DAMAGE ON (charge-aware bot)', { ...D, noMatchDamage: true });
+runMode('NO_MATCH_DAMAGE + ENEMY_MATCHING (charge-aware bot)', { ...D, noMatchDamage: true, enemyMatching: true });

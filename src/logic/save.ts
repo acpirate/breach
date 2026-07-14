@@ -9,12 +9,12 @@
 import { BOARD_HEIGHT, BOARD_WIDTH } from './constants';
 import { Game } from './game';
 import { makeRNG } from './rng';
-import { GameState } from './types';
+import { GameState, UNIT_ORDER } from './types';
 
 // Save-format version (designer-set placeholder scheme; bump on state-shape
-// changes). MK6 removed the scenario field and extended BattleConfig — older
-// saves fail gracefully to a fresh start, as designed.
-export const SAVE_VERSION = 'mk6';
+// changes). MK7 extended BattleConfig (costs, hint, NMD bot sub-option) —
+// older saves fail gracefully to a fresh start, as designed.
+export const SAVE_VERSION = 'mk7';
 
 export function serializeGame(state: GameState): string {
   const { rng, ...plain } = state;
@@ -47,7 +47,13 @@ export function deserializeGame(json: string | null): Game | null {
       typeof c.noMatchDamage !== 'boolean' ||
       !(c.maxCascadeSteps === null || (Number.isInteger(c.maxCascadeSteps) && c.maxCascadeSteps >= 0 && c.maxCascadeSteps <= 9)) ||
       !(Number.isInteger(c.playerHp) && c.playerHp >= 1 && c.playerHp <= 9999) ||
-      !(Number.isInteger(c.enemyHp) && c.enemyHp >= 1 && c.enemyHp <= 9999)
+      !(Number.isInteger(c.enemyHp) && c.enemyHp >= 1 && c.enemyHp <= 9999) ||
+      typeof c.flatAbilityCost !== 'boolean' ||
+      typeof c.hintEnabled !== 'boolean' ||
+      typeof c.nmdChargeAwareBot !== 'boolean' ||
+      !(Number.isInteger(c.hintDelaySeconds) && c.hintDelaySeconds >= 1 && c.hintDelaySeconds <= 60) ||
+      !c.abilityCosts ||
+      UNIT_ORDER.some((t) => !(Number.isInteger(c.abilityCosts[t]) && c.abilityCosts[t] >= 1 && c.abilityCosts[t] <= 99))
     ) {
       return null;
     }

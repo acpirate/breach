@@ -94,17 +94,40 @@ export function hasAnyValidMove(board: Board): boolean {
   return findValidMove(board) !== null;
 }
 
-// Shared reshuffle core (spec 1.7, as revised by MK2.2): the player-paid
-// board-shake and the automatic deadlock reshuffle are now IDENTICAL. Both
-// reposition ALL tiles (special tiles persist with color/shape/owner/duration
-// unchanged, at new random positions; non-special tiles get entirely new
-// random assignments), and both guarantee >=1 valid move with NO pre-existing
-// match — no damage, no charge, no cascades. The old "player shake may land
-// on matches as a cascade payoff" rule is removed.
+// Shared reshuffle core (spec 1.7, MK2.2 unification, revised by MK7.9):
+// both the player-paid board-shake AND the automatic deadlock reshuffle are
+// now PERMUTATIONS — the board's composition (which tiles exist) is preserved
+// exactly; only positions change. No shaking your way to more of a color you
+// need, no free composition reroll on deadlock, and a future tile-converting
+// ability's investment survives the shake. Special tiles persist with all
+// their data (they're the same Tile objects, just relocated).
+// Validity contract unchanged: >=1 valid move, NO pre-existing match, so the
+// re-permute-until-valid loop remains. Safeguard: if no valid permutation is
+// found within the attempt budget (pathologically skewed composition —
+// effectively impossible at 64 tiles), fall back to the old constrained
+// re-randomization rather than softlock.
 export function reshuffleBoard(state: { board: Board; rng: RNG; nextId: number }): void {
-  const specials: Tile[] = [];
-  for (const row of state.board) for (const t of row) if (t?.special) specials.push(t);
+  const tiles: Tile[] = [];
+  for (const row of state.board) for (const t of row) if (t) tiles.push(t);
 
+  for (let attempt = 0; attempt < 1000; attempt++) {
+    state.rng.shuffle(tiles);
+    const board = emptyBoard();
+    let i = 0;
+    for (let y = 0; y < BOARD_HEIGHT; y++) {
+      for (let x = 0; x < BOARD_WIDTH; x++) {
+        board[y][x] = tiles[i++];
+      }
+    }
+    if (detectMatches(board).length === 0 && hasAnyValidMove(board)) {
+      state.board = board;
+      return;
+    }
+  }
+
+  // Fallback (composition has no valid arrangement we could find): regenerate
+  // non-special tiles with the pre-MK7 constrained fill. Never softlock.
+  const specials = tiles.filter((t) => t.special);
   for (let attempt = 0; attempt < 1000; attempt++) {
     const board = emptyBoard();
     const cells: Pt[] = [];
@@ -114,10 +137,6 @@ export function reshuffleBoard(state: { board: Board; rng: RNG; nextId: number }
       const p = cells[i];
       board[p.y][p.x] = s;
     });
-
-    // Constrained fill: local rejection keeps most matches from forming; the
-    // full-board validation below catches the rest (e.g. runs completed by a
-    // pre-placed special to the right/below) and retries.
     for (let y = 0; y < BOARD_HEIGHT; y++) {
       for (let x = 0; x < BOARD_WIDTH; x++) {
         if (board[y][x]) continue;
@@ -132,5 +151,5 @@ export function reshuffleBoard(state: { board: Board; rng: RNG; nextId: number }
       return;
     }
   }
-  throw new Error('failed to produce a valid deadlock reshuffle');
+  throw new Error('failed to produce a valid reshuffle');
 }

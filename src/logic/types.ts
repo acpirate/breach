@@ -53,6 +53,19 @@ export interface BattleConfig {
   noMatchDamage: boolean; // MK6.2: matches deal ZERO damage (charge unchanged; detonations unaffected)
   playerHp: number; // MK6.4: starting HP, menu-settable (1-9999)
   enemyHp: number;
+  // MK7.1: ability costs as config (defaults 7/13/19/22); flatAbilityCost is
+  // the diagnostic that prices ALL units at 7 to de-confound effect from
+  // firing rate. Expected to play badly — that's the point.
+  abilityCosts: Record<UnitType, number>;
+  flatAbilityCost: boolean;
+  // MK7.7: hint system (default off; delay in seconds)
+  hintEnabled: boolean;
+  hintDelaySeconds: number;
+  // MK7.13 + designer addendum: when noMatchDamage is on, the bot matches for
+  // CHARGE instead of damage — unless this sub-option is turned off, which
+  // restores the original charge-agnostic prefer-4 logic. Default ON. Inert
+  // when noMatchDamage is off.
+  nmdChargeAwareBot: boolean;
 }
 
 export interface GameState {
@@ -108,10 +121,13 @@ export type GameEvent =
   | { t: 'setTile'; p: Pt; view: TileView }
   | { t: 'countdown'; p: Pt; value: number }
   | { t: 'detonate'; p: Pt }
-  // damage carries metrics enrichment (MK2.3): source bucket, the portion
-  // added by the 1.5x crit multiplier (pre-floor), and the buff-tile bonus
-  // portion included in `amount`
-  | { t: 'damage'; target: Side; amount: number; label: string; source: 'match' | 'attacker' | 'bomb'; critExtra?: number; buffBonus?: number }
+  // damage carries metrics enrichment (MK2.3/MK7): source = the CAUSAL bucket
+  // (the action that initiated the chain, not the mechanism); buffBonus = the
+  // buff-tile portion of `amount` (subtracted out into the disjoint buffer
+  // bucket, MK7.4); colorRaw/shapeRaw = pre-floor per-axis match damage
+  // (MK7.5); cascadeRaw = pre-floor damage from tiles destroyed exclusively
+  // by STOCHASTIC refill matches (MK7.3 cross-cut)
+  | { t: 'damage'; target: Side; amount: number; label: string; source: 'match' | 'attacker' | 'bomb'; critExtra?: number; buffBonus?: number; colorRaw?: number; shapeRaw?: number; cascadeRaw?: number }
   | { t: 'msg'; text: string }
   | { t: 'over'; winner: Side }
   // metrics/logging-only events (no visual representation; renderer skips them)
@@ -125,4 +141,7 @@ export type GameEvent =
   | { t: 'tileStats'; side: Side; destroyed: number; contested: number }
   // MK6.6 — raw player think-time for the committed move (input-available ->
   // match-committed), supplied by the orchestrator, never pre-aggregated
-  | { t: 'thinkTime'; ms: number };
+  | { t: 'thinkTime'; ms: number }
+  // MK7.7 — a hint was shown before this turn's committed move (so the turn
+  // can be excluded from think-time analysis)
+  | { t: 'hintShown' };

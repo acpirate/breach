@@ -12,6 +12,20 @@ npm run batch      # headless batch: 100 bot-played battles, aggregate metrics r
 npm run typecheck  # tsc --noEmit
 ```
 
+## MK7 revisions (Section 1-MK7 — Attribution, Cost Curve & Instrumentation)
+
+Theme: fix the instruments before running the experiment. No new mechanics beyond config.
+
+- **MK7.1 Costs as config + flat-cost diagnostic:** the four ability costs are per-battle config (Settings, 1–99, defaults 7/13/19/22); `flatAbilityCost` prices all four at 7 to de-confound effect from firing rate. All cost checks go through `effectiveCost()`.
+- **MK7.2 Cascade redefined (metric only):** only matches containing newly-spawned RNG tiles count as cascades; deterministic settling is part of the chosen move. No gameplay change (the cap already gated only stochastic refills). Cascade depths drop — that's the fix.
+- **MK7.3/7.4 Causal attribution:** damage rolls up to the action that initiated the chain. Four **disjoint** buckets summing exactly to total: `match` / `bomb` (incl. its own settling+cascades) / `atk` / `buffer` (subtracted out of the others). Plus one cross-cutting `cascadeDamage` (all stochastic-refill damage, any cause, pre-floor).
+- **MK7.5 Axis split:** match damage split `color` vs `shape` (per tile, by the axis that paid; ties→color; pre-floor). The color-matcher-bias instrument.
+- **MK7.6 Round metrics:** biggest round (swinginess) and average nonzero round (effectiveness), per side.
+- **MK7.7 Hints (default OFF):** after `hintDelaySeconds` (default 7) idle, highlights an available 4-match; every hint-assisted turn is flagged in the logs so think-time analysis can exclude it.
+- **MK7.8** Dev-build-only "find match" button. **MK7.9** Shake is now a **permutation** (composition preserved exactly; same validity contract; auto-reshuffle too, per designer ruling; re-randomization only as a never-softlock fallback). **MK7.10** Title = New Game / Continue / Settings; all config in the Settings modal (not reachable mid-battle); no confirm on New Game. **MK7.11** Quit clears the board render. **MK7.12** Letterboxed to 9:19.5 phone aspect — desktop testing is phone testing.
+- **MK7.13 + addendum:** under `noMatchDamage` the bot matches for **charge** (feeds its bindings) instead of damage — controlled by the `nmdChargeAwareBot` sub-option (default ON when NMD is on; OFF restores the classic prefer-4 tier).
+- Save/log versions `mk7`; log files roll daily and `logs:dump` is lossless.
+
 ## MK6 revisions (Section 1-MK6 — Shape Damage, No-Match-Damage, Instrumentation & QoL)
 
 - **MK6.1 Shape damage:** shapes get their own damage tiers, symmetric with color (LOW 1 / HIGH 2). **HIGH shapes: Square, Cross, Diamond · LOW: Triangle, Star, Circle** — assigned so every unit binds one HIGH axis + one LOW axis (no unit's tiles are double-weighted). A color-match damages via the tile's color tier, a shape-match via its shape tier; a tile destroyed by both pays once at the higher applicable value. Supersedes the MK5 color-fallback stopgap.

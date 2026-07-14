@@ -3,12 +3,12 @@
 // Run with `npm run smoke`.
 
 import { findValidMove, swap } from '../src/logic/board';
-import { BOARD_HEIGHT, BOARD_SHAKE_COST, BOARD_WIDTH, DEFAULT_BATTLE_CONFIG, UNIT_DEFS } from '../src/logic/constants';
+import { BOARD_HEIGHT, BOARD_SHAKE_COST, BOARD_WIDTH, DEFAULT_BATTLE_CONFIG, effectiveCost } from '../src/logic/constants';
 import { Game } from '../src/logic/game';
 import { detectMatches } from '../src/logic/match';
 import { deserializeGame, serializeGame } from '../src/logic/save';
 import { BattleConfig } from '../src/logic/types';
-import { botFireAbilities, findBotMove } from './bot';
+import { botFireAbilities, botMove } from './bot';
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`SMOKE FAIL: ${msg}`);
@@ -25,10 +25,10 @@ function checkInvariants(g: Game): void {
       }
     }
   }
-  // charge caps respected
+  // charge caps respected (MK7.1: against effective costs)
   for (const side of ['player', 'enemy'] as const) {
     for (const u of s.units[side]) {
-      const cost = UNIT_DEFS[u.type].cost;
+      const cost = effectiveCost(s.config, u.type);
       assert(u.charge >= 0 && u.charge <= cost, `${side} ${u.type} charge ${u.charge} out of [0,${cost}]`);
     }
   }
@@ -77,7 +77,15 @@ function runBattle(label: string, config: BattleConfig, seed: number): void {
         e: g.state.units.enemy.map((u) => u.charge),
       });
       const shakeBefore = g.state.shakeCharge;
+      // MK7.9: shake is a PERMUTATION — board composition must be preserved
+      const compBefore = JSON.stringify(
+        g.state.board.flat().map((t) => `${t!.kind}:${t!.color ?? '-'}:${t!.shape ?? '-'}`).sort(),
+      );
       const ev = g.fireShake();
+      assert(
+        JSON.stringify(g.state.board.flat().map((t) => `${t!.kind}:${t!.color ?? '-'}:${t!.shape ?? '-'}`).sort()) === compBefore,
+        'shake must preserve board composition (permutation, not re-roll)',
+      );
       assert(ev.length > 0, 'charged shake in playerPre must fire');
       assert(!ev.some((e) => e.t === 'damage'), 'shake must deal no damage');
       assert(!ev.some((e) => e.t === 'destroy'), 'shake must trigger no cascades');
@@ -93,7 +101,7 @@ function runBattle(label: string, config: BattleConfig, seed: number): void {
     }
     if (g.state.winner) break;
 
-    const mv = findBotMove(g.state.board);
+    const mv = botMove(g);
     assert(mv, 'deadlock prevention guarantees a move');
     const r = g.attemptSwap(mv.a, mv.b);
     assert(r.matched, 'bot-selected swap must produce a match');
@@ -117,8 +125,12 @@ function runBattle(label: string, config: BattleConfig, seed: number): void {
   assert(m.winner === g.state.winner, 'metrics winner must match game winner');
   assert(m.turns === g.state.turn, 'metrics turn count must match game state');
   assert(m.sides[g.state.winner].totalDamage > 0, 'winning side must have dealt damage');
-  const tallied = m.sides[g.state.winner].matchDamage + m.sides[g.state.winner].attackerDamage + m.sides[g.state.winner].bombDamage;
-  assert(tallied === m.sides[g.state.winner].totalDamage, 'damage source split must sum to total');
+  // MK7.3/7.4: the four DISJOINT causal buckets must sum EXACTLY to total
+  for (const side of ['player', 'enemy'] as const) {
+    const sm = m.sides[side];
+    const tallied = sm.matchDamage + sm.bombDamage + sm.attackerDamage + sm.bufferDamageAdded;
+    assert(tallied === sm.totalDamage, `${side} causal buckets (${tallied}) must sum to total (${sm.totalDamage})`);
+  }
   if (config.enemyMatching) {
     assert(m.sides.enemy.tilesDestroyed > 0, 'matching enemy should have destroyed tiles');
   }
@@ -126,8 +138,9 @@ function runBattle(label: string, config: BattleConfig, seed: number): void {
   if (config.noMatchDamage) {
     assert(m.sides.player.matchDamage === 0 && m.sides.enemy.matchDamage === 0, 'NMD: match damage must be zero');
     assert(
-      m.sides.player.totalDamage === m.sides.player.attackerDamage + m.sides.player.bombDamage,
-      'NMD: all damage must come from abilities',
+      m.sides.player.totalDamage ===
+        m.sides.player.attackerDamage + m.sides.player.bombDamage + m.sides.player.bufferDamageAdded,
+      'NMD: all damage must come from abilities (+buffer)',
     );
   }
   console.log(
@@ -139,29 +152,40 @@ function runBattle(label: string, config: BattleConfig, seed: number): void {
 
 // MK4.1: save/restore round trip — headless, pure logic (no storage APIs)
 function testSaveRoundTrip(): void {
-  const cfg: BattleConfig = { ...DEFAULT_BATTLE_CONFIG, enemyMatching: true, maxCascadeSteps: 4, playerHp: 222, enemyHp: 333 };
+  const cfg: BattleConfig = {
+    ...DEFAULT_BATTLE_CONFIG,
+    enemyMatching: true,
+    maxCascadeSteps: 4,
+    playerHp: 222,
+    enemyHp: 333,
+    abilityCosts: { bomber: 5, buffer: 11, attacker: 17, disabler: 23 },
+    hintEnabled: true,
+    hintDelaySeconds: 3,
+  };
   const g = new Game(cfg, 42);
   g.startPlayerPhase();
   for (let i = 0; i < 3 && !g.state.winner; i++) {
-    const mv = findBotMove(g.state.board);
+    const mv = botMove(g);
     assert(mv, 'move available');
-    g.attemptSwap(mv.a, mv.b, 1234); // exercise the thinkTime path too
+    g.attemptSwap(mv.a, mv.b, 1234, i === 0); // exercise thinkTime + hintShown paths
     if (!g.state.winner) g.runEnemyPhase();
     if (!g.state.winner) g.startPlayerPhase();
   }
   assert(!g.state.winner, 'battle still in progress at save point');
   assert(g.state.metrics.thinkTimesMs.length === 3, 'raw think-times must be recorded per move');
+  assert(g.state.metrics.hintsShown === 1, 'hint-shown count must be recorded');
   const json = serializeGame(g.state);
   const r = deserializeGame(json);
   assert(r, 'valid save must deserialize');
   assert(serializeGame(r.state) === json, 'restored state must re-serialize identically');
   assert(r.state.turn === g.state.turn && r.state.battleId === g.state.battleId, 'turn/battleId survive');
   assert(r.state.config.playerHp === 222 && r.state.config.enemyHp === 333, 'HP config survives the round trip');
+  assert(r.state.config.abilityCosts.disabler === 23 && r.state.config.hintDelaySeconds === 3, 'MK7 config survives');
   let safety = 0;
   while (!r.state.winner && safety++ < 600) {
     botFireAbilities(r);
     if (r.state.winner) break;
-    const mv = findBotMove(r.state.board);
+    const mv = botMove(r);
     assert(mv, 'restored game has moves');
     r.attemptSwap(mv.a, mv.b);
     if (!r.state.winner) r.runEnemyPhase();
@@ -194,9 +218,19 @@ for (let seed = 1; seed <= 5; seed++) {
   runBattle('singleAxis', { ...D, singleAxisPayout: true }, 5000 + seed);
 }
 // MK6.2: no-match-damage — abilities are the only damage source, bombs intact
+// (MK7.13: charge-aware bot tier active by default under NMD)
 for (let seed = 1; seed <= 5; seed++) {
   runBattle('noMatchDmg', { ...D, noMatchDamage: true }, 6000 + seed);
   runBattle('noMatchDmg+enemyMatch', { ...D, noMatchDamage: true, enemyMatching: true }, 7000 + seed);
+}
+// MK7.13 addendum: sub-option off restores the classic charge-agnostic tier
+for (let seed = 1; seed <= 3; seed++) {
+  runBattle('noMatchDmg+classicBot', { ...D, noMatchDamage: true, enemyMatching: true, nmdChargeAwareBot: false }, 7500 + seed);
+}
+// MK7.1: flat ability cost diagnostic — everything costs 7
+for (let seed = 1; seed <= 5; seed++) {
+  runBattle('flatCost', { ...D, flatAbilityCost: true }, 8000 + seed);
+  runBattle('flatCost+enemyMatch', { ...D, flatAbilityCost: true, enemyMatching: true }, 9000 + seed);
 }
 testSaveRoundTrip();
 console.log('SMOKE OK');

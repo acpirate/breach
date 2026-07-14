@@ -18,9 +18,25 @@ export interface UnitMetrics {
 
 export interface SideMetrics {
   totalDamage: number;
+  // MK7.3/7.4 — FOUR DISJOINT causal buckets: match + bomb + attacker +
+  // bufferDamageAdded === totalDamage, exactly. Each damage event's buff
+  // portion is subtracted out of its causal bucket into the buffer bucket;
+  // bomb-caused settling and cascades credit to bomb, not match.
   matchDamage: number;
   attackerDamage: number;
   bombDamage: number;
+  // MK7.3 cross-cutting (overlaps the buckets, does NOT sum with them):
+  // pre-floor damage from tiles destroyed exclusively by stochastic refill
+  // matches, regardless of cause — "how much is unearned RNG?"
+  cascadeDamage: number;
+  // MK7.5 — behavioral split of match-cause damage by paying axis (pre-floor
+  // raw; neutral-tile damage belongs to neither axis)
+  matchDamageColor: number;
+  matchDamageShape: number;
+  // MK7.6 — per-round (per game turn) damage: ceiling and baseline
+  biggestRound: number;
+  roundDamageSum: number; // over rounds where this side dealt > 0
+  roundDamageCount: number;
   // Crit metric: only the portion ADDED by the 1.5x multiplier
   // (sum of tile base x 0.5 for crit-multiplied tiles, measured pre-floor).
   critExtra: number;
@@ -43,6 +59,7 @@ export interface BattleMetrics {
   // MK6.6 — RAW per-turn think-times (input-available -> move-committed),
   // never pre-aggregated; medians are computed at display/analysis time
   thinkTimesMs: number[];
+  hintsShown: number; // MK7.7 — hint-assisted turns are excludable from think-time analysis
   sides: Record<Side, SideMetrics>;
 }
 
@@ -54,6 +71,12 @@ function emptySide(): SideMetrics {
     matchDamage: 0,
     attackerDamage: 0,
     bombDamage: 0,
+    cascadeDamage: 0,
+    matchDamageColor: 0,
+    matchDamageShape: 0,
+    biggestRound: 0,
+    roundDamageSum: 0,
+    roundDamageCount: 0,
     critExtra: 0,
     largestHit: 0,
     deepestCascade: 0,
@@ -70,6 +93,7 @@ export function createBattleMetrics(): BattleMetrics {
     autoReshuffles: 0,
     winner: null,
     thinkTimesMs: [],
+    hintsShown: 0,
     sides: { player: emptySide(), enemy: emptySide() },
   };
 }
@@ -80,20 +104,25 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
       case 'damage': {
         const side = opponentOf(ev.target); // damage is dealt BY the target's opponent
         const sm = m.sides[side];
+        const bonus = ev.buffBonus ?? 0;
+        const base = ev.amount - bonus; // MK7.4: buffer subtracted out of the causal bucket
         sm.totalDamage += ev.amount;
         if (ev.amount > sm.largestHit) sm.largestHit = ev.amount;
         if (ev.source === 'match') {
-          sm.matchDamage += ev.amount;
+          sm.matchDamage += base;
           sm.critExtra += ev.critExtra ?? 0;
+          sm.matchDamageColor += ev.colorRaw ?? 0;
+          sm.matchDamageShape += ev.shapeRaw ?? 0;
         } else if (ev.source === 'attacker') {
-          sm.attackerDamage += ev.amount;
-          sm.units.attacker.effect += ev.amount;
+          sm.attackerDamage += base;
+          sm.units.attacker.effect += base;
         } else {
-          sm.bombDamage += ev.amount;
-          sm.units.bomber.effect += ev.amount;
+          sm.bombDamage += base; // MK7.3: includes bomb-caused settling + cascades
+          sm.units.bomber.effect += base;
         }
-        sm.units.buffer.effect += ev.buffBonus ?? 0;
-        sm.bufferDamageAdded += ev.buffBonus ?? 0; // MK6.7 (== dealt − zero-buff dealt)
+        sm.cascadeDamage += ev.cascadeRaw ?? 0; // cross-cutting, any cause
+        sm.units.buffer.effect += bonus;
+        sm.bufferDamageAdded += bonus; // MK6.7/MK7.4 disjoint bucket
         break;
       }
       case 'ability': {
@@ -121,6 +150,9 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
       }
       case 'thinkTime':
         m.thinkTimesMs.push(ev.ms);
+        break;
+      case 'hintShown':
+        m.hintsShown++;
         break;
       default:
         break;

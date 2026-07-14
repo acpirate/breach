@@ -91,6 +91,9 @@ export const HACKER_BONUS_CHARGE = 1; // extra charge per bonus-color tile to co
 // tested dramatically better: stable board, specials survive, abilities
 // matter more, closer battles). HP defaults are the MK6.4 config exposure of
 // the former fixed scenario values.
+// MK7.1: the flat-cost diagnostic prices every unit at this value.
+export const FLAT_ABILITY_COST_VALUE = 7;
+
 export const DEFAULT_BATTLE_CONFIG: BattleConfig = {
   enemyMatching: false,
   hackerBonusEnabled: false,
@@ -99,7 +102,19 @@ export const DEFAULT_BATTLE_CONFIG: BattleConfig = {
   noMatchDamage: false, // MK6.2
   playerHp: STARTING_HP_PLAYER_NORMAL,
   enemyHp: STARTING_HP_ENEMY,
+  // MK7.1: costs exposed as config; defaults unchanged
+  abilityCosts: { bomber: BOMBER_COST, buffer: BUFFER_COST, attacker: ATTACKER_COST, disabler: DISABLER_COST },
+  flatAbilityCost: false,
+  hintEnabled: false, // MK7.7
+  hintDelaySeconds: 7,
+  nmdChargeAwareBot: true, // MK7.13 addendum: sub-option of noMatchDamage, default on
 };
+
+// MK7.1: the single lookup every cost check goes through — charge caps, fire
+// checks, HUD, character sheet, bot.
+export function effectiveCost(config: BattleConfig, type: UnitType): number {
+  return config.flatAbilityCost ? FLAT_ABILITY_COST_VALUE : config.abilityCosts[type];
+}
 
 // ============================================================================
 // Agent-discretion assignments (approved by the designer)

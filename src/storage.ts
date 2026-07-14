@@ -6,7 +6,7 @@
 
 import { DEFAULT_BATTLE_CONFIG } from './logic/constants';
 import { MAX_METRIC_LOG_ENTRIES, MAX_TURN_LOG_ENTRIES, MetricLogEntry, TurnLogEntry } from './logic/logger';
-import { BattleConfig } from './logic/types';
+import { BattleConfig, UNIT_ORDER } from './logic/types';
 
 const SAVE_KEY = 'breach:save';
 const METRICS_LOG_KEY = 'breach:log:metrics';
@@ -79,7 +79,13 @@ export function loadMenuConfig(): BattleConfig {
       typeof c.noMatchDamage !== 'boolean' ||
       !(c.maxCascadeSteps === null || (Number.isInteger(c.maxCascadeSteps) && c.maxCascadeSteps >= 0 && c.maxCascadeSteps <= 9)) ||
       !(Number.isInteger(c.playerHp) && c.playerHp >= 1 && c.playerHp <= 9999) ||
-      !(Number.isInteger(c.enemyHp) && c.enemyHp >= 1 && c.enemyHp <= 9999)
+      !(Number.isInteger(c.enemyHp) && c.enemyHp >= 1 && c.enemyHp <= 9999) ||
+      typeof c.flatAbilityCost !== 'boolean' ||
+      typeof c.hintEnabled !== 'boolean' ||
+      typeof c.nmdChargeAwareBot !== 'boolean' ||
+      !(Number.isInteger(c.hintDelaySeconds) && c.hintDelaySeconds >= 1 && c.hintDelaySeconds <= 60) ||
+      !c.abilityCosts ||
+      UNIT_ORDER.some((t) => !(Number.isInteger(c.abilityCosts[t]) && c.abilityCosts[t] >= 1 && c.abilityCosts[t] <= 99))
     ) {
       return { ...DEFAULT_BATTLE_CONFIG };
     }
@@ -91,6 +97,11 @@ export function loadMenuConfig(): BattleConfig {
       noMatchDamage: c.noMatchDamage,
       playerHp: c.playerHp,
       enemyHp: c.enemyHp,
+      abilityCosts: { ...c.abilityCosts },
+      flatAbilityCost: c.flatAbilityCost,
+      hintEnabled: c.hintEnabled,
+      hintDelaySeconds: c.hintDelaySeconds,
+      nmdChargeAwareBot: c.nmdChargeAwareBot,
     };
   } catch {
     return { ...DEFAULT_BATTLE_CONFIG };

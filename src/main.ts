@@ -17,7 +17,9 @@ import {
   LOW_SHAPES,
   UNIT_DEFS,
   UnitDef,
+  effectiveCost,
 } from './logic/constants';
+import { findBotMove, findHintMove } from './logic/bot';
 import { Game } from './logic/game';
 import { LOG_VERSION } from './logic/logger';
 import { BattleMetrics } from './logic/metrics';
@@ -47,6 +49,10 @@ let selection: Pt | null = null;
 // read when the match commits. Abilities/invalid swaps leave it running.
 let thinkStart: number | null = null;
 let battleStartAt = 0; // wall-clock anchor for this session's battle
+// MK7.7 — hint state: whether a hint fired this turn (logged, excludable from
+// think-time analysis) and the last raw pointer input (idle detection)
+let hintFiredThisTurn = false;
+let lastInputAt = performance.now();
 // MK3.2: Disabler targeting mode — armed by tapping the charged Disabler;
 // the next tap on an enemy minion fires it, any other tap cancels (free).
 let targeting = false;
@@ -54,22 +60,35 @@ let targeting = false;
 // running battle uses ITS OWN immutable copy (game.state.config), not this.
 let menuConfig: BattleConfig = loadMenuConfig();
 
+// canonical value list — safer than field-by-field as the config grows
+function configKey(c: BattleConfig): string {
+  return JSON.stringify([
+    c.enemyMatching,
+    c.hackerBonusEnabled,
+    c.singleAxisPayout,
+    c.maxCascadeSteps,
+    c.noMatchDamage,
+    c.nmdChargeAwareBot,
+    c.playerHp,
+    c.enemyHp,
+    UNIT_ORDER.map((t) => c.abilityCosts[t]),
+    c.flatAbilityCost,
+    c.hintEnabled,
+    c.hintDelaySeconds,
+  ]);
+}
+
 function configsEqual(a: BattleConfig, b: BattleConfig): boolean {
-  return (
-    a.enemyMatching === b.enemyMatching &&
-    a.hackerBonusEnabled === b.hackerBonusEnabled &&
-    a.singleAxisPayout === b.singleAxisPayout &&
-    a.maxCascadeSteps === b.maxCascadeSteps &&
-    a.noMatchDamage === b.noMatchDamage &&
-    a.playerHp === b.playerHp &&
-    a.enemyHp === b.enemyHp
-  );
+  return configKey(a) === configKey(b);
 }
 
 // input just unlocked into the make-a-match phase → start the think clock
+// and reset the per-turn hint state (MK7.7)
 function endBusy(): void {
   busy = false;
   thinkStart = canAct() ? performance.now() : null;
+  hintFiredThisTurn = false;
+  view.setHint(null);
 }
 
 function canAct(): boolean {
@@ -98,11 +117,12 @@ function getHud(): Hud | null {
     hpEnemyMax: s.config.enemyHp,
     programs: s.units.player.map((u) => {
       const d = UNIT_DEFS[u.type];
-      return { label: d.label, cost: d.cost, charge: u.charge, ready: act && u.charge >= d.cost, color: d.color, shape: d.shape };
+      const cost = effectiveCost(s.config, u.type); // MK7.1
+      return { label: d.label, cost, charge: u.charge, ready: act && u.charge >= cost, color: d.color, shape: d.shape };
     }),
     minions: s.units.enemy.map((u) => {
       const d = UNIT_DEFS[u.type];
-      return { label: d.label, cost: d.cost, charge: u.charge, ready: false, color: d.color, shape: d.shape };
+      return { label: d.label, cost: effectiveCost(s.config, u.type), charge: u.charge, ready: false, color: d.color, shape: d.shape };
     }),
     shakeCharge: s.shakeCharge,
     shakeCost: BOARD_SHAKE_COST,
@@ -169,17 +189,22 @@ function metricsElement(m: BattleMetrics): HTMLElement {
   for (const side of ['player', 'enemy'] as const) {
     const sm = m.sides[side];
     row(side === 'player' ? 'YOUR SIDE' : 'ENEMY SIDE', true);
+    // MK7.3/7.4 — four disjoint causal buckets (sum exactly to total)
     row(`Total damage dealt: ${fmt(sm.totalDamage)}`);
-    row(`  from matches: ${fmt(sm.matchDamage)}`);
-    row(`  from Attacker ability: ${fmt(sm.attackerDamage)}`);
-    row(`  from bomb detonations: ${fmt(sm.bombDamage)}`);
+    row(`  match-caused (incl. its cascades): ${fmt(sm.matchDamage)}`);
+    row(`  bomb-caused (incl. its cascades): ${fmt(sm.bombDamage)}`);
+    row(`  Attacker: ${fmt(sm.attackerDamage)}`);
+    row(`  Buffer added: ${fmt(sm.bufferDamageAdded)}`);
+    row(`Cascade (RNG-refill) damage, any cause: ${fmt(sm.cascadeDamage)}`); // MK7.3 cross-cut
+    row(`Match damage by axis: color ${fmt(sm.matchDamageColor)} / shape ${fmt(sm.matchDamageShape)}`); // MK7.5
     const critPct = sm.matchDamage > 0 ? ((sm.critExtra / sm.matchDamage) * 100).toFixed(1) : '0.0';
     row(`Crit bonus damage (1.5x extra): ${fmt(sm.critExtra)} (${critPct}% of match damage)`);
     row(`Largest single hit: ${fmt(sm.largestHit)}`);
-    row(`Deepest cascade: ${sm.deepestCascade} step${sm.deepestCascade === 1 ? '' : 's'}`);
+    row(`Biggest round: ${fmt(sm.biggestRound)}`); // MK7.6 swinginess
+    row(`Avg round damage (nonzero rounds): ${sm.roundDamageCount ? fmt(sm.roundDamageSum / sm.roundDamageCount) : '0'}`); // MK7.6 effectiveness
+    row(`Deepest cascade: ${sm.deepestCascade} RNG round${sm.deepestCascade === 1 ? '' : 's'}`); // MK7.2 redefined
     const contPct = sm.tilesDestroyed > 0 ? ((sm.contentionTiles / sm.tilesDestroyed) * 100).toFixed(1) : '0.0';
     row(`Opponent-bound tiles destroyed: ${sm.contentionTiles} of ${sm.tilesDestroyed} (${contPct}%)`);
-    row(`Buffer damage added: ${fmt(sm.bufferDamageAdded)}`); // MK6.7
     for (const t of UNIT_ORDER) {
       const u = sm.units[t];
       row(`${UNIT_DEFS[t].label}: fired ${u.fires}, effect ${fmt(u.effect)}, charge wasted ${fmt(u.chargeWasted)}`);
@@ -191,6 +216,7 @@ function metricsElement(m: BattleMetrics): HTMLElement {
   const med = median(m.thinkTimesMs);
   row(`Median think-time: ${med === null ? 'n/a' : `${(med / 1000).toFixed(1)}s`} (${m.thinkTimesMs.length} moves)`);
   row(`Battle wall-clock: ${((Date.now() - battleStartAt) / 1000).toFixed(0)}s (this session)`);
+  if (m.hintsShown > 0) row(`Hints shown: ${m.hintsShown}`); // MK7.7
   return wrap;
 }
 
@@ -205,9 +231,11 @@ function hideDialog(): void {
   overlay.classList.add('hidden');
 }
 
-// MK5.3 — menu config panel: all four flags settable per battle. Persists on
-// every change; "Reset to Defaults" is the only reset.
-function configPanel(): HTMLElement {
+// MK5.3/MK7.10 — battle config panel (lives in the Settings modal). Persists
+// on every change; "Reset to Defaults" is the only reset. `rerender` rebuilds
+// the hosting modal after a reset so the controls show default values.
+function configPanel(rerender: () => void): HTMLElement {
+  const costInputs: HTMLInputElement[] = [];
   const wrap = document.createElement('div');
   wrap.className = 'config';
   const head = document.createElement('div');
@@ -231,7 +259,34 @@ function configPanel(): HTMLElement {
   check('Enemy matching', 'enemyMatching');
   check('Hacker color bonus', 'hackerBonusEnabled');
   check('Single-axis payout', 'singleAxisPayout');
-  check('No match damage', 'noMatchDamage'); // MK6.2
+
+  // MK6.2 No match damage + MK7.13 addendum sub-option (charge-aware bot,
+  // default on, only meaningful while NMD is on)
+  const nmdRow = document.createElement('label');
+  const nmdCb = document.createElement('input');
+  nmdCb.type = 'checkbox';
+  nmdCb.checked = menuConfig.noMatchDamage;
+  nmdRow.appendChild(nmdCb);
+  nmdRow.appendChild(document.createTextNode(' No match damage'));
+  wrap.appendChild(nmdRow);
+  const subRow = document.createElement('label');
+  subRow.className = 'suboption';
+  const subCb = document.createElement('input');
+  subCb.type = 'checkbox';
+  subCb.checked = menuConfig.nmdChargeAwareBot;
+  subCb.disabled = !menuConfig.noMatchDamage;
+  subRow.appendChild(subCb);
+  subRow.appendChild(document.createTextNode(' Charge-aware bot (NMD)'));
+  wrap.appendChild(subRow);
+  nmdCb.addEventListener('change', () => {
+    menuConfig = { ...menuConfig, noMatchDamage: nmdCb.checked };
+    subCb.disabled = !nmdCb.checked;
+    saveMenuConfig(menuConfig);
+  });
+  subCb.addEventListener('change', () => {
+    menuConfig = { ...menuConfig, nmdChargeAwareBot: subCb.checked };
+    saveMenuConfig(menuConfig);
+  });
 
   // MK6.4 — starting HP inputs (1-9999)
   const hpInput = (label: string, key: 'playerHp' | 'enemyHp'): void => {
@@ -254,6 +309,77 @@ function configPanel(): HTMLElement {
   };
   hpInput('Player HP', 'playerHp');
   hpInput('Enemy HP', 'enemyHp');
+
+  // MK7.1 — ability costs (1-99) + flat-cost diagnostic
+  const costHead = document.createElement('div');
+  costHead.className = 'cfghead';
+  costHead.textContent = 'ABILITY COSTS';
+  wrap.appendChild(costHead);
+  for (const t of UNIT_ORDER) {
+    const l = document.createElement('label');
+    l.appendChild(document.createTextNode(`${UNIT_DEFS[t].label} cost `));
+    const n = document.createElement('input');
+    n.type = 'number';
+    n.min = '1';
+    n.max = '99';
+    n.step = '1';
+    n.value = String(menuConfig.abilityCosts[t]);
+    n.disabled = menuConfig.flatAbilityCost;
+    n.addEventListener('change', () => {
+      const v = Math.max(1, Math.min(99, Math.floor(Number(n.value) || 1)));
+      n.value = String(v);
+      menuConfig = { ...menuConfig, abilityCosts: { ...menuConfig.abilityCosts, [t]: v } };
+      saveMenuConfig(menuConfig);
+    });
+    l.appendChild(n);
+    wrap.appendChild(l);
+    costInputs.push(n);
+  }
+  const flatRow = document.createElement('label');
+  const flatCb = document.createElement('input');
+  flatCb.type = 'checkbox';
+  flatCb.checked = menuConfig.flatAbilityCost;
+  flatCb.addEventListener('change', () => {
+    menuConfig = { ...menuConfig, flatAbilityCost: flatCb.checked };
+    for (const n of costInputs) n.disabled = flatCb.checked;
+    saveMenuConfig(menuConfig);
+  });
+  flatRow.appendChild(flatCb);
+  flatRow.appendChild(document.createTextNode(' Flat ability cost (all 7) — diagnostic'));
+  wrap.appendChild(flatRow);
+
+  // MK7.7 — hint system
+  const hintHead = document.createElement('div');
+  hintHead.className = 'cfghead';
+  hintHead.textContent = 'HINTS';
+  wrap.appendChild(hintHead);
+  const hintRow = document.createElement('label');
+  const hintCb = document.createElement('input');
+  hintCb.type = 'checkbox';
+  hintCb.checked = menuConfig.hintEnabled;
+  hintCb.addEventListener('change', () => {
+    menuConfig = { ...menuConfig, hintEnabled: hintCb.checked };
+    saveMenuConfig(menuConfig);
+  });
+  hintRow.appendChild(hintCb);
+  hintRow.appendChild(document.createTextNode(' Show hints'));
+  wrap.appendChild(hintRow);
+  const delayRow = document.createElement('label');
+  delayRow.appendChild(document.createTextNode('Hint delay (s) '));
+  const delayN = document.createElement('input');
+  delayN.type = 'number';
+  delayN.min = '1';
+  delayN.max = '60';
+  delayN.step = '1';
+  delayN.value = String(menuConfig.hintDelaySeconds);
+  delayN.addEventListener('change', () => {
+    const v = Math.max(1, Math.min(60, Math.floor(Number(delayN.value) || 7)));
+    delayN.value = String(v);
+    menuConfig = { ...menuConfig, hintDelaySeconds: v };
+    saveMenuConfig(menuConfig);
+  });
+  delayRow.appendChild(delayN);
+  wrap.appendChild(delayRow);
 
   // cascade cap: "Infinite?" toggle + 0-9 integer input (0 = zero cascades)
   const capRow = document.createElement('label');
@@ -296,9 +422,9 @@ function configPanel(): HTMLElement {
   reset.className = 'cfgreset';
   reset.textContent = 'Reset to Defaults';
   reset.addEventListener('click', () => {
-    menuConfig = { ...DEFAULT_BATTLE_CONFIG };
+    menuConfig = { ...DEFAULT_BATTLE_CONFIG, abilityCosts: { ...DEFAULT_BATTLE_CONFIG.abilityCosts } };
     saveMenuConfig(menuConfig);
-    showTitle(); // rebuild the panel with default values
+    rerender(); // rebuild the modal with default values
   });
   wrap.appendChild(reset);
   return wrap;
@@ -316,9 +442,11 @@ function configSummary(c: BattleConfig, heading: string): HTMLElement {
     `Enemy matching: ${c.enemyMatching ? 'ON' : 'OFF'}`,
     `Hacker color bonus: ${c.hackerBonusEnabled ? 'ON' : 'OFF'}`,
     `Single-axis payout: ${c.singleAxisPayout ? 'ON' : 'OFF'}`,
-    `No match damage: ${c.noMatchDamage ? 'ON' : 'OFF'}`,
+    `No match damage: ${c.noMatchDamage ? `ON (${c.nmdChargeAwareBot ? 'charge-aware' : 'classic'} bot)` : 'OFF'}`,
     `Cascade cap: ${c.maxCascadeSteps === null ? 'Infinite' : c.maxCascadeSteps}`,
     `Starting HP: you ${c.playerHp} / enemy ${c.enemyHp}`,
+    `Ability costs: ${c.flatAbilityCost ? 'FLAT 7 (diagnostic)' : UNIT_ORDER.map((t) => `${UNIT_DEFS[t].label} ${c.abilityCosts[t]}`).join(', ')}`,
+    `Hints: ${c.hintEnabled ? `ON (${c.hintDelaySeconds}s)` : 'OFF'}`,
   ];
   for (const r of rows) {
     const d = document.createElement('div');
@@ -340,7 +468,7 @@ const SHAPE_NAMES: Record<Shape, string> = {
   [Shape.Diamond]: 'Diamond', [Shape.Star]: 'Star', [Shape.Cross]: 'Cross',
 };
 
-function characterSheet(playerDefs: Record<string, UnitDef>, enemyDefs: Record<string, UnitDef>): HTMLElement {
+function characterSheet(cfg: BattleConfig, playerDefs: Record<string, UnitDef>, enemyDefs: Record<string, UnitDef>): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'config readonly';
   const row = (text: string, head = false): void => {
@@ -360,24 +488,35 @@ function characterSheet(playerDefs: Record<string, UnitDef>, enemyDefs: Record<s
     row(label, true);
     for (const t of UNIT_ORDER) {
       const d = defs[t];
-      row(`${d.label} — cost ${d.cost} — ${COLOR_NAMES[d.color]} + ${SHAPE_NAMES[d.shape]}`);
+      // MK7.1: show the EFFECTIVE cost for this battle (config / flat mode)
+      row(`${d.label} — cost ${effectiveCost(cfg, t)} — ${COLOR_NAMES[d.color]} + ${SHAPE_NAMES[d.shape]}`);
     }
   }
   return wrap;
 }
 
+// MK7.10 — title screen is ACTIONS ONLY: New Game / Continue / Settings.
+// All config lives in the Settings modal (not reachable mid-battle — config
+// is immutable for a battle in progress). No confirm on New Game (standing
+// principle: confirms are reserved for meaningful consequences).
 function showTitle(): void {
   game = null;
+  view.clearBoard(); // MK7.11: no ghost board behind the title after Quit
   const buttons: [string, () => void][] = [];
-  // MK4.2: Continue appears only when a valid, version-compatible,
-  // in-progress save exists
   const resumable = deserializeGame(loadBattleJson());
   if (resumable) {
     buttons.push([`Continue (turn ${resumable.state.turn})`, () => void resumeBattle()]);
   }
-  // MK6.4: single Play button — the config (flags + HP) IS the battle setup
-  buttons.push(['Play', () => void startBattle()]);
-  showDialog('BREACH — PoC', 'Configure and play', buttons, configPanel());
+  buttons.push(['New Game', () => void startBattle()]);
+  buttons.push(['Settings', showSettings]);
+  showDialog('BREACH — PoC', '', buttons);
+}
+
+function showSettings(): void {
+  const panels = document.createElement('div');
+  panels.className = 'panelscroll';
+  panels.appendChild(configPanel(showSettings));
+  showDialog('SETTINGS', 'Applies to the next new game', [['Back', showTitle]], panels);
 }
 
 // MK5.4: `cfg` is supplied by Restart paths (a restart is the same battle —
@@ -477,7 +616,8 @@ async function doSwap(a: Pt, b: Pt): Promise<void> {
   // if the swap matches; the clock keeps running through invalid attempts)
   const thinkMs = thinkStart !== null ? performance.now() - thinkStart : undefined;
   busy = true;
-  const r = game.attemptSwap(a, b, thinkMs);
+  view.setHint(null);
+  const r = game.attemptSwap(a, b, thinkMs, hintFiredThisTurn);
   await view.play(r.events);
   if (r.matched) {
     if (!game.state.winner) await view.play(game.runEnemyPhase());
@@ -578,7 +718,7 @@ attachInput(canvas, view, {
     const panels = document.createElement('div');
     panels.className = 'panelscroll';
     panels.appendChild(configSummary(cfg, 'ACTIVE BATTLE CONFIG'));
-    panels.appendChild(characterSheet(UNIT_DEFS, UNIT_DEFS)); // sides share defs today; MAY diverge later
+    panels.appendChild(characterSheet(cfg, UNIT_DEFS, UNIT_DEFS)); // sides share defs today; MAY diverge later
     showDialog(
       'PAUSED',
       '',
@@ -593,6 +733,42 @@ attachInput(canvas, view, {
 });
 
 showTitle();
+
+// MK7.7 — hint timer: after hintDelaySeconds with no input during the
+// make-a-match phase, highlight an available 4-match (if any). Fires at most
+// once per turn; the fact that it fired is logged with the turn.
+window.addEventListener('pointerdown', () => {
+  lastInputAt = performance.now();
+});
+setInterval(() => {
+  if (!game || !canAct() || hintFiredThisTurn) return;
+  const cfg = game.state.config;
+  if (!cfg.hintEnabled || thinkStart === null) return;
+  const idleSince = Math.max(thinkStart, lastInputAt);
+  if (performance.now() - idleSince < cfg.hintDelaySeconds * 1000) return;
+  const mv = findHintMove(game.state.board);
+  if (mv) {
+    view.setHint(mv);
+    hintFiredThisTurn = true;
+  }
+}, 400);
+
+// MK7.8 — debug-only find-match button (dev server builds only; import.meta
+// guards it out of production bundles entirely)
+if (import.meta.env.DEV) {
+  const b = document.createElement('button');
+  b.id = 'dbgfind';
+  b.textContent = 'find match';
+  b.addEventListener('click', () => {
+    if (!game || !canAct()) return;
+    const mv = findBotMove(game.state.board);
+    if (mv) {
+      view.setHint(mv);
+      hintFiredThisTurn = true; // counts as assisted for think-time honesty
+    }
+  });
+  document.body.appendChild(b);
+}
 
 // MK4.3 console-dump helpers (sanctioned log access — no viewing UI):
 //   breachLogs()               -> { metrics: [...], turns: [...] }

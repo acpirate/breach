@@ -71,10 +71,12 @@ for (const file of files) {
         );
         for (const side of ['player', 'enemy']) {
           const s = entry.metrics.sides[side];
+          const avgRound = s.roundDamageCount ? (s.roundDamageSum / s.roundDamageCount).toFixed(1) : '0';
           outLines.push(
-            `  ${side}: dmg ${s.totalDamage} (match ${s.matchDamage}, atk ${s.attackerDamage}, bomb ${s.bombDamage})` +
-              ` critExtra ${s.critExtra} bufferAdded ${s.bufferDamageAdded ?? 0}` +
-              ` contention ${s.contentionTiles ?? 0}/${s.tilesDestroyed ?? 0} largestHit ${s.largestHit} deepestCascade ${s.deepestCascade}`,
+            `  ${side}: dmg ${s.totalDamage} [match ${s.matchDamage} | bomb ${s.bombDamage} | atk ${s.attackerDamage} | buffer ${s.bufferDamageAdded ?? 0}]` +
+              ` cascadeDmg ${s.cascadeDamage ?? 0} axis(c/s) ${s.matchDamageColor ?? 0}/${s.matchDamageShape ?? 0}` +
+              ` critExtra ${s.critExtra} contention ${s.contentionTiles ?? 0}/${s.tilesDestroyed ?? 0}` +
+              ` largestHit ${s.largestHit} biggestRound ${s.biggestRound ?? 0} avgRound ${avgRound} deepestCascade ${s.deepestCascade}`,
           );
           for (const [t, u] of Object.entries(s.units)) {
             outLines.push(`    ${t}: fires ${u.fires}, effect ${u.effect}, chargeWasted ${u.chargeWasted}`);
@@ -83,11 +85,13 @@ for (const file of files) {
         if (entry.metrics.thinkTimesMs?.length) {
           outLines.push(`  thinkTimesMs (raw): [${entry.metrics.thinkTimesMs.join(', ')}]`);
         }
+        if (entry.metrics.hintsShown) outLines.push(`  hintsShown: ${entry.metrics.hintsShown}`);
       } else if (kind === 'turn') {
         turns++;
         outLines.push(
           `[${at}] turn ${entry.turn} (${entry.battleId} v=${entry.v} ${cfgStr(entry.config)})` +
             `${entry.thinkMs !== undefined ? ` think=${(entry.thinkMs / 1000).toFixed(1)}s` : ''}` +
+            `${entry.hintShown ? ' HINTED' : ''}` +
             `${entry.result ? `  RESULT: ${entry.result} wins` : ''}`,
         );
         if (entry.actions.length) outLines.push(`  actions: ${entry.actions.join('; ')}`);

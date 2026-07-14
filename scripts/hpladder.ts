@@ -6,7 +6,7 @@
 import { DEFAULT_BATTLE_CONFIG } from '../src/logic/constants';
 import { Game } from '../src/logic/game';
 import { BattleConfig } from '../src/logic/types';
-import { botFireAbilities, findBotMove } from './bot';
+import { botFireAbilities, botMove } from './bot';
 
 const N = 100;
 const TIERS = [100, 500, 2000];
@@ -23,7 +23,7 @@ function playOne(seed: number, config: BattleConfig): Result {
   while (!g.state.winner && safety++ < 5000) {
     botFireAbilities(g);
     if (g.state.winner) break;
-    const mv = findBotMove(g.state.board);
+    const mv = botMove(g);
     if (!mv) throw new Error('deadlock prevention failed');
     g.attemptSwap(mv.a, mv.b);
     if (!g.state.winner) g.runEnemyPhase();

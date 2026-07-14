@@ -162,7 +162,11 @@ export class View {
   private msgUntil = 0;
   private floats: { text: string; cx: number; cy: number; born: number; color: string }[] = [];
   private selection: Pt | null = null;
+  private hintMove: { a: Pt; b: Pt } | null = null; // MK7.7/7.8 highlight
   private noise: HTMLCanvasElement;
+  // MK7.12 — letterboxed logical viewport (phone aspect), centered via CSS
+  private cssW = 0;
+  private cssH = 0;
 
   // layout (CSS pixels)
   private pad = 8;
@@ -223,6 +227,24 @@ export class View {
     this.selection = p;
   }
 
+  // MK7.7/7.8 — pulsing highlight on a suggested swap pair (null clears)
+  setHint(mv: { a: Pt; b: Pt } | null): void {
+    this.hintMove = mv;
+  }
+
+  // MK7.11 — tear down the board render (quit-to-title leaves no ghost frame)
+  clearBoard(): void {
+    for (let y = 0; y < BOARD_HEIGHT; y++) {
+      for (let x = 0; x < BOARD_WIDTH; x++) this.grid[y][x] = null;
+    }
+    this.queue = [];
+    this.cur = null;
+    this.floats = [];
+    this.msgText = '';
+    this.selection = null;
+    this.hintMove = null;
+  }
+
   play(events: GameEvent[]): Promise<void> {
     if (!events.length) return Promise.resolve();
     this.queue.push(...events);
@@ -252,8 +274,16 @@ export class View {
 
   private layout(): void {
     const dpr = window.devicePixelRatio || 1;
-    const w = window.innerWidth;
-    const h = window.innerHeight;
+    // MK7.12: letterbox to the target phone's vertical aspect (9:19.5) so
+    // desktop testing IS phone testing — dead space either side on wide
+    // screens (CSS containment, centered by the body flex layout).
+    const ASPECT = 9 / 19.5;
+    let w = Math.min(window.innerWidth, Math.round(window.innerHeight * ASPECT));
+    let h = Math.min(window.innerHeight, Math.round(window.innerWidth / ASPECT));
+    if (w < 200) w = Math.min(window.innerWidth, 200);
+    if (h < 200) h = Math.min(window.innerHeight, 200);
+    this.cssW = w;
+    this.cssH = h;
     this.canvas.width = Math.floor(w * dpr);
     this.canvas.height = Math.floor(h * dpr);
     this.canvas.style.width = `${w}px`;
@@ -430,8 +460,8 @@ export class View {
 
   private draw(now: number): void {
     const ctx = this.ctx;
-    const w = window.innerWidth;
-    const h = window.innerHeight;
+    const w = this.cssW;
+    const h = this.cssH;
     ctx.fillStyle = '#1b1b22';
     ctx.fillRect(0, 0, w, h);
 
@@ -623,6 +653,16 @@ export class View {
         c - 3,
         c - 3,
       );
+    }
+
+    // hint highlight (MK7.7/7.8): pulsing cyan outline on the suggested pair
+    if (this.hintMove) {
+      const pulse = 0.5 + 0.5 * Math.sin(now / 180);
+      ctx.strokeStyle = `rgba(80,220,255,${(0.45 + 0.55 * pulse).toFixed(3)})`;
+      ctx.lineWidth = 4;
+      for (const p of [this.hintMove.a, this.hintMove.b]) {
+        ctx.strokeRect(this.boardX + p.x * c + 2, this.boardY + p.y * c + 2, c - 4, c - 4);
+      }
     }
 
     // event overlays

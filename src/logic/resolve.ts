@@ -26,6 +26,7 @@ import {
   HIGH_SHAPES,
   SHAKE_CHARGE_PER_NEUTRAL_TILE,
   UNIT_DEFS,
+  effectiveCost,
 } from './constants';
 import { MatchCondition, detectMatches, matchClearsLine, matchMultiplier } from './match';
 import { completesRun, hasAnyValidMove, randomTile, reshuffleBoard } from './board';
@@ -56,26 +57,45 @@ export function baseDamage(t: Tile): number {
 // applicable value (mirror of the highest-multiplier-wins rule).
 // The Hacker passive (+1 on Red, player match events, config-gated) rides the
 // color-tier value.
-function matchTileDamage(t: Tile, axes: Set<MatchCondition>, owner: Side, hackerOn: boolean): number {
-  if (t.kind === 'neutral') return DAMAGE_PER_TILE_NEUTRAL;
+// Returns the paid value AND which axis paid it (MK7.5 split): 'color' when
+// the color tier paid (including neutral-sweep destruction of standard tiles,
+// which uses the color tier; ties also go to color since color is the paid
+// value there), 'shape' when the shape tier strictly exceeded it, 'neutral'
+// for neutral tiles (axis-less for the behavioral split).
+function matchTileDamage(
+  t: Tile,
+  axes: Set<MatchCondition>,
+  owner: Side,
+  hackerOn: boolean,
+): { v: number; axis: 'color' | 'shape' | 'neutral' } {
+  if (t.kind === 'neutral') return { v: DAMAGE_PER_TILE_NEUTRAL, axis: 'neutral' };
   let v = 0;
+  let axis: 'color' | 'shape' | 'neutral' = 'neutral';
   if (axes.has('color') || axes.has('neutral')) {
     let c = HIGH_COLORS.includes(t.color!) ? DAMAGE_PER_TILE_HIGH_COLOR : DAMAGE_PER_TILE_LOW_COLOR;
     if (hackerOn && owner === 'player' && t.color === HACKER_BONUS_COLOR) c += HACKER_BONUS_DAMAGE;
     v = c;
+    axis = 'color';
   }
   if (axes.has('shape')) {
     const s = HIGH_SHAPES.includes(t.shape!) ? DAMAGE_PER_TILE_HIGH_SHAPE : DAMAGE_PER_TILE_LOW_SHAPE;
-    if (s > v) v = s;
+    if (s > v) {
+      v = s;
+      axis = 'shape';
+    } else if (v === 0) {
+      v = s;
+      axis = 'shape';
+    }
   }
-  return v;
+  return { v, axis };
 }
 
-// Charge cap = activation cost, applied at the moment charge is added.
-// Returns the amount discarded at the cap (for the MK2.3 waste metric).
-export function addUnitCharge(u: UnitState, amount: number): number {
+// Charge cap = activation cost (MK7.1: the EFFECTIVE cost from the battle
+// config), applied at the moment charge is added. Returns the amount
+// discarded at the cap (for the MK2.3 waste metric).
+export function addUnitCharge(state: GameState, u: UnitState, amount: number): number {
   const before = u.charge;
-  u.charge = Math.min(UNIT_DEFS[u.type].cost, before + amount);
+  u.charge = Math.min(effectiveCost(state.config, u.type), before + amount);
   return before + amount - u.charge;
 }
 
@@ -84,16 +104,30 @@ export function addShakeCharge(state: GameState, amount: number): void {
 }
 
 export interface DamageInfo {
-  source: 'match' | 'attacker' | 'bomb';
+  source: 'match' | 'attacker' | 'bomb'; // MK7.3: the CAUSAL bucket
   label: string;
   critExtra?: number; // portion of `amount` added by the 1.5x multiplier (pre-floor)
   buffBonus?: number; // portion of `amount` contributed by buff tiles
+  colorRaw?: number; // MK7.5: pre-floor damage paid via the color axis (match cause only)
+  shapeRaw?: number; // MK7.5: pre-floor damage paid via the shape axis (match cause only)
+  cascadeRaw?: number; // MK7.3: pre-floor damage from stochastic-only tiles
 }
 
 export function dealDamage(state: GameState, target: Side, amount: number, info: DamageInfo, events: GameEvent[]): void {
   if (state.winner || amount <= 0) return;
   state.hp[target] -= amount;
-  events.push({ t: 'damage', target, amount, label: info.label, source: info.source, critExtra: info.critExtra, buffBonus: info.buffBonus });
+  events.push({
+    t: 'damage',
+    target,
+    amount,
+    label: info.label,
+    source: info.source,
+    critExtra: info.critExtra,
+    buffBonus: info.buffBonus,
+    colorRaw: info.colorRaw,
+    shapeRaw: info.shapeRaw,
+    cascadeRaw: info.cascadeRaw,
+  });
   if (state.hp[target] <= 0) {
     state.winner = opponentOf(target);
     state.phase = 'over';
@@ -137,9 +171,9 @@ function chargeFromDestroyedTile(
       if (state.config.hackerBonusEnabled && owner === 'player' && t.color === HACKER_BONUS_COLOR) {
         c += HACKER_BONUS_CHARGE;
       }
-      w += addUnitCharge(u, c);
+      w += addUnitCharge(state, u, c);
     }
-    if (shapePays && def.shape === t.shape) w += addUnitCharge(u, CHARGE_PER_TILE_SHAPE_MATCH);
+    if (shapePays && def.shape === t.shape) w += addUnitCharge(state, u, CHARGE_PER_TILE_SHAPE_MATCH);
     if (w > 0) waste.set(u.type, (waste.get(u.type) ?? 0) + w);
   }
 }
@@ -149,7 +183,10 @@ function chargeFromDestroyedTile(
 // Matches formed purely by EXISTING tiles falling together cannot be
 // prevented by tile generation and still resolve (designer ruling) — each
 // such step gets another constrained refill until the board settles clean.
-export function applyGravityAndRefill(state: GameState, events: GameEvent[], constrained = false): void {
+// `freshIds` (MK7.2): ids of tiles spawned by refill within the CURRENT
+// resolution chain — the stochastic ones. Anything on the board when the
+// chain started was visible to the player and is deterministic.
+export function applyGravityAndRefill(state: GameState, events: GameEvent[], constrained = false, freshIds?: Set<number>): void {
   const moves: { from: Pt; to: Pt }[] = [];
   for (let x = 0; x < BOARD_WIDTH; x++) {
     let write = BOARD_HEIGHT - 1;
@@ -179,6 +216,7 @@ export function applyGravityAndRefill(state: GameState, events: GameEvent[], con
   } else {
     for (const p of empty) state.board[p.y][p.x] = randomTile(state);
   }
+  if (freshIds) for (const p of empty) freshIds.add(state.board[p.y][p.x]!.id);
   events.push({ t: 'spawn', tiles: empty.map((p) => ({ p, view: tileViewOf(state.board[p.y][p.x]!) })) });
 }
 
@@ -217,42 +255,74 @@ const BOUND_SHAPES = new Set(Object.values(UNIT_DEFS).map((d) => d.shape));
 // cascades). Matches are always resolved when present (they never sit on the
 // board); the cap throttles generation, not resolution.
 //
-// Returns the number of steps resolved (deepest-cascade metric; 1 = a plain
-// match with no cascading).
-export function resolveCascades(state: GameState, owner: Side, events: GameEvent[], budget: number | null): number {
+// MK7.3 `cause`: the action that INITIATED this chain ('match' = player/enemy
+// swap, 'bomb' = detonation). Every damage event the chain emits — including
+// deterministic settling and stochastic refill cascades descended from it —
+// inherits this cause as its bucket. The mechanism does not determine the
+// bucket; the cause does.
+//
+// MK7.2 `freshIds`: tile ids spawned by refill within THIS chain. A match is
+// STOCHASTIC iff it contains a fresh tile; matches formed purely by existing
+// tiles falling are deterministic settling (visible to a skilled player, part
+// of the chosen move) and are NOT cascades.
+//
+// Returns steps resolved and how many rounds contained a stochastic match
+// (the corrected cascade-depth metric).
+export function resolveCascades(
+  state: GameState,
+  owner: Side,
+  events: GameEvent[],
+  budget: number | null,
+  cause: 'match' | 'bomb',
+  freshIds: Set<number>,
+): { steps: number; stochasticRounds: number } {
   let steps = 0;
+  let stochasticRounds = 0;
   while (!state.winner) {
     const matches = detectMatches(state.board);
     if (!matches.length) break;
     steps++;
 
-    // Per destroyed tile: highest multiplier (applied once), plus the set of
-    // match AXES that destroyed it (for MK5.2 single-axis charge payout).
-    const info = new Map<number, { p: Pt; m: number; axes: Set<MatchCondition> }>();
-    const bump = (x: number, y: number, m: number, axis: MatchCondition): void => {
+    // classify each match BEFORE destruction (needs live board tiles)
+    const stochastic = matches.map((match) =>
+      match.cells.some((c) => {
+        const t = state.board[c.y][c.x];
+        return !!t && freshIds.has(t.id);
+      }),
+    );
+    if (stochastic.some(Boolean)) stochasticRounds++;
+
+    // Per destroyed tile: highest multiplier (applied once), the set of match
+    // AXES that destroyed it (MK5.2 single-axis charge / MK7.5 split), and
+    // whether EVERY match destroying it was stochastic (MK7.3 cascadeDamage —
+    // mixed destruction counts as earned).
+    const info = new Map<number, { p: Pt; m: number; axes: Set<MatchCondition>; stochOnly: boolean }>();
+    const bump = (x: number, y: number, m: number, axis: MatchCondition, stoch: boolean): void => {
       const k = y * BOARD_WIDTH + x;
       const cur = info.get(k);
-      if (!cur) info.set(k, { p: { x, y }, m, axes: new Set([axis]) });
+      if (!cur) info.set(k, { p: { x, y }, m, axes: new Set([axis]), stochOnly: stoch });
       else {
         if (m > cur.m) cur.m = m;
         cur.axes.add(axis);
+        cur.stochOnly = cur.stochOnly && stoch;
       }
     };
-    for (const match of matches) {
+    matches.forEach((match, mi) => {
       const m = matchMultiplier(match);
-      for (const c of match.cells) bump(c.x, c.y, m, match.condition);
+      const st = stochastic[mi];
+      for (const c of match.cells) bump(c.x, c.y, m, match.condition, st);
       if (matchClearsLine(match)) {
         // straight-line 4/5+: the entire row/column is cleared at this
         // match's multiplier; swept tiles carry the sweeping match's axis
         if (match.orientation === 'h') {
           const y = match.cells[0].y;
-          for (let x = 0; x < BOARD_WIDTH; x++) bump(x, y, m, match.condition);
+          for (let x = 0; x < BOARD_WIDTH; x++) bump(x, y, m, match.condition, st);
         } else {
           const x = match.cells[0].x;
-          for (let y = 0; y < BOARD_HEIGHT; y++) bump(x, y, m, match.condition);
+          for (let y = 0; y < BOARD_HEIGHT; y++) bump(x, y, m, match.condition, st);
         }
       }
-    }
+    });
 
     // Buff bonus: once per step, computed BEFORE removal so a same-side buff
     // destroyed in this step still counts toward this step's damage.
@@ -262,15 +332,21 @@ export function resolveCascades(state: GameState, owner: Side, events: GameEvent
     let raw = 0;
     let critExtra = 0; // damage added by the 1.5x multiplier only (pre-floor)
     let contested = 0; // MK5.6: destroyed tiles bound to the OPPOSING side's units
+    let colorRaw = 0; // MK7.5: pre-floor damage paid via the color axis
+    let shapeRaw = 0; // MK7.5: pre-floor damage paid via the shape axis
+    let cascadeRaw = 0; // MK7.3: pre-floor damage from stochastic-only tiles
     const destroyed: Pt[] = [];
     const waste = new Map<string, number>();
-    for (const { p, m, axes } of info.values()) {
+    for (const { p, m, axes, stochOnly } of info.values()) {
       const t = state.board[p.y][p.x];
       if (!t) continue;
       destroyed.push(p);
-      const base = matchTileDamage(t, axes, owner, hackerOn); // MK6.1: axis-resolved
+      const { v: base, axis } = matchTileDamage(t, axes, owner, hackerOn); // MK6.1: axis-resolved
       raw += base * m;
       if (m > 1) critExtra += base * (m - 1);
+      if (axis === 'color') colorRaw += base * m;
+      else if (axis === 'shape') shapeRaw += base * m;
+      if (stochOnly) cascadeRaw += base * m;
       if (t.kind === 'standard' && (BOUND_COLORS.has(t.color!) || BOUND_SHAPES.has(t.shape!))) contested++;
       chargeFromDestroyedTile(state, owner, t, axes, waste);
     }
@@ -292,15 +368,24 @@ export function resolveCascades(state: GameState, owner: Side, events: GameEvent
         state,
         opponentOf(owner),
         Math.floor(raw) + bonus,
-        { source: 'match', label: owner === 'player' ? 'match' : 'enemy match', critExtra, buffBonus: bonus },
+        {
+          source: cause, // MK7.3: bucket = initiating cause, not mechanism
+          label: owner === 'player' ? 'match' : 'enemy match',
+          critExtra,
+          buffBonus: bonus,
+          colorRaw: cause === 'match' ? colorRaw : undefined,
+          shapeRaw: cause === 'match' ? shapeRaw : undefined,
+          cascadeRaw,
+        },
         events,
       );
     }
-    applyGravityAndRefill(state, events, budget !== null && steps >= budget);
+    applyGravityAndRefill(state, events, budget !== null && steps >= budget, freshIds);
   }
-  if (steps > 0) events.push({ t: 'cascadeDepth', side: owner, depth: steps });
+  // MK7.2: the cascade metric counts only stochastic-refill rounds
+  if (stochasticRounds > 0) events.push({ t: 'cascadeDepth', side: owner, depth: stochasticRounds });
   if (!state.winner) ensureNoDeadlock(state, events);
-  return steps;
+  return { steps, stochasticRounds };
 }
 
 // Bomb detonation: destroys the bomb + its 4 orthogonal neighbors as NORMAL
@@ -342,11 +427,14 @@ export function resolveDetonation(state: GameState, p: Pt, events: GameEvent[]):
 
   // MK5.2: a detonation has no "initial match" — its entire cascade budget is
   // the cap itself, and at cap 0 even the blast's own refill is constrained.
+  // MK7.3: everything descended from the blast carries the 'bomb' cause, so
+  // bomb-caused cascade damage now correctly credits to the bomb bucket.
+  // MK7.2: the chain's own cascadeDepth event (stochastic rounds only) is
+  // emitted inside resolveCascades — the blast itself is not a cascade.
   const cap = state.config.maxCascadeSteps;
-  applyGravityAndRefill(state, events, cap !== null && cap <= 0);
-  const steps = resolveCascades(state, owner, events, cap);
-  // detonation depth = the blast itself + any cascade steps it caused
-  events.push({ t: 'cascadeDepth', side: owner, depth: 1 + steps });
+  const freshIds = new Set<number>();
+  applyGravityAndRefill(state, events, cap !== null && cap <= 0, freshIds);
+  resolveCascades(state, owner, events, cap, 'bomb', freshIds);
 }
 
 // Run after every settle: if the board has no valid moves, the automatic

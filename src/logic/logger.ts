@@ -13,7 +13,7 @@ import { BattleConfig, GameEvent, GameState, Side, opponentOf } from './types';
 
 // Version tag stamped on every log entry (designer-set; placeholder scheme).
 // Older-version entries remain in the logs until explicitly cleared.
-export const LOG_VERSION = 'mk6';
+export const LOG_VERSION = 'mk7';
 
 // Log-size caps — directly controlled here, comfortably under the ~5MB
 // localStorage quota (entries are a few hundred bytes each). The storage
@@ -40,6 +40,7 @@ export interface TurnLogEntry {
   hpAfter: Record<Side, number>;
   chargesAfter: { player: number[]; enemy: number[]; shake: number };
   thinkMs?: number; // MK6.6 — RAW think-time for this turn's committed move (no aggregation)
+  hintShown?: boolean; // MK7.7 — a hint fired before this turn's move (exclude from think-time analysis)
   result?: Side; // present on a battle's final entry: who won
 }
 
@@ -109,6 +110,9 @@ export class TurnLogger {
         }
         case 'thinkTime':
           e.thinkMs = ev.ms;
+          break;
+        case 'hintShown':
+          e.hintShown = true;
           break;
         default:
           break;
