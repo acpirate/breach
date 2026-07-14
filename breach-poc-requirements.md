@@ -666,6 +666,127 @@ Not in MK6: the **escalating cascade cap** (cap starts at 0 and climbs over the 
 
 ---
 
+# Section 1-MK7: Attribution, Cost Curve & Instrumentation (BUILD THIS, ON TOP OF MK6)
+
+Assumes Sections 1, MK2–MK6 are built and working. Each item is a DELTA against the current build — where MK7 conflicts with an earlier section, MK7 governs; everything not mentioned is unchanged. Section 2 (Roadmap) remains out of scope.
+
+**Intent (context, not a build instruction):** MK7's theme is **fix the instruments before running the experiment.** Sixteen logged human battles revealed that the metrics have been lying in several specific, identified ways — bomb cascade damage is miscredited to matches, buffer damage is double-represented, and deterministic tile-settling is being counted as "cascades" alongside genuine RNG payouts. Separately, the ability cost curve (7/13/19/22) was priced for a 350-HP game and never re-priced: at the current 100–150 HP, **the 19-cost Attacker fired in 2 of 16 battles and the 22-cost Disabler fired ZERO times, ever.** Expensive abilities aren't underpowered — they're *unreachable*. MK7 fixes the attribution, exposes cost as config, and adds a flat-cost diagnostic mode so ability EFFECTS can finally be evaluated independently of their FIRING RATE. No new abilities, no new units, no loadout screen — those come next, on corrected numbers.
+
+## MK7.1 Ability cost as config + `FLAT_ABILITY_COST` diagnostic (TOP PRIORITY)
+
+- **Expose the four ability costs as per-battle config values** (settable on the Settings screen, persisted, stamped into save and logs like every other config value). Current defaults remain 7 / 13 / 19 / 22 (Bomber / Buffer / Attacker / Disabler).
+- **Add a `FLAT_ABILITY_COST` diagnostic flag (default OFF). When ON, ALL FOUR units cost 7.**
+- **Why:** the four abilities currently differ on TWO dimensions at once — what they DO (effect) and how often they FIRE (cost). So "is Disabler good?" is unanswerable: you cannot separate "weak effect" from "never fires." Flattening cost collapses the confound — every unit fires at the same rate, so any difference in contribution is purely a difference in EFFECT.
+- **Secondary benefit:** it also rescues the `SINGLE_AXIS_PAYOUT` experiment. Feeding shape-over-color is currently not a strategic tradeoff but a SCALING problem — trading "1/7th of a bomb" against "1/22nd of a disable" is a choice between RATES, not EFFECTS. Equal costs make it a genuine choice about what you get.
+- **NOTE (context, not an instruction):** flat-7 will likely produce unbalanced, swingy, or very short battles. **That is expected and fine.** It is a diagnostic config, not a shipping one. Its purpose is to reveal RELATIVE ability contributions, not to play well.
+
+## MK7.2 Redefine "cascade" — deterministic settling is NOT a cascade (metric fix, NO gameplay change)
+
+Two mechanically different things are currently both counted as "cascades":
+
+- **Existing tiles falling into gaps and forming matches = DETERMINISTIC.** Fully determined by the board state plus the player's swap. A skilled player can see it coming. It is part of the move they chose. **This is NOT a cascade.**
+- **Newly-generated RANDOM tiles falling in from the top and forming matches = STOCHASTIC.** Unpredictable. **This is the ONLY thing that should count as a "cascade."**
+
+- **This is a NAMING/METRIC correction only — do NOT change any gameplay behavior.** `MAX_CASCADE_STEPS` already gates only the stochastic refill rounds (deterministic settling already resolves regardless of the cap); that behavior is correct and stays exactly as-is. Only the *counter* and the *damage attribution* change.
+- The cascade-depth metric must now count only stochastic-refill rounds. (Expect reported cascade depths to drop — that is the fix working.)
+
+## MK7.3 Damage attribution model (settled — implement exactly this)
+
+**Governing principle: damage rolls up to the ACTION THAT INITIATED THE CHAIN. The mechanism does not determine the bucket; the CAUSE does.**
+
+**Four DISJOINT causal buckets, which must sum exactly to total damage:**
+
+| Bucket | Contents |
+|---|---|
+| **`match`** | The swap-initiated match + its deterministic settling + its stochastic refill-cascades. (All of it was caused by the player's swap.) |
+| **`bomb`** | The explosion + its deterministic settling + its stochastic refill-cascades. (All of it was caused by the bomb.) **Roll bomb-cascades INTO bomb damage — do NOT split them into a separate column.** |
+| **`atk`** | Direct Attacker damage. |
+| **`buffer`** | The Buffer's damage contribution — see MK7.4. |
+
+- **This corrects a real error:** bomb-caused cascade damage is currently miscredited to the `match` column, which inflates match damage and understates bomb damage. The misattribution scales with how board-disruptive an ability is, so it will only get worse as more board-altering abilities are added.
+- Implementation: tag the resolution chain with its initiating cause. Whatever *initiates* a resolution (player swap / bomb detonation / any future board-altering ability) stamps its cause, and every settling and cascade step descended from it **inherits** that cause. Damage then rolls up by cause.
+- **Do NOT build separate per-source cascade columns** (e.g. "bomb-cascade damage"). There is no live tuning question that such a column would answer. The causal tagging makes it trivial to add later if that changes.
+
+**Plus ONE cross-cutting measure (overlaps the causal buckets; does NOT sum with them):**
+
+- **`cascadeDamage`** = ALL damage from STOCHASTIC REFILL matches, **regardless of what caused them**. This overlaps `match` and `bomb` rather than being disjoint from them — the same reporting shape as `bufferAdded`.
+- **Why:** it is the one number needed to answer *"how much damage is coming from unearned RNG refills?"* (MPQ precedent: cascade matches deal diminishing damage, precisely because they're unearned.) Having this single line makes "should cascades pay less?" a tunable question instead of an invisible one — without proliferating per-source columns.
+
+## MK7.4 Buffer damage as a disjoint column
+
+- `bufferAdded` is currently reported separately **but its contribution is ALSO baked into the `match`/`atk`/`bomb` totals** — so it is double-represented and the columns do not decompose cleanly.
+- **Make Buffer a genuine disjoint bucket**, so that `match + bomb + atk + buffer = total`, with every column a non-overlapping contribution.
+- Definition is unchanged from MK6.7: buffer damage = for each damage event, `(damage_dealt − damage_that_would_have_been_dealt_with_zero_active_buff_stacks)`, summed. It is now *subtracted out* of the other buckets rather than left inside them.
+
+## MK7.5 Log the match AXIS (color vs shape)
+
+- Record, per match, **which axis it resolved on** (color-match vs shape-match), and split match damage accordingly: **`matchDamage_color` vs `matchDamage_shape`**.
+- **This is primarily a BEHAVIORAL question, not a correctness check.** Color is pre-attentively salient; shape requires serial visual search. **The player may be an unconscious color-matcher.** If matches run 85/15 in favour of color, then the shape axis is functionally decorative for the player regardless of what the code does — and the entire dual-axis premise is not delivering the strategic value it was designed for. **This is arguably THE open question about whether the dual-axis board is doing anything.**
+- Secondary benefit: because MK6 made the tiers symmetric (both 1/2), a regression in the shape-damage path would currently be **invisible** in the totals. This makes it detectable.
+
+## MK7.6 New damage metrics — biggest ROUND and average round (nonzero)
+
+- **Biggest ROUND damage** — the largest total damage dealt in a single round (ability + match + cascade stacked), as distinct from the existing biggest-HIT. This is the real **swinginess** indicator.
+- **Average round damage where > 0** — the general **effectiveness** indicator. Explicitly exclude zero-damage rounds; including them would drag a naive mean toward zero and obscure the signal.
+- Together these give ceiling AND baseline, which is what's needed to reason about pacing and swing. Both per side, in the batch output and the game-over display.
+
+## MK7.7 Hint system (configurable, DEFAULT OFF)
+
+- After a configurable delay (**default 7 seconds**) with no player input, highlight an available 4-match if one exists. Standard genre feature.
+- **Default OFF.** Settable (on/off + delay) in Settings.
+- **Log whether a hint fired on each turn.** This is required: a 7-second hint compresses the think-time distribution and would destroy its value as an engagement proxy (MK6.6). Hint-assisted turns must be **excludable** from think-time analysis.
+
+## MK7.8 Debug-only "find match" button
+
+- A debug-build-only button that finds and highlights an available match, so the human tester can move through games faster while still directly observing them.
+- Debug builds only — must not appear in a normal build.
+
+## MK7.9 Shake becomes a PERMUTATION, not a re-randomization
+
+Supersedes the shake behavior from MK2.2 / MK5.
+
+- **The shake now REARRANGES the existing tiles on the board rather than generating new ones.** The board's *composition* (which tiles exist) is preserved exactly; only their *positions* change.
+- **The validity contract is UNCHANGED:** the resulting board must still have at least one valid move and NO pre-existing match. A permutation of a bad board could land in a deadlock, so the re-permute-until-valid loop must remain.
+- Special tiles continue to persist through the shake (retaining color / shape / owner / duration), as before.
+- **Rationale:** (a) it makes shake a **positional** tool rather than an **economic** one — you can no longer shake your way to *more* of a colour you need, only to a better arrangement of what you have; (b) it removes a hidden reroll-the-economy exploit (a bad-composition board currently gets rerolled; now you must play through it); (c) **critically, it is the right behaviour BEFORE board-tuning abilities exist** — a future ability that converts tiles toward your colour would be *undone* by a re-randomizing shake, which would punish exactly the play it should reward. A permuting shake preserves that investment.
+
+## MK7.10 Menu / Settings UI restructure
+
+- **Rename the "Play" button to "New Game."** Clearer, and it names the consequence (starting a new game wipes any resident save, per MK4.2). **No confirmation dialog** — see the design note below.
+- **Move the battle config out of the title screen and into its own "Settings" modal**, reached by a new **Settings** button. The title screen currently carries Continue, Play, four flags, two HP fields, a cascade toggle and Reset — a settings panel that ate a menu, and it will only get worse (MK7 alone adds cost config, a hint toggle and a hint delay).
+- **Title screen becomes: New Game / Continue (when a valid save exists) / Settings.** Actions only.
+- **Settings modal contains:** all battle config (flags, HP, ability costs, hint on/off + delay, cascade cap) plus **Reset to Defaults**.
+- **The battle pause menu keeps its read-only config review and the character sheet as reference panels BELOW the action buttons.** Same principle: actions first, reference below.
+- **Settings is NOT reachable mid-battle.** Config is immutable for a battle in progress (it is baked into the save; changing rules mid-fight is incoherent). Offering an editable control that cannot do anything would be worse than not offering it. The pause menu's read-only config review already covers "what am I playing under?"
+
+**Design note — confirmation dialogs (standing principle, applies here and in future):** confirmations are reserved for actions with meaningful real-world consequences. Every trivial confirm acclimates the user toward dismissing dialogs unthinkingly, which degrades the *important* ones. Losing an in-progress PoC battle is annoying, not consequential. **Do not add a confirm to New Game.**
+
+## MK7.11 Bug — board stays rendered behind the title screen after Quit
+
+- On Quit, the render layer is not torn down or reset, so the board's last frame remains visible behind the title menu.
+- Cosmetic, but it reads as unfinished and sends an ambiguous signal (the visible board implies the battle is still running — which, since Continue still holds it, is *semi*-true).
+- **Fix:** clear the board render on quit. (Optionally, dimming/blurring it instead would be *more* truthful, since Continue is right there offering to resume — but clearing is the cheaper fix and is sufficient.)
+
+## MK7.12 Constrain the desktop/web view to the phone's aspect ratio
+
+- The game is a mobile-first portrait experience, but it is currently also being viewed and tested at desktop aspect ratios. **Letterbox the game into a fixed-aspect container matching the target phone's vertical aspect ratio, centered in the viewport** (dead space either side on wide screens).
+- Rationale: right now UI is effectively being tested at two different aspect ratios and only one of them is the real target — a layout that looks fine on a wide desktop viewport could be broken on the phone and go unnoticed. Constraining the desktop view means **every test is a phone test, regardless of the device being used.**
+- This is a CSS containment change, not a layout rework.
+- **Explicitly deferred:** a proper wide/tablet/landscape layout that takes advantage of desktop aspect ratios. That is a release-time content decision (it would mean redesigning the HUD for landscape), and building it now would mean maintaining two layouts through every subsequent UI change.
+
+## MK7.13 Bot heuristic — add a charge-aware tier for `NO_MATCH_DAMAGE`
+
+- **The bot's `prefer-4` heuristic is a DAMAGE heuristic.** Under `NO_MATCH_DAMAGE`, matches deal no damage — so the bot is optimizing for something that no longer exists. Observed: in an NMD battle the enemy bot fired 6 bombs for **zero total damage** (a churning board destroyed them all before they could detonate) and never adapted; it lost 126–30 to a human who had adapted to the mode.
+- **Consequence: NMD win rates are currently meaningless as balance data** — the human is playing a different game from the bot.
+- **Fix: add one more heuristic tier for use when `NO_MATCH_DAMAGE` is on — "prefer matches that feed my units' bindings" (i.e. match for CHARGE, not damage).** This is not a full AI upgrade; it is one additional selection rule, chosen when the flag is set.
+- Keep the existing tiers intact for non-NMD play. The bot must remain a deliberately weak floor indicator; this only stops it from optimizing for a quantity that does not exist.
+
+## MK7 — Out of scope (parked)
+
+Not in MK7: **new units** and the **loadout screen** (deliberately deferred — design them against CORRECTED numbers, after MK7's attribution fixes and the flat-cost experiment reveal what the existing abilities are actually worth); unit variants; enemy loadout sandbox; the escalating cascade cap; cascade-manipulation abilities; the "sensory corruption" axis-blind debuff; action-point economy; unit HP / knockout; axis-identity factions; overcharge; different-bindings; AI difficulty tiers. See Section 2 and the design backlog.
+
+---
+
 # Section 2: Roadmap (DO NOT BUILD — CONTEXT ONLY)
 
 This section exists so future work has a documented home and so deferred ideas aren't lost. Nothing in this section should be implemented as part of the PoC. If anything here appears to conflict with Section 1, Section 1 governs for this build.
@@ -1239,4 +1360,150 @@ After building, report: (a) ability share of damage with NO_MATCH_DAMAGE off vs 
 STILL deal detonation damage under NO_MATCH_DAMAGE, (e) the dump now includes config,
 version, contention, timing, and buffer fields, and (f) HP is settable from the menu and
 the forced-loss scenario is gone.
+```
+
+# Coding Agent Prompt — MK7 Iteration (Ready to Paste)
+
+```
+This is a seventh iteration on the existing, working "Breach" build in this repo.
+Sections 1 and MK2-MK6 are complete, verified, and committed. Now implement
+"Section 1-MK7: Attribution, Cost Curve & Instrumentation" from
+breach-poc-requirements.md.
+
+Read Section 1-MK7 in full first, including its intent note. THE THEME OF THIS
+BUILD IS: FIX THE INSTRUMENTS BEFORE RUNNING THE EXPERIMENT. Sixteen logged human
+battles revealed the metrics have been lying in several specific ways (bomb cascade
+damage miscredited to matches; buffer damage double-represented; deterministic
+tile-settling counted as "cascades"). Separately, the ability cost curve was priced
+for a 350-HP game and never re-priced: at 100-150 HP the 19-cost Attacker fired in
+2 of 16 battles and the 22-cost Disabler fired ZERO times, ever. NO new abilities,
+NO new units, NO loadout screen this pass.
+
+1. MK7.1 ABILITY COST AS CONFIG + FLAT_ABILITY_COST (TOP PRIORITY) — expose the four
+   ability costs as per-battle config (Settings screen, persisted, stamped into save
+   and logs). Defaults stay 7/13/19/22. ADD a FLAT_ABILITY_COST flag (default OFF);
+   when ON, all four units cost 7. Rationale: cost and effect are currently
+   CONFOUNDED — "is Disabler good?" is unanswerable because you can't separate "weak
+   effect" from "never fires." Flat cost collapses the confound. NOTE: flat-7 will
+   probably produce unbalanced/swingy/short battles. THAT IS EXPECTED AND FINE — it
+   is a diagnostic config, not a shipping one.
+
+2. MK7.2 REDEFINE "CASCADE" (metric fix ONLY — NO gameplay change) — deterministic
+   settling (existing tiles falling into gaps) is NOT a cascade; it's part of the move
+   the player chose and they can see it coming. ONLY matches formed by NEWLY-GENERATED
+   RANDOM tiles falling in from the top count as cascades. *** DO NOT CHANGE ANY
+   GAMEPLAY BEHAVIOR. MAX_CASCADE_STEPS already gates only the stochastic refill rounds
+   and that is correct — leave it exactly as-is. Only the COUNTER and the DAMAGE
+   ATTRIBUTION change. *** Expect reported cascade depths to drop; that's the fix
+   working.
+
+3. MK7.3 DAMAGE ATTRIBUTION MODEL — implement exactly as specced. GOVERNING PRINCIPLE:
+   damage rolls up to the ACTION THAT INITIATED THE CHAIN; the mechanism doesn't
+   determine the bucket, the CAUSE does.
+   FOUR DISJOINT buckets that must sum EXACTLY to total damage:
+     match  = swap-initiated match + its settling + its stochastic cascades
+     bomb   = explosion + its settling + its stochastic cascades  <-- ROLL BOMB
+              CASCADES INTO BOMB DAMAGE. Do NOT split them out. (Currently they are
+              miscredited to `match`, inflating match damage and understating bombs.)
+     atk    = direct Attacker damage
+     buffer = the Buffer's contribution (see item 4)
+   Implementation: tag each resolution chain with its INITIATING cause; every settling
+   and cascade step DESCENDED from it INHERITS that cause; damage rolls up by cause.
+   PLUS ONE CROSS-CUTTING measure (overlaps the buckets, does NOT sum with them):
+     cascadeDamage = ALL damage from stochastic-refill matches regardless of cause
+   (same reporting shape as bufferAdded). This is the one number that answers "should
+   cascades pay less?" (MPQ discounts cascade damage because it's unearned).
+   Do NOT build per-source cascade columns (e.g. bomb-cascade) — no live tuning
+   question needs them, and the causal tagging makes it trivial to add later.
+
+4. MK7.4 BUFFER AS A DISJOINT COLUMN — bufferAdded is currently reported separately
+   but ALSO baked into match/atk/bomb, so it's double-represented and the columns don't
+   decompose. Make it a genuine disjoint bucket: match + bomb + atk + buffer = total.
+   Definition unchanged from MK6.7; it is now SUBTRACTED OUT of the other buckets.
+
+5. MK7.5 LOG THE MATCH AXIS — record whether each match resolved on the COLOR axis or
+   the SHAPE axis; split match damage into matchDamage_color vs matchDamage_shape.
+   This is mainly a BEHAVIORAL question: color is pre-attentively salient, shape needs
+   serial visual search, so the player may be an unconscious COLOR-MATCHER. If matches
+   run ~85/15 color, the shape axis is functionally decorative and the dual-axis premise
+   isn't delivering. (Also: because MK6's tiers are symmetric (1/2 both), a regression
+   in the shape-damage path would otherwise be INVISIBLE in the totals.)
+
+6. MK7.6 NEW DAMAGE METRICS — (a) biggest ROUND damage (largest total in one round:
+   ability + match + cascade stacked) — distinct from the existing biggest-HIT; this is
+   the SWINGINESS indicator. (b) average round damage WHERE > 0 — the EFFECTIVENESS
+   indicator; explicitly EXCLUDE zero-damage rounds (including them would drag the mean
+   toward zero and obscure the signal). Both per side, in batch output and game-over
+   display.
+
+7. MK7.7 HINT SYSTEM (configurable, DEFAULT OFF) — after a configurable delay (default
+   7s) with no player input, highlight an available 4-match if one exists. Settable
+   (on/off + delay) in Settings. *** LOG WHETHER A HINT FIRED EACH TURN — required, so
+   hint-assisted turns can be EXCLUDED from think-time analysis; otherwise a 7s hint
+   compresses the think-time distribution and destroys its value as an engagement
+   proxy (MK6.6). ***
+
+8. MK7.8 DEBUG-ONLY "FIND MATCH" BUTTON — debug builds only; must not appear in a
+   normal build. Lets the human tester move through games faster while still directly
+   observing them.
+
+9. MK7.9 SHAKE BECOMES A PERMUTATION — the shake now REARRANGES the existing tiles
+   rather than generating new ones. Board COMPOSITION is preserved exactly; only
+   POSITIONS change. *** The validity contract is UNCHANGED: the result must still have
+   >=1 valid move and NO pre-existing match, so the re-permute-until-valid loop must
+   remain. *** Special tiles still persist (color/shape/owner/duration). Rationale:
+   makes shake a POSITIONAL tool not an ECONOMIC one (you can no longer shake for MORE
+   of a color you need); removes a hidden reroll-the-economy exploit; and is the right
+   behavior BEFORE board-tuning abilities exist (a future ability that converts tiles
+   toward your color would be UNDONE by a re-randomizing shake).
+
+10. MK7.10 MENU / SETTINGS RESTRUCTURE — rename "Play" to "New Game". Move ALL battle
+    config off the title screen into a new SETTINGS MODAL (reached by a Settings button).
+    Title screen becomes: New Game / Continue (when a valid save exists) / Settings —
+    ACTIONS ONLY. Settings modal holds all config (flags, HP, ability costs, hint on/off
+    + delay, cascade cap) plus Reset to Defaults. The battle PAUSE menu keeps its
+    read-only config review and character sheet as reference panels BELOW the action
+    buttons. *** SETTINGS IS NOT REACHABLE MID-BATTLE — config is immutable for a battle
+    in progress (it's baked into the save). *** NO CONFIRMATION DIALOG on New Game:
+    standing principle is that confirms are reserved for actions with meaningful
+    real-world consequences; trivial confirms train users to dismiss dialogs unthinkingly.
+
+11. MK7.11 BUG — after Quit, the board stays rendered behind the title screen (the
+    render layer isn't torn down/reset, so it holds the last frame). Fix: clear the
+    board render on quit.
+
+12. MK7.12 ASPECT RATIO — letterbox the game into a fixed container matching the target
+    PHONE'S VERTICAL ASPECT RATIO, centered in the viewport (dead space either side on
+    wide screens), so desktop testing IS phone testing. CSS containment change, not a
+    layout rework. Do NOT build a wide/tablet/landscape layout — explicitly deferred.
+
+13. MK7.13 BOT HEURISTIC FOR NMD — the bot's prefer-4 rule is a DAMAGE heuristic, but
+    under NO_MATCH_DAMAGE matches deal no damage, so it optimizes for a quantity that no
+    longer exists (observed: the bot fired 6 bombs for ZERO damage into a churning board
+    and never adapted). Add ONE more heuristic tier, used only when NO_MATCH_DAMAGE is
+    on: "prefer matches that feed my units' bindings" (match for CHARGE, not damage).
+    Not a full AI upgrade — one selection rule. Keep the existing tiers for non-NMD play;
+    the bot must remain a deliberately weak floor indicator.
+
+CRITICAL:
+- DELTAS on top of the existing build. Do not rebuild working systems. Where MK7
+  conflicts with an earlier section, MK7 wins; everything else stays.
+- NO new abilities, NO new units, NO loadout screen, NO unit variants — all
+  deliberately parked so they can be designed against CORRECTED numbers.
+- Keep logic/render separation. Attribution and all metrics live in the logic layer on
+  the EXISTING event stream — do not create a parallel pipeline. Constants/config in the
+  constants module.
+- Keep MK6 as a clean committed restore point.
+
+Before writing code, tell me: (1) any clarifying questions; (2) your one-line plan for
+how the causal tag is attached to a resolution chain and inherited by descendant
+settling/cascade steps; and (3) confirmation that you will NOT change any gameplay
+behavior in MK7.2 (it is a counter/attribution fix only). Then wait for my go-ahead.
+
+After building, report: (a) that the four causal buckets sum exactly to total damage;
+(b) bomb damage before vs after the attribution fix (it should RISE, and match damage
+should FALL correspondingly); (c) matchDamage_color vs matchDamage_shape from a sample
+battle; (d) ability fires per unit with FLAT_ABILITY_COST off vs on — specifically
+whether Disabler fires AT ALL under flat-7 (it has never fired in any logged battle);
+and (e) confirm the shake now preserves board composition.
 ```
