@@ -787,6 +787,41 @@ Not in MK7: **new units** and the **loadout screen** (deliberately deferred — 
 
 ---
 
+# Section 1-MK8: Disabler Bug Fix, Config UI & Defaults (BUILD THIS, ON TOP OF MK7)
+
+Assumes Sections 1, MK2–MK7 are built and working. Each item is a DELTA against the current build — where MK8 conflicts with an earlier section, MK8 governs; everything not mentioned is unchanged. Section 2 (Roadmap) remains out of scope.
+
+**Intent (context, not a build instruction):** A deliberately LIGHT build. Its job is to (1) fix the one genuine bug — the player Disabler cannot be activated on desktop — so that the Disabler becomes observable (all its data to date is contaminated by this bug), and (2) tidy the config UI and reset a few defaults now that flat-cost is the working diagnostic and symmetric HP is the clean baseline. **No effect/balance redesigns this pass** — notably, do NOT redesign the Disabler's effect; fix the bug, then it can be observed working before any effect change is considered.
+
+## MK8.1 Fix the player Disabler desktop-activation bug (PRIORITY)
+
+- **Symptom:** on desktop web browsers (e.g. Brave/Edge), the player cannot activate the Disabler. It works correctly on mobile Chrome, and the ENEMY Disabler works correctly on all platforms — so the disable LOGIC is fine.
+- **Likely location:** the Disabler is the only ability with a **two-stage targeting interaction** (MK3.2 made it player-targetable: arm → select a target minion → fire), while the other three abilities fire immediately. The break is almost certainly in the **targeting overlay's input / hit-testing path** — the arm-then-select flow likely handles touch events but not mouse/pointer/click events, or the target hitboxes don't register pointer input on desktop.
+- **Fix** so the player can arm and fire the Disabler via mouse on desktop, matching mobile behavior. Verify on both desktop (mouse) and mobile (touch).
+- **Do NOT change the Disabler's effect or cost** — this is a pure input-path fix. (Its effect is separately suspected weak, but that redesign waits until a working Disabler has been observed in a batch.)
+
+## MK8.2 Settings UI — accordion / tabbed structure
+
+- The Settings modal's entries have grown long and awkward to scroll (flags, HP, ability costs, hint config, cascade cap, reset). **Reorganize them into an accordion or tabbed structure.** The specific structure is the implementer's choice — group related settings sensibly (e.g. game-mode flags / HP / ability costs / hints).
+- No settings are removed or added here beyond the flat-cost restructuring in MK8.3 — this is purely a reorganization for scannability.
+
+## MK8.3 Defaults & the flat-cost config restructure
+
+- **`FLAT_ABILITY_COST` now DEFAULTS TO ON** (all four units cost 7). This is the current working diagnostic baseline.
+- **The individual per-ability cost inputs become a SUBSECTION that is only visible/active when `FLAT_ABILITY_COST` is OFF.** When flat-cost is on, the per-ability costs are irrelevant, so they should be hidden (or disabled) to reduce clutter — surfacing only when the user turns flat-cost off to tune individual values.
+- **Default HP changes to 150 for BOTH player and enemy** (was 150 / 350). Symmetric HP is the clean balance baseline established in MK7 testing. (HP remains fully settable per MK6.4.)
+
+## MK8.4 Layout nudges
+
+- **Move the tile board UP by ~10% of the game-window height**, leaving a small margin/border at the bottom (currently the board sits flush at the very bottom of the window).
+- **Relocate the debug "find match" button** to just below the "Buffs —" status line. It currently overlaps the lower-left board tile and blocks that tile from being selected. (Debug-build only, unchanged from MK7.8.)
+
+## MK8 — Out of scope (parked)
+
+Not in MK8 (deliberately, to keep it light and single-purpose): the **Disabler effect redesign** (wait until a working Disabler is observed); the **left/right vertical info panels** (player-info left, enemy-info right — a layout re-architecture, deferred); **character-sheet pop-up modals** off each side's health-bar "portrait" (deferred); optional **find-match auto-execute / speedrun** (only if it tags assisted turns in the log; not clearly worth it yet); new units, loadout screen, unit variants, enemy personalities, and all other roadmap items. See Section 2 and the design backlog.
+
+---
+
 # Section 2: Roadmap (DO NOT BUILD — CONTEXT ONLY)
 
 This section exists so future work has a documented home and so deferred ideas aren't lost. Nothing in this section should be implemented as part of the PoC. If anything here appears to conflict with Section 1, Section 1 governs for this build.
@@ -1506,4 +1541,63 @@ should FALL correspondingly); (c) matchDamage_color vs matchDamage_shape from a 
 battle; (d) ability fires per unit with FLAT_ABILITY_COST off vs on — specifically
 whether Disabler fires AT ALL under flat-7 (it has never fired in any logged battle);
 and (e) confirm the shake now preserves board composition.
+```
+
+# Coding Agent Prompt — MK8 Iteration (Ready to Paste)
+
+```
+This is an eighth iteration on the existing, working "Breach" build in this repo.
+Sections 1 and MK2-MK7 are complete, verified, and committed. Now implement
+"Section 1-MK8: Disabler Bug Fix, Config UI & Defaults" from
+breach-poc-requirements.md.
+
+Read Section 1-MK8 in full first. This is a deliberately LIGHT build: one real
+bug fix, a Settings reorganization, a few default changes, and two layout nudges.
+NO effect/balance redesigns — in particular do NOT redesign the Disabler's effect.
+
+1. MK8.1 FIX THE DISABLER DESKTOP BUG (PRIORITY) — on desktop web (Brave/Edge) the
+   player cannot activate the Disabler; it works on mobile Chrome, and the ENEMY
+   Disabler works everywhere, so the disable LOGIC is fine. The Disabler is the ONLY
+   ability with a two-stage targeting interaction (arm -> select target minion ->
+   fire); the other three fire immediately. The break is almost certainly in the
+   targeting overlay's INPUT / HIT-TESTING path — the arm-then-select flow likely
+   handles touch events but not mouse/pointer/click events on desktop. Fix so the
+   player can arm and fire the Disabler with a mouse on desktop, matching mobile.
+   Verify on BOTH desktop (mouse) and mobile (touch). Do NOT change its effect or cost.
+
+2. MK8.2 SETTINGS UI — reorganize the Settings modal's entries (flags, HP, ability
+   costs, hints, cascade cap, reset) into an ACCORDION or TABBED structure; they've
+   grown too long to scroll comfortably. Structure is your choice — group related
+   settings sensibly. Don't remove or add settings beyond the flat-cost restructure
+   in item 3.
+
+3. MK8.3 DEFAULTS + FLAT-COST RESTRUCTURE — FLAT_ABILITY_COST now DEFAULTS TO ON (all
+   four units cost 7). The individual per-ability cost inputs become a SUBSECTION that
+   is only visible/active when FLAT_ABILITY_COST is OFF (hide/disable them when flat
+   cost is on). Default HP changes to 150 for BOTH sides (was 150/350); HP stays fully
+   settable.
+
+4. MK8.4 LAYOUT NUDGES — move the tile board UP by ~10% of the game-window height,
+   leaving a small bottom margin (it currently sits flush at the bottom). Relocate the
+   debug "find match" button to just below the "Buffs --" status line; it currently
+   overlaps and blocks the lower-left board tile. (find-match stays debug-build-only.)
+
+CRITICAL:
+- DELTAS on top of the existing build. Do not rebuild working systems. Where MK8
+  conflicts with an earlier section, MK8 wins; everything else stays.
+- NO effect/balance redesigns. Do NOT touch the Disabler's effect or any ability's
+  effect/cost values (other than the flat-cost DEFAULT and HP DEFAULT). No new units,
+  no loadout, no layout re-architecture (the left/right info panels and portrait
+  modals are explicitly deferred).
+- Keep logic/render separation. Config/constants in their modules.
+- Keep MK7 as a clean committed restore point.
+
+Before writing code, tell me: (1) any clarifying questions; and (2) your one-line
+diagnosis of the Disabler desktop input bug once you've located it (so I can confirm
+it matches the expected cause before you fix). Then wait for my go-ahead.
+
+After building, confirm: (a) the player Disabler can be armed and fired with a MOUSE on
+desktop AND by touch on mobile; (b) FLAT_ABILITY_COST defaults ON and the per-ability
+cost inputs appear only when it's turned off; (c) default HP is 150/150; and (d) the
+find-match button no longer overlaps the board.
 ```
