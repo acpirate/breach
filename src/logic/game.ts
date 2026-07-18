@@ -7,8 +7,14 @@ import {
   BOARD_SHAKE_COST,
   BOARD_SHAKE_STARTS_CHARGED,
   BOMBER_COUNTDOWN_TURNS,
+  E_BOMB_BOMBS,
+  E_BOMB_COUNTDOWN,
+  PLAYER_BOMBER_BOMBS,
+  SHIELDER_TILES,
   UNIT_DEFS,
   effectiveCost,
+  unitDefsFor,
+  unitDisplayName,
 } from './constants';
 import { generateInitialBoard, reshuffleBoard, swap } from './board';
 import { pickBotMove } from './bot';
@@ -206,15 +212,21 @@ export class Game {
     const who = owner === 'player' ? 'You' : 'Enemy';
     switch (type) {
       case 'bomber':
-        events.push({ t: 'ability', side: owner, unit: type });
-        this.placeSpecial('bomb', owner, events);
+        // MK9.1/9.2: player Bomber drops 2 bombs; enemy "E-Bomb" drops 1 (wider,
+        // longer-fused — the footprint/countdown difference lives in placement
+        // and detonation). One cost, one activation either way.
+        events.push({ t: 'ability', side: owner, unit: type, name: unitDisplayName(owner, type) });
+        this.placeSpecials('bomb', owner, owner === 'player' ? PLAYER_BOMBER_BOMBS : E_BOMB_BOMBS, events);
         break;
       case 'buffer':
-        events.push({ t: 'ability', side: owner, unit: type });
-        this.placeSpecial('buff', owner, events);
+        // MK9.3: player Buffer places 1 buff tile; enemy "Shielder" places 2
+        // shield tiles (inverse role — reduces incoming enemy damage).
+        events.push({ t: 'ability', side: owner, unit: type, name: unitDisplayName(owner, type) });
+        if (owner === 'enemy') this.placeSpecials('shield', owner, SHIELDER_TILES, events);
+        else this.placeSpecials('buff', owner, 1, events);
         break;
       case 'attacker': {
-        events.push({ t: 'ability', side: owner, unit: type });
+        events.push({ t: 'ability', side: owner, unit: type, name: unitDisplayName(owner, type) });
         events.push({ t: 'msg', text: `${who} fired Attacker` });
         const bonus = buffBonus(s, owner);
         dealDamage(
@@ -240,7 +252,7 @@ export class Game {
         } else {
           const charged = s.units.player.filter((t) => t.charge > 0);
           if (!charged.length) {
-            events.push({ t: 'ability', side: owner, unit: type, drained: 0 });
+            events.push({ t: 'ability', side: owner, unit: type, drained: 0, name: unitDisplayName(owner, type) });
             events.push({ t: 'msg', text: 'Enemy Disabler fizzled — nothing to drain' });
             break;
           }
@@ -252,17 +264,24 @@ export class Game {
         }
         const drained = pick.charge;
         pick.charge = 0;
-        events.push({ t: 'ability', side: owner, unit: type, drained });
-        events.push({ t: 'msg', text: `${who} fired Disabler — drained ${UNIT_DEFS[pick.type].label}` });
+        // Label the DRAINED unit using its own side's bindings (MK9.4: sides
+        // diverge). Player Disabler drains an enemy unit → enemy label.
+        const drainedLabel = unitDefsFor(opponentOf(owner))[pick.type].label;
+        events.push({ t: 'ability', side: owner, unit: type, drained, name: unitDisplayName(owner, type) });
+        events.push({ t: 'msg', text: `${who} fired Disabler — drained ${drainedLabel}` });
         break;
       }
     }
   }
 
-  // SPECIAL TILE PLACEMENT: convert a random existing non-neutral, non-special
-  // tile, preserving its color and shape. If no valid target exists, the
-  // charge is still spent and the placement is wasted (no error).
-  private placeSpecial(type: 'bomb' | 'buff', owner: Side, events: GameEvent[]): void {
+  // SPECIAL TILE PLACEMENT (MK9.1/9.3 multi-placement): convert up to `count`
+  // random existing non-neutral, non-special tiles into special tiles,
+  // preserving each tile's color/shape. Candidates are drawn WITHOUT
+  // replacement so two bombs/shields never land on the same tile. If fewer than
+  // `count` valid targets exist, place as many as possible (never hang, retry,
+  // or corrupt the board); the charge is still spent. Emits a `placed` event
+  // with the number actually placed (metrics: bombs/shields per activation).
+  private placeSpecials(type: 'bomb' | 'buff' | 'shield', owner: Side, count: number, events: GameEvent[]): void {
     const s = this.state;
     const candidates: Pt[] = [];
     for (let y = 0; y < s.board.length; y++) {
@@ -271,20 +290,24 @@ export class Game {
         if (t && t.kind === 'standard' && !t.special) candidates.push({ x, y });
       }
     }
-    if (!candidates.length) {
-      events.push({ t: 'msg', text: 'No valid tile — effect wasted' });
-      return;
+    // player bombs keep the MK3.1 short fuse; enemy bombs (E-Bomb) use the
+    // original longer countdown (MK9.2).
+    const countdown = type === 'bomb' ? (owner === 'enemy' ? E_BOMB_COUNTDOWN : BOMBER_COUNTDOWN_TURNS) : undefined;
+    const noun = type === 'bomb' ? 'bomb' : type === 'shield' ? 'shield' : 'buff';
+    let placed = 0;
+    for (let i = 0; i < count && candidates.length; i++) {
+      const idx = s.rng.int(candidates.length);
+      const p = candidates.splice(idx, 1)[0]; // draw without replacement
+      const t = s.board[p.y][p.x]!;
+      t.special = { type, owner, countdown, seq: s.nextSeq++ };
+      events.push({ t: 'setTile', p, view: tileViewOf(t) });
+      placed++;
     }
-    const p = s.rng.pick(candidates);
-    const t = s.board[p.y][p.x]!;
-    t.special = {
-      type,
-      owner,
-      countdown: type === 'bomb' ? BOMBER_COUNTDOWN_TURNS : undefined,
-      seq: s.nextSeq++,
-    };
-    events.push({ t: 'setTile', p, view: tileViewOf(t) });
-    events.push({ t: 'msg', text: `${owner === 'player' ? 'You' : 'Enemy'} placed a ${type === 'bomb' ? 'bomb' : 'buff'}` });
+    // MK9.8 tracks bombs/shields placed per activation; buffs aren't in that set.
+    if (type !== 'buff') events.push({ t: 'placed', side: owner, kind: type, count: placed });
+    const who = owner === 'player' ? 'You' : 'Enemy';
+    if (placed === 0) events.push({ t: 'msg', text: 'No valid tile — effect wasted' });
+    else events.push({ t: 'msg', text: `${who} placed ${placed === 1 ? `a ${noun}` : `${placed} ${noun}s`}` });
   }
 
   // 1.6.1.c/d — the turn-ending match. A swap producing no match reverts and
@@ -344,7 +367,7 @@ export class Game {
       // deadlock prevention guarantees a move after every settle; the guard
       // is defensive only. MK7.13: move selection is config-aware (charge-
       // seeking under NMD unless the sub-option disables it).
-      const mv = pickBotMove(s.board, s.config);
+      const mv = pickBotMove(s.board, s.config, 'enemy'); // MK9.4: score against enemy bindings
       if (mv) {
         swap(s.board, mv.a, mv.b);
         events.push({ t: 'swap', a: mv.a, b: mv.b });

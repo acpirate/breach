@@ -6,15 +6,28 @@
 // only written at stable points (player's make-a-match phase), so a restored
 // game is always immediately playable.
 
-import { BOARD_HEIGHT, BOARD_WIDTH } from './constants';
+import { BOARD_HEIGHT, BOARD_WIDTH, COLOR_COUNT, SHAPE_COUNT } from './constants';
 import { Game } from './game';
 import { makeRNG } from './rng';
 import { GameState, UNIT_ORDER } from './types';
 
 // Save-format version (designer-set placeholder scheme; bump on state-shape
-// changes). MK7 extended BattleConfig (costs, hint, NMD bot sub-option) —
-// older saves fail gracefully to a fresh start, as designed.
-export const SAVE_VERSION = 'mk7';
+// changes). MK9 added the 'shield' special tile and per-side strong bindings to
+// BattleConfig — older saves (mk7) fail gracefully to a fresh start via the
+// version check below, as designed (MK9.9: reject malformed mixed-version state
+// rather than silently loading it).
+export const SAVE_VERSION = 'mk9';
+
+// MK9.4: a strong-binding set is an array of valid Color/Shape enum ints
+// (0..COLOR_COUNT-1 / 0..SHAPE_COUNT-1). Empty is allowed (a side with no
+// strong tiles). Used to validate persisted per-side strong bindings.
+function isValidEnumArray(a: unknown, max: number): boolean {
+  return Array.isArray(a) && a.every((v) => Number.isInteger(v) && v >= 0 && v < max);
+}
+export function isValidStrongRecord(r: unknown, max: number): boolean {
+  const rec = r as { player?: unknown; enemy?: unknown } | undefined;
+  return !!rec && isValidEnumArray(rec.player, max) && isValidEnumArray(rec.enemy, max);
+}
 
 export function serializeGame(state: GameState): string {
   const { rng, ...plain } = state;
@@ -53,7 +66,10 @@ export function deserializeGame(json: string | null): Game | null {
       typeof c.nmdChargeAwareBot !== 'boolean' ||
       !(Number.isInteger(c.hintDelaySeconds) && c.hintDelaySeconds >= 1 && c.hintDelaySeconds <= 60) ||
       !c.abilityCosts ||
-      UNIT_ORDER.some((t) => !(Number.isInteger(c.abilityCosts[t]) && c.abilityCosts[t] >= 1 && c.abilityCosts[t] <= 99))
+      UNIT_ORDER.some((t) => !(Number.isInteger(c.abilityCosts[t]) && c.abilityCosts[t] >= 1 && c.abilityCosts[t] <= 99)) ||
+      // MK9.4: per-side strong bindings must be present and well-formed
+      !isValidStrongRecord(c.strongColors, COLOR_COUNT) ||
+      !isValidStrongRecord(c.strongShapes, SHAPE_COUNT)
     ) {
       return null;
     }

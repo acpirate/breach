@@ -5,10 +5,10 @@
 // first valid move. No look-ahead, no board evaluation — this tier doubles as
 // the enemy's difficulty knob later (future work, not a setting now).
 
-import { BOARD_HEIGHT, BOARD_WIDTH, UNIT_DEFS } from './constants';
+import { BOARD_HEIGHT, BOARD_WIDTH, unitDefsFor } from './constants';
 import { swap } from './board';
 import { detectMatches } from './match';
-import { BattleConfig, Board, Pt } from './types';
+import { BattleConfig, Board, Pt, Side } from './types';
 
 export function findBotMove(board: Board): { a: Pt; b: Pt } | null {
   const dirs = [{ dx: 1, dy: 0 }, { dx: 0, dy: 1 }];
@@ -38,10 +38,13 @@ export function findBotMove(board: Board): { a: Pt; b: Pt } | null {
 // This tier scores each valid move by how many matched tiles feed the mover's
 // unit bindings (color or shape), i.e. it matches for CHARGE. Still one dumb
 // selection rule — the bot remains a floor indicator.
-const BOT_BOUND_COLORS = new Set(Object.values(UNIT_DEFS).map((d) => d.color));
-const BOT_BOUND_SHAPES = new Set(Object.values(UNIT_DEFS).map((d) => d.shape));
-
-export function findChargeMove(board: Board): { a: Pt; b: Pt } | null {
+// MK9.4: bindings now differ per side, so the scorer uses the ACTING side's
+// bindings (the harness drives the player; the enemy's own matching turn
+// passes 'enemy').
+export function findChargeMove(board: Board, side: Side = 'player'): { a: Pt; b: Pt } | null {
+  const defs = unitDefsFor(side);
+  const boundColors = new Set(Object.values(defs).map((d) => d.color));
+  const boundShapes = new Set(Object.values(defs).map((d) => d.shape));
   const dirs = [{ dx: 1, dy: 0 }, { dx: 0, dy: 1 }];
   let best: { a: Pt; b: Pt } | null = null;
   let bestScore = -1;
@@ -66,8 +69,8 @@ export function findChargeMove(board: Board): { a: Pt; b: Pt } | null {
               seen.add(k);
               const t = board[c.y][c.x];
               if (!t || t.kind !== 'standard') continue;
-              if (BOT_BOUND_COLORS.has(t.color!)) score++;
-              if (BOT_BOUND_SHAPES.has(t.shape!)) score++;
+              if (boundColors.has(t.color!)) score++;
+              if (boundShapes.has(t.shape!)) score++;
             }
           }
         }
@@ -85,8 +88,8 @@ export function findChargeMove(board: Board): { a: Pt; b: Pt } | null {
 // Config-aware selection: the NMD charge-aware tier applies only when
 // noMatchDamage is on AND the nmdChargeAwareBot sub-option (designer
 // addendum, default on) hasn't been switched back to the classic heuristic.
-export function pickBotMove(board: Board, config: BattleConfig): { a: Pt; b: Pt } | null {
-  if (config.noMatchDamage && config.nmdChargeAwareBot) return findChargeMove(board);
+export function pickBotMove(board: Board, config: BattleConfig, side: Side = 'player'): { a: Pt; b: Pt } | null {
+  if (config.noMatchDamage && config.nmdChargeAwareBot) return findChargeMove(board, side);
   return findBotMove(board);
 }
 

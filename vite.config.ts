@@ -7,7 +7,14 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { defineConfig, Plugin } from 'vite';
+
+// MK9.6/9.7: shared server-side log-storage defaults (threshold + sentinel).
+const { STORAGE_SENTINEL, overThreshold } = createRequire(import.meta.url)('./scripts/logConfig.cjs') as {
+  STORAGE_SENTINEL: string;
+  overThreshold: (dir: string) => boolean;
+};
 
 function breachLogSink(): Plugin {
   const dir = path.resolve(process.cwd(), 'logs');
@@ -38,7 +45,23 @@ function breachLogSink(): Plugin {
           try {
             JSON.parse(body); // only append well-formed lines
             fs.mkdirSync(dir, { recursive: true });
-            fs.appendFileSync(fileForToday(), body.trim() + '\n');
+            const file = fileForToday();
+            // MK9.6 storage threshold: over-limit → drop the raw entry and
+            // replace the affected raw-log with the sentinel (once). Bounded:
+            // never grows storage while over threshold. Never throws into the
+            // game — logging failures are isolated.
+            if (overThreshold(dir)) {
+              try {
+                const cur = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+                if (cur.trim() !== STORAGE_SENTINEL) fs.writeFileSync(file, STORAGE_SENTINEL + '\n');
+              } catch {
+                /* ignore — logging must never break the game */
+              }
+              res.statusCode = 507; // Insufficient Storage
+              res.end('storage-threshold');
+              return;
+            }
+            fs.appendFileSync(file, body.trim() + '\n');
             res.end('ok');
           } catch {
             res.statusCode = 400;

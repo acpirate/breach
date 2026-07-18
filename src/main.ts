@@ -3,21 +3,21 @@
 
 import {
   BOARD_SHAKE_COST,
+  BUFFER_DAMAGE_BONUS,
   CHARGE_PER_TILE_COLOR_MATCH,
   CHARGE_PER_TILE_SHAPE_MATCH,
+  SHIELD_POINTS_PER_TILE,
   DAMAGE_PER_TILE_HIGH_COLOR,
   DAMAGE_PER_TILE_HIGH_SHAPE,
   DAMAGE_PER_TILE_LOW_COLOR,
   DAMAGE_PER_TILE_LOW_SHAPE,
   DAMAGE_PER_TILE_NEUTRAL,
   DEFAULT_BATTLE_CONFIG,
-  HIGH_COLORS,
-  HIGH_SHAPES,
-  LOW_COLORS,
-  LOW_SHAPES,
+  ENEMY_UNIT_DEFS,
   UNIT_DEFS,
   UnitDef,
   effectiveCost,
+  unitDisplayName,
 } from './logic/constants';
 import { findBotMove, findHintMove } from './logic/bot';
 import { Game } from './logic/game';
@@ -95,12 +95,12 @@ function canAct(): boolean {
   return !!game && !busy && !game.state.winner && game.state.phase === 'playerPre';
 }
 
-function buffCount(side: Side): number {
+function specialCount(kind: 'buff' | 'shield', side: Side): number {
   if (!game) return 0;
   let n = 0;
   for (const row of game.state.board) {
     for (const t of row) {
-      if (t?.special?.type === 'buff' && t.special.owner === side) n++;
+      if (t?.special?.type === kind && t.special.owner === side) n++;
     }
   }
   return n;
@@ -121,14 +121,15 @@ function getHud(): Hud | null {
       return { label: d.label, cost, charge: u.charge, ready: act && u.charge >= cost, color: d.color, shape: d.shape };
     }),
     minions: s.units.enemy.map((u) => {
-      const d = UNIT_DEFS[u.type];
+      const d = ENEMY_UNIT_DEFS[u.type]; // MK9.2/9.3: enemy shows E-Bomb/Shielder identities + bindings
       return { label: d.label, cost: effectiveCost(s.config, u.type), charge: u.charge, ready: false, color: d.color, shape: d.shape };
     }),
     shakeCharge: s.shakeCharge,
     shakeCost: BOARD_SHAKE_COST,
     shakeReady: act && s.shakeCharge >= BOARD_SHAKE_COST,
-    buffPlayer: buffCount('player') * 5,
-    buffEnemy: buffCount('enemy') * 5,
+    buffPlayer: specialCount('buff', 'player') * BUFFER_DAMAGE_BONUS,
+    buffEnemy: specialCount('buff', 'enemy') * BUFFER_DAMAGE_BONUS,
+    shieldEnemy: specialCount('shield', 'enemy') * SHIELD_POINTS_PER_TILE, // MK9.3
     turn: s.turn,
     canAct: act,
     statusText: s.winner
@@ -185,6 +186,9 @@ function metricsElement(m: BattleMetrics): HTMLElement {
   row('BATTLE', true);
   row(`Turns to resolution: ${m.turns}`);
   row(`Match-locks (auto-reshuffles): ${m.autoReshuffles}`);
+  // MK9.3 — enemy Shielder (prevention is NOT damage dealt; reported separately)
+  row(`Enemy shields — created ${m.enemyShieldCreated}, removed ${m.enemyShieldRemoved}`);
+  row(`Shielded hits: ${m.enemyShieldInstances}, damage prevented: ${fmt(m.enemyShieldPrevented)}`);
 
   for (const side of ['player', 'enemy'] as const) {
     const sm = m.sides[side];
@@ -207,7 +211,8 @@ function metricsElement(m: BattleMetrics): HTMLElement {
     row(`Opponent-bound tiles destroyed: ${sm.contentionTiles} of ${sm.tilesDestroyed} (${contPct}%)`);
     for (const t of UNIT_ORDER) {
       const u = sm.units[t];
-      row(`${UNIT_DEFS[t].label}: fired ${u.fires}, effect ${fmt(u.effect)}, charge wasted ${fmt(u.chargeWasted)}`);
+      const placed = t === 'bomber' ? `, bombs placed ${u.bombsPlaced}` : ''; // MK9.1/9.2
+      row(`${unitDisplayName(side, t)}: fired ${u.fires}, effect ${fmt(u.effect)}, charge wasted ${fmt(u.chargeWasted)}${placed}`);
     }
   }
 
@@ -234,8 +239,9 @@ function hideDialog(): void {
 // MK5.3/MK7.10 — battle config panel (lives in the Settings modal). Persists
 // on every change; "Reset to Defaults" is the only reset. `rerender` rebuilds
 // the hosting modal after a reset so the controls show default values.
+// MK8.2 — grouped into an accordion of native <details> sections (collapsed
+// by default) for scannability; no settings added or removed.
 function configPanel(rerender: () => void): HTMLElement {
-  const costInputs: HTMLInputElement[] = [];
   const wrap = document.createElement('div');
   wrap.className = 'config';
   const head = document.createElement('div');
@@ -243,7 +249,23 @@ function configPanel(rerender: () => void): HTMLElement {
   head.textContent = 'BATTLE CONFIG';
   wrap.appendChild(head);
 
-  const check = (label: string, key: 'enemyMatching' | 'hackerBonusEnabled' | 'singleAxisPayout' | 'noMatchDamage'): void => {
+  const section = (title: string): HTMLDetailsElement => {
+    const det = document.createElement('details');
+    det.className = 'cfgsection';
+    const sum = document.createElement('summary');
+    sum.textContent = title;
+    det.appendChild(sum);
+    wrap.appendChild(det);
+    return det;
+  };
+
+  const modes = section('Game modes');
+  const health = section('Starting HP');
+  const costs = section('Ability costs');
+  const hints = section('Hints');
+  const cascades = section('Cascades');
+
+  const check = (parent: HTMLElement, label: string, key: 'enemyMatching' | 'hackerBonusEnabled' | 'singleAxisPayout' | 'noMatchDamage'): void => {
     const l = document.createElement('label');
     const cb = document.createElement('input');
     cb.type = 'checkbox';
@@ -254,11 +276,11 @@ function configPanel(rerender: () => void): HTMLElement {
     });
     l.appendChild(cb);
     l.appendChild(document.createTextNode(` ${label}`));
-    wrap.appendChild(l);
+    parent.appendChild(l);
   };
-  check('Enemy matching', 'enemyMatching');
-  check('Hacker color bonus', 'hackerBonusEnabled');
-  check('Single-axis payout', 'singleAxisPayout');
+  check(modes, 'Enemy matching', 'enemyMatching');
+  check(modes, 'Hacker color bonus', 'hackerBonusEnabled');
+  check(modes, 'Single-axis payout', 'singleAxisPayout');
 
   // MK6.2 No match damage + MK7.13 addendum sub-option (charge-aware bot,
   // default on, only meaningful while NMD is on)
@@ -268,7 +290,7 @@ function configPanel(rerender: () => void): HTMLElement {
   nmdCb.checked = menuConfig.noMatchDamage;
   nmdRow.appendChild(nmdCb);
   nmdRow.appendChild(document.createTextNode(' No match damage'));
-  wrap.appendChild(nmdRow);
+  modes.appendChild(nmdRow);
   const subRow = document.createElement('label');
   subRow.className = 'suboption';
   const subCb = document.createElement('input');
@@ -277,7 +299,7 @@ function configPanel(rerender: () => void): HTMLElement {
   subCb.disabled = !menuConfig.noMatchDamage;
   subRow.appendChild(subCb);
   subRow.appendChild(document.createTextNode(' Charge-aware bot (NMD)'));
-  wrap.appendChild(subRow);
+  modes.appendChild(subRow);
   nmdCb.addEventListener('change', () => {
     menuConfig = { ...menuConfig, noMatchDamage: nmdCb.checked };
     subCb.disabled = !nmdCb.checked;
@@ -305,16 +327,30 @@ function configPanel(rerender: () => void): HTMLElement {
       saveMenuConfig(menuConfig);
     });
     l.appendChild(n);
-    wrap.appendChild(l);
+    health.appendChild(l);
   };
   hpInput('Player HP', 'playerHp');
   hpInput('Enemy HP', 'enemyHp');
 
-  // MK7.1 — ability costs (1-99) + flat-cost diagnostic
-  const costHead = document.createElement('div');
-  costHead.className = 'cfghead';
-  costHead.textContent = 'ABILITY COSTS';
-  wrap.appendChild(costHead);
+  // MK7.1 — flat-cost diagnostic + per-ability costs (1-99).
+  // MK8.3 — the per-ability inputs are a SUBSECTION shown only while
+  // flat-cost is OFF (irrelevant while every unit costs 7).
+  const flatRow = document.createElement('label');
+  const flatCb = document.createElement('input');
+  flatCb.type = 'checkbox';
+  flatCb.checked = menuConfig.flatAbilityCost;
+  flatRow.appendChild(flatCb);
+  flatRow.appendChild(document.createTextNode(' Flat ability cost (all 7) — diagnostic'));
+  costs.appendChild(flatRow);
+  const costSub = document.createElement('div');
+  costSub.className = 'suboption';
+  costSub.style.display = menuConfig.flatAbilityCost ? 'none' : '';
+  costs.appendChild(costSub);
+  flatCb.addEventListener('change', () => {
+    menuConfig = { ...menuConfig, flatAbilityCost: flatCb.checked };
+    costSub.style.display = flatCb.checked ? 'none' : '';
+    saveMenuConfig(menuConfig);
+  });
   for (const t of UNIT_ORDER) {
     const l = document.createElement('label');
     l.appendChild(document.createTextNode(`${UNIT_DEFS[t].label} cost `));
@@ -324,7 +360,6 @@ function configPanel(rerender: () => void): HTMLElement {
     n.max = '99';
     n.step = '1';
     n.value = String(menuConfig.abilityCosts[t]);
-    n.disabled = menuConfig.flatAbilityCost;
     n.addEventListener('change', () => {
       const v = Math.max(1, Math.min(99, Math.floor(Number(n.value) || 1)));
       n.value = String(v);
@@ -332,27 +367,10 @@ function configPanel(rerender: () => void): HTMLElement {
       saveMenuConfig(menuConfig);
     });
     l.appendChild(n);
-    wrap.appendChild(l);
-    costInputs.push(n);
+    costSub.appendChild(l);
   }
-  const flatRow = document.createElement('label');
-  const flatCb = document.createElement('input');
-  flatCb.type = 'checkbox';
-  flatCb.checked = menuConfig.flatAbilityCost;
-  flatCb.addEventListener('change', () => {
-    menuConfig = { ...menuConfig, flatAbilityCost: flatCb.checked };
-    for (const n of costInputs) n.disabled = flatCb.checked;
-    saveMenuConfig(menuConfig);
-  });
-  flatRow.appendChild(flatCb);
-  flatRow.appendChild(document.createTextNode(' Flat ability cost (all 7) — diagnostic'));
-  wrap.appendChild(flatRow);
 
   // MK7.7 — hint system
-  const hintHead = document.createElement('div');
-  hintHead.className = 'cfghead';
-  hintHead.textContent = 'HINTS';
-  wrap.appendChild(hintHead);
   const hintRow = document.createElement('label');
   const hintCb = document.createElement('input');
   hintCb.type = 'checkbox';
@@ -363,7 +381,7 @@ function configPanel(rerender: () => void): HTMLElement {
   });
   hintRow.appendChild(hintCb);
   hintRow.appendChild(document.createTextNode(' Show hints'));
-  wrap.appendChild(hintRow);
+  hints.appendChild(hintRow);
   const delayRow = document.createElement('label');
   delayRow.appendChild(document.createTextNode('Hint delay (s) '));
   const delayN = document.createElement('input');
@@ -379,7 +397,7 @@ function configPanel(rerender: () => void): HTMLElement {
     saveMenuConfig(menuConfig);
   });
   delayRow.appendChild(delayN);
-  wrap.appendChild(delayRow);
+  hints.appendChild(delayRow);
 
   // cascade cap: "Infinite?" toggle + 0-9 integer input (0 = zero cascades)
   const capRow = document.createElement('label');
@@ -388,7 +406,7 @@ function configPanel(rerender: () => void): HTMLElement {
   inf.checked = menuConfig.maxCascadeSteps === null;
   capRow.appendChild(inf);
   capRow.appendChild(document.createTextNode(' Infinite cascades'));
-  wrap.appendChild(capRow);
+  cascades.appendChild(capRow);
 
   const numRow = document.createElement('label');
   numRow.appendChild(document.createTextNode('Cascade cap (0–9) '));
@@ -401,7 +419,7 @@ function configPanel(rerender: () => void): HTMLElement {
   num.disabled = inf.checked;
   numRow.appendChild(num);
   numRow.style.display = inf.checked ? 'none' : '';
-  wrap.appendChild(numRow);
+  cascades.appendChild(numRow);
 
   const readCap = (): number => Math.max(0, Math.min(9, Math.floor(Number(num.value) || 0)));
   inf.addEventListener('change', () => {
@@ -478,20 +496,30 @@ function characterSheet(cfg: BattleConfig, playerDefs: Record<string, UnitDef>, 
     wrap.appendChild(d);
   };
   row('CHARACTER SHEET', true);
-  row(`Color damage — HIGH (${DAMAGE_PER_TILE_HIGH_COLOR}): ${HIGH_COLORS.map((c) => COLOR_NAMES[c]).join(', ')}`);
-  row(`Color damage — LOW (${DAMAGE_PER_TILE_LOW_COLOR}): ${LOW_COLORS.map((c) => COLOR_NAMES[c]).join(', ')}`);
-  row(`Shape damage — HIGH (${DAMAGE_PER_TILE_HIGH_SHAPE}): ${HIGH_SHAPES.map((s) => SHAPE_NAMES[s]).join(', ')}`);
-  row(`Shape damage — LOW (${DAMAGE_PER_TILE_LOW_SHAPE}): ${LOW_SHAPES.map((s) => SHAPE_NAMES[s]).join(', ')}`);
-  row(`Neutral damage: ${DAMAGE_PER_TILE_NEUTRAL} (matches only other neutrals; refills your Shake)`);
-  row(`Charge: +${CHARGE_PER_TILE_COLOR_MATCH} per tile of a unit's bound color, +${CHARGE_PER_TILE_SHAPE_MATCH} per bound shape`);
-  for (const [label, defs] of [['YOUR UNITS', playerDefs], ['ENEMY UNITS', enemyDefs]] as const) {
+  // MK9.5: player and enemy statistics are visibly separated; each side shows
+  // its OWN strong color/shape (they now diverge — MK9.4). Weak = every other
+  // color/shape. Charge & neutral explanations move to the bottom.
+  const sides: Array<[string, Side, Record<string, UnitDef>]> = [
+    ['YOU', 'player', playerDefs],
+    ['ENEMY', 'enemy', enemyDefs],
+  ];
+  for (const [label, side, defs] of sides) {
     row(label, true);
+    const sc = cfg.strongColors[side];
+    const ss = cfg.strongShapes[side];
+    row(`Strong colors (${DAMAGE_PER_TILE_HIGH_COLOR} dmg): ${sc.length ? sc.map((c) => COLOR_NAMES[c]).join(', ') : 'none'}`);
+    row(`Strong shapes (${DAMAGE_PER_TILE_HIGH_SHAPE} dmg): ${ss.length ? ss.map((s) => SHAPE_NAMES[s]).join(', ') : 'none'}`);
+    row(`Weak (all other) colors/shapes: ${DAMAGE_PER_TILE_LOW_COLOR}/${DAMAGE_PER_TILE_LOW_SHAPE} dmg`);
     for (const t of UNIT_ORDER) {
       const d = defs[t];
       // MK7.1: show the EFFECTIVE cost for this battle (config / flat mode)
-      row(`${d.label} — cost ${effectiveCost(cfg, t)} — ${COLOR_NAMES[d.color]} + ${SHAPE_NAMES[d.shape]}`);
+      row(`${unitDisplayName(side, t)} — cost ${effectiveCost(cfg, t)} — ${COLOR_NAMES[d.color]} + ${SHAPE_NAMES[d.shape]}`);
     }
   }
+  // MK9.5: general charge + neutral explanations LAST, after side-specific info.
+  row('GENERAL', true);
+  row(`Charge: +${CHARGE_PER_TILE_COLOR_MATCH} per tile of a unit's bound color, +${CHARGE_PER_TILE_SHAPE_MATCH} per bound shape`);
+  row(`Neutral damage: ${DAMAGE_PER_TILE_NEUTRAL} (matches only other neutrals; refills your Shake)`);
   return wrap;
 }
 
@@ -668,8 +696,11 @@ attachInput(canvas, view, {
     }
     const u = game.state.units.player[i];
     if (u.type === 'disabler') {
-      // MK3.2: charged Disabler arms targeting mode instead of firing blind
-      if (u.charge >= UNIT_DEFS[u.type].cost) targeting = true;
+      // MK3.2: charged Disabler arms targeting mode instead of firing blind.
+      // MK8.1: gate on the EFFECTIVE cost (config/flat mode), not the static
+      // UNIT_DEFS cost — charge caps at effectiveCost, so a static-22 check
+      // could never pass under flat-cost and the Disabler was unarmable.
+      if (u.charge >= effectiveCost(game.state.config, u.type)) targeting = true;
       return;
     }
     const events = game.fireProgram(i);
@@ -718,7 +749,7 @@ attachInput(canvas, view, {
     const panels = document.createElement('div');
     panels.className = 'panelscroll';
     panels.appendChild(configSummary(cfg, 'ACTIVE BATTLE CONFIG'));
-    panels.appendChild(characterSheet(cfg, UNIT_DEFS, UNIT_DEFS)); // sides share defs today; MAY diverge later
+    panels.appendChild(characterSheet(cfg, UNIT_DEFS, ENEMY_UNIT_DEFS)); // MK9.4: sides diverge
     showDialog(
       'PAUSED',
       '',
@@ -754,7 +785,9 @@ setInterval(() => {
 }, 400);
 
 // MK7.8 — debug-only find-match button (dev server builds only; import.meta
-// guards it out of production bundles entirely)
+// guards it out of production bundles entirely). MK8.4: docked just below the
+// "Buffs —" status line — its old fixed bottom-left spot overlapped (and
+// blocked taps on) the lower-left board tile.
 if (import.meta.env.DEV) {
   const b = document.createElement('button');
   b.id = 'dbgfind';
@@ -768,6 +801,14 @@ if (import.meta.env.DEV) {
     }
   });
   document.body.appendChild(b);
+  const placeDbg = (): void => {
+    const r = canvas.getBoundingClientRect();
+    const a = view.debugAnchor;
+    b.style.left = `${Math.round(r.left + a.x)}px`;
+    b.style.top = `${Math.round(r.top + a.y)}px`;
+  };
+  placeDbg();
+  window.addEventListener('resize', placeDbg);
 }
 
 // MK4.3 console-dump helpers (sanctioned log access — no viewing UI):

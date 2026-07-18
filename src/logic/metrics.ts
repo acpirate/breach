@@ -14,6 +14,9 @@ export interface UnitMetrics {
   //   disabler → total charge drained from opponent units
   effect: number;
   chargeWasted: number; // charge granted but discarded at the cost cap
+  // MK9.1/9.2 — bomber only: total bombs successfully placed across all
+  // activations (2/activation for the player, 1 for the enemy E-Bomb).
+  bombsPlaced: number;
 }
 
 export interface SideMetrics {
@@ -60,12 +63,19 @@ export interface BattleMetrics {
   // never pre-aggregated; medians are computed at display/analysis time
   thinkTimesMs: number[];
   hintsShown: number; // MK7.7 — hint-assisted turns are excludable from think-time analysis
+  // MK9.3 — enemy Shielder instrumentation (battle-level; shields are enemy-
+  // only). `prevented` is damage absorbed, NOT damage dealt — it is never added
+  // to any damage-source bucket.
+  enemyShieldCreated: number;
+  enemyShieldRemoved: number;
+  enemyShieldInstances: number; // player->enemy damage instances that hit active shield
+  enemyShieldPrevented: number; // total damage absorbed by shields
   sides: Record<Side, SideMetrics>;
 }
 
 function emptySide(): SideMetrics {
   const units = {} as Record<UnitType, UnitMetrics>;
-  for (const t of UNIT_ORDER) units[t] = { fires: 0, effect: 0, chargeWasted: 0 };
+  for (const t of UNIT_ORDER) units[t] = { fires: 0, effect: 0, chargeWasted: 0, bombsPlaced: 0 };
   return {
     totalDamage: 0,
     matchDamage: 0,
@@ -94,6 +104,10 @@ export function createBattleMetrics(): BattleMetrics {
     winner: null,
     thinkTimesMs: [],
     hintsShown: 0,
+    enemyShieldCreated: 0,
+    enemyShieldRemoved: 0,
+    enemyShieldInstances: 0,
+    enemyShieldPrevented: 0,
     sides: { player: emptySide(), enemy: emptySide() },
   };
 }
@@ -133,6 +147,17 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
       }
       case 'chargeWaste':
         m.sides[ev.side].units[ev.unit].chargeWasted += ev.amount;
+        break;
+      case 'placed':
+        if (ev.kind === 'bomb') m.sides[ev.side].units.bomber.bombsPlaced += ev.count;
+        else m.enemyShieldCreated += ev.count; // shields are enemy-only
+        break;
+      case 'shield':
+        m.enemyShieldInstances++;
+        m.enemyShieldPrevented += ev.prevented;
+        break;
+      case 'shieldRemoved':
+        m.enemyShieldRemoved += ev.count;
         break;
       case 'autoReshuffle':
         m.autoReshuffles++;

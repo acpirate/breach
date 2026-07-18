@@ -26,6 +26,7 @@ export interface Hud {
   shakeReady: boolean;
   buffPlayer: number;
   buffEnemy: number;
+  shieldEnemy: number; // MK9.3: total active enemy shield points
   turn: number;
   canAct: boolean;
   statusText: string;
@@ -202,6 +203,13 @@ export class View {
     return this.cell;
   }
 
+  // MK8.4: canvas-local anchor just below the "Buffs —" status line, where
+  // the debug find-match button docks (it used to overlap the lower-left
+  // board tile). The caller converts to page coordinates.
+  get debugAnchor(): { x: number; y: number } {
+    return { x: this.pad, y: this.buffY + 18 };
+  }
+
   reset(grid: TileView[][]): void {
     this.queue = [];
     this.cur = null;
@@ -291,10 +299,14 @@ export class View {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     const pad = this.pad;
-    this.cell = Math.max(24, Math.floor(Math.min((w - pad * 2) / BOARD_WIDTH, (h - 210) / BOARD_HEIGHT)));
+    // MK8.4: the board sits ~10% of the window height above the bottom edge
+    // (was flush at the bottom); the cell budget shrinks by the same margin
+    // so the raised board can never overlap the HUD.
+    const bottomMargin = pad + Math.floor(h * 0.1);
+    this.cell = Math.max(24, Math.floor(Math.min((w - pad * 2) / BOARD_WIDTH, (h - 210 - Math.floor(h * 0.1)) / BOARD_HEIGHT)));
     const boardW = this.cell * BOARD_WIDTH;
     this.boardX = Math.floor((w - boardW) / 2);
-    this.boardY = h - this.cell * BOARD_HEIGHT - pad;
+    this.boardY = h - this.cell * BOARD_HEIGHT - bottomMargin;
 
     this.menuRect = { x: w - 42, y: 6, w: 36, h: 28 };
     const hpW = (w - pad * 2 - 52) / 2;
@@ -532,11 +544,11 @@ export class View {
       this.drawUnitBox(this.minionRects[i], hud.minions[i], false, hud.targeting);
     }
 
-    // buffs
+    // buffs (player) + shields (enemy, MK9.3)
     ctx.fillStyle = '#b8b8c6';
     ctx.font = '15px sans-serif';
     ctx.textAlign = 'left';
-    ctx.fillText(`Buffs — you: +${hud.buffPlayer}   enemy: +${hud.buffEnemy}`, this.pad, this.buffY + 6);
+    ctx.fillText(`Buff +${hud.buffPlayer}   Enemy shield ${hud.shieldEnemy}`, this.pad, this.buffY + 6);
   }
 
   private drawHpBar(r: Rect, label: string, hp: number, max: number, color: string): void {
@@ -741,7 +753,9 @@ export class View {
       ctx.font = `bold ${Math.max(10, Math.floor(br * 1.5))}px sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText(view.special.type === 'bomb' ? String(view.special.countdown ?? '?') : '+', bx, by + 0.5);
+      // MK9.3: shield badge 'S'; bomb shows countdown; buff shows '+'
+      const badge = view.special.type === 'bomb' ? String(view.special.countdown ?? '?') : view.special.type === 'shield' ? 'S' : '+';
+      ctx.fillText(badge, bx, by + 0.5);
       ctx.textBaseline = 'alphabetic';
     }
   }

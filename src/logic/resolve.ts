@@ -10,7 +10,6 @@ import {
   BOARD_HEIGHT,
   BOARD_WIDTH,
   BOARD_SHAKE_COST,
-  BOMB_BLAST_OFFSETS,
   BUFFER_DAMAGE_BONUS,
   CHARGE_PER_TILE_COLOR_MATCH,
   CHARGE_PER_TILE_SHAPE_MATCH,
@@ -22,11 +21,13 @@ import {
   HACKER_BONUS_CHARGE,
   HACKER_BONUS_COLOR,
   HACKER_BONUS_DAMAGE,
-  HIGH_COLORS,
-  HIGH_SHAPES,
   SHAKE_CHARGE_PER_NEUTRAL_TILE,
-  UNIT_DEFS,
+  SHIELD_POINTS_PER_TILE,
+  blastOffsetsFor,
   effectiveCost,
+  isStrongColor,
+  isStrongShape,
+  unitDefsFor,
 } from './constants';
 import { MatchCondition, detectMatches, matchClearsLine, matchMultiplier } from './match';
 import { completesRun, hasAnyValidMove, randomTile, reshuffleBoard } from './board';
@@ -42,11 +43,28 @@ export function buffBonus(state: GameState, side: Side): number {
   return n * BUFFER_DAMAGE_BONUS;
 }
 
+// MK9.3 — total active enemy shield: SHIELD_POINTS_PER_TILE for each shield
+// tile of `side` currently on the board. Measured live at damage-application
+// time, so a shield matched/blasted away no longer protects the next instance.
+export function shieldValue(state: GameState, side: Side): number {
+  let n = 0;
+  for (const row of state.board) {
+    for (const t of row) {
+      if (t?.special?.type === 'shield' && t.special.owner === side) n++;
+    }
+  }
+  return n * SHIELD_POINTS_PER_TILE;
+}
+
 // Per-tile damage for BLAST destruction (not a match — no axis): a tile's
 // "own type's normal value" is its color tier / neutral value, per Section 1.
-export function baseDamage(t: Tile): number {
+// MK9.4: the color tier is resolved against the BOMB OWNER's strong colors
+// (a player bomb hitting a player-strong-colored tile deals the HIGH value),
+// documented deviation — MK9.4 names matches explicitly but blast damage uses
+// the same per-side strength for consistency.
+export function baseDamage(t: Tile, state: GameState, owner: Side): number {
   if (t.kind === 'neutral') return DAMAGE_PER_TILE_NEUTRAL;
-  return HIGH_COLORS.includes(t.color!) ? DAMAGE_PER_TILE_HIGH_COLOR : DAMAGE_PER_TILE_LOW_COLOR;
+  return isStrongColor(state.config, owner, t.color!) ? DAMAGE_PER_TILE_HIGH_COLOR : DAMAGE_PER_TILE_LOW_COLOR;
 }
 
 // MK6.1 — per-tile damage for MATCH destruction, resolved on the axis(es)
@@ -66,19 +84,21 @@ function matchTileDamage(
   t: Tile,
   axes: Set<MatchCondition>,
   owner: Side,
+  state: GameState,
   hackerOn: boolean,
 ): { v: number; axis: 'color' | 'shape' | 'neutral' } {
   if (t.kind === 'neutral') return { v: DAMAGE_PER_TILE_NEUTRAL, axis: 'neutral' };
   let v = 0;
   let axis: 'color' | 'shape' | 'neutral' = 'neutral';
   if (axes.has('color') || axes.has('neutral')) {
-    let c = HIGH_COLORS.includes(t.color!) ? DAMAGE_PER_TILE_HIGH_COLOR : DAMAGE_PER_TILE_LOW_COLOR;
+    // MK9.4: strong/weak resolved against the MATCH OWNER's strong colors
+    let c = isStrongColor(state.config, owner, t.color!) ? DAMAGE_PER_TILE_HIGH_COLOR : DAMAGE_PER_TILE_LOW_COLOR;
     if (hackerOn && owner === 'player' && t.color === HACKER_BONUS_COLOR) c += HACKER_BONUS_DAMAGE;
     v = c;
     axis = 'color';
   }
   if (axes.has('shape')) {
-    const s = HIGH_SHAPES.includes(t.shape!) ? DAMAGE_PER_TILE_HIGH_SHAPE : DAMAGE_PER_TILE_LOW_SHAPE;
+    const s = isStrongShape(state.config, owner, t.shape!) ? DAMAGE_PER_TILE_HIGH_SHAPE : DAMAGE_PER_TILE_LOW_SHAPE;
     if (s > v) {
       v = s;
       axis = 'shape';
@@ -115,18 +135,53 @@ export interface DamageInfo {
 
 export function dealDamage(state: GameState, target: Side, amount: number, info: DamageInfo, events: GameEvent[]): void {
   if (state.winner || amount <= 0) return;
-  state.hp[target] -= amount;
+
+  let finalAmount = amount;
+  let buffFinal = info.buffBonus ?? 0;
+  let critFinal = info.critExtra;
+  let colorFinal = info.colorRaw;
+  let shapeFinal = info.shapeRaw;
+  let cascadeFinal = info.cascadeRaw;
+
+  // MK9.3 Shielder: every separate player->enemy damage instance is reduced by
+  // the total active enemy shield (min 0), AFTER base+buff are computed (they
+  // are already folded into `amount`) but BEFORE HP is touched. Shield
+  // prevention is NOT damage dealt — it is reported separately and never added
+  // to any damage-source bucket.
+  if (target === 'enemy') {
+    const shield = shieldValue(state, 'enemy');
+    if (shield > 0) {
+      const prevented = Math.min(amount, shield);
+      finalAmount = amount - prevented;
+      events.push({ t: 'shield', source: info.source, preShield: amount, shield, prevented, final: finalAmount });
+      // Shield eats the causal (base) portion first and the buff portion last,
+      // so the disjoint metric buckets (base bucket + buffer bucket) still sum
+      // exactly to the dealt amount. Pre-floor analytical splits scale with it.
+      const base = amount - (info.buffBonus ?? 0);
+      buffFinal = Math.min(info.buffBonus ?? 0, finalAmount);
+      const causalFinal = finalAmount - buffFinal;
+      const scale = base > 0 ? causalFinal / base : 0;
+      if (critFinal !== undefined) critFinal *= scale;
+      if (colorFinal !== undefined) colorFinal *= scale;
+      if (shapeFinal !== undefined) shapeFinal *= scale;
+      if (cascadeFinal !== undefined) cascadeFinal *= scale;
+    }
+  }
+
+  if (finalAmount <= 0) return; // fully absorbed: shield event emitted, nothing dealt
+
+  state.hp[target] -= finalAmount;
   events.push({
     t: 'damage',
     target,
-    amount,
+    amount: finalAmount,
     label: info.label,
     source: info.source,
-    critExtra: info.critExtra,
-    buffBonus: info.buffBonus,
-    colorRaw: info.colorRaw,
-    shapeRaw: info.shapeRaw,
-    cascadeRaw: info.cascadeRaw,
+    critExtra: critFinal,
+    buffBonus: buffFinal,
+    colorRaw: colorFinal,
+    shapeRaw: shapeFinal,
+    cascadeRaw: cascadeFinal,
   });
   if (state.hp[target] <= 0) {
     state.winner = opponentOf(target);
@@ -163,8 +218,9 @@ function chargeFromDestroyedTile(
   }
   const colorPays = !singleAxis || axes.has('color');
   const shapePays = !singleAxis || axes.has('shape');
+  const defs = unitDefsFor(owner); // MK9.4: per-side bindings
   for (const u of state.units[owner]) {
-    const def = UNIT_DEFS[u.type];
+    const def = defs[u.type];
     let w = 0;
     if (colorPays && def.color === t.color) {
       let c = CHARGE_PER_TILE_COLOR_MATCH;
@@ -241,10 +297,14 @@ function refillConstrained(state: GameState, cells: Pt[]): void {
 }
 
 // Tiles bound to a side's units (color OR shape) — for the MK5.6 contention
-// metric. Bindings are currently identical on both sides, but this is written
-// against the opposing side's actual defs.
-const BOUND_COLORS = new Set(Object.values(UNIT_DEFS).map((d) => d.color));
-const BOUND_SHAPES = new Set(Object.values(UNIT_DEFS).map((d) => d.shape));
+// metric. MK9.4: bindings now differ per side, so this is resolved against the
+// actual opposing-side defs at use.
+function boundColors(side: Side): Set<number> {
+  return new Set(Object.values(unitDefsFor(side)).map((d) => d.color));
+}
+function boundShapes(side: Side): Set<number> {
+  return new Set(Object.values(unitDefsFor(side)).map((d) => d.shape));
+}
 
 // Resolve all match steps for one owner-side event until the board settles.
 // Each loop iteration is one "step" (spec 1.5): all simultaneous matches in
@@ -328,6 +388,9 @@ export function resolveCascades(
     // destroyed in this step still counts toward this step's damage.
     const bonus = buffBonus(state, owner);
     const hackerOn = state.config.hackerBonusEnabled;
+    // MK5.6/MK9.4: contention is tiles bound to the OPPONENT's (now distinct) units.
+    const oppColors = boundColors(opponentOf(owner));
+    const oppShapes = boundShapes(opponentOf(owner));
 
     let raw = 0;
     let critExtra = 0; // damage added by the 1.5x multiplier only (pre-floor)
@@ -335,19 +398,21 @@ export function resolveCascades(
     let colorRaw = 0; // MK7.5: pre-floor damage paid via the color axis
     let shapeRaw = 0; // MK7.5: pre-floor damage paid via the shape axis
     let cascadeRaw = 0; // MK7.3: pre-floor damage from stochastic-only tiles
+    let shieldsRemoved = 0; // MK9.3: enemy shield tiles matched/cascaded away this step
     const destroyed: Pt[] = [];
     const waste = new Map<string, number>();
     for (const { p, m, axes, stochOnly } of info.values()) {
       const t = state.board[p.y][p.x];
       if (!t) continue;
       destroyed.push(p);
-      const { v: base, axis } = matchTileDamage(t, axes, owner, hackerOn); // MK6.1: axis-resolved
+      if (t.special?.type === 'shield') shieldsRemoved++;
+      const { v: base, axis } = matchTileDamage(t, axes, owner, state, hackerOn); // MK6.1/MK9.4: axis+side-resolved
       raw += base * m;
       if (m > 1) critExtra += base * (m - 1);
       if (axis === 'color') colorRaw += base * m;
       else if (axis === 'shape') shapeRaw += base * m;
       if (stochOnly) cascadeRaw += base * m;
-      if (t.kind === 'standard' && (BOUND_COLORS.has(t.color!) || BOUND_SHAPES.has(t.shape!))) contested++;
+      if (t.kind === 'standard' && (oppColors.has(t.color!) || oppShapes.has(t.shape!))) contested++;
       chargeFromDestroyedTile(state, owner, t, axes, waste);
     }
     for (const [unit, amount] of waste) {
@@ -357,6 +422,7 @@ export function resolveCascades(
 
     events.push({ t: 'destroy', cells: destroyed });
     for (const p of destroyed) state.board[p.y][p.x] = null;
+    if (shieldsRemoved > 0) events.push({ t: 'shieldRemoved', count: shieldsRemoved });
 
     // MK6.2 NO_MATCH_DAMAGE: matches deal ZERO damage — no damage event at
     // all (the buff bonus must not leak through on a zero base). Charge,
@@ -399,9 +465,10 @@ export function resolveDetonation(state: GameState, p: Pt, events: GameEvent[]):
   const owner = bomb.special.owner;
 
   events.push({ t: 'detonate', p });
-  // MK3.1: blast pattern is the named BOMB_BLAST_OFFSETS constant (full 3x3)
+  // MK3.1 base 3x3; MK9.2 enemy bombs (E-Bomb) use the cardinal-extended
+  // footprint. Edge-clipped either way.
   const cells: Pt[] = [];
-  for (const d of BOMB_BLAST_OFFSETS) {
+  for (const d of blastOffsetsFor(owner)) {
     const nx = p.x + d.x;
     const ny = p.y + d.y;
     if (nx >= 0 && nx < BOARD_WIDTH && ny >= 0 && ny < BOARD_HEIGHT && state.board[ny][nx]) {
@@ -411,10 +478,16 @@ export function resolveDetonation(state: GameState, p: Pt, events: GameEvent[]):
 
   const bonus = buffBonus(state, owner);
   let raw = 0;
-  for (const c of cells) raw += baseDamage(state.board[c.y][c.x]!);
+  let shieldsRemoved = 0; // MK9.3: shield tiles caught in this blast
+  for (const c of cells) {
+    const t = state.board[c.y][c.x]!;
+    if (t.special?.type === 'shield') shieldsRemoved++;
+    raw += baseDamage(t, state, owner);
+  }
 
   events.push({ t: 'destroy', cells });
   for (const c of cells) state.board[c.y][c.x] = null;
+  if (shieldsRemoved > 0) events.push({ t: 'shieldRemoved', count: shieldsRemoved });
 
   dealDamage(
     state,

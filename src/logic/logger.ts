@@ -94,7 +94,14 @@ export class TurnLogger {
           e.actions.push('player board-shake');
           break;
         case 'ability':
-          e.actions.push(`${ev.side} fired ${ev.unit}${ev.drained !== undefined ? ` (drained ${ev.drained})` : ''}`);
+          // MK9: prefer the player-facing identity (E-Bomb / Shielder) when set.
+          e.actions.push(`${ev.side} fired ${ev.name ?? ev.unit}${ev.drained !== undefined ? ` (drained ${ev.drained})` : ''}`);
+          break;
+        case 'placed':
+          if (ev.count > 0) e.actions.push(`${ev.side} placed ${ev.count} ${ev.kind}${ev.count === 1 ? '' : 's'}`);
+          break;
+        case 'shield':
+          e.actions.push(`shield absorbed ${ev.prevented} of ${ev.preShield} (${ev.source})`);
           break;
         case 'detonate':
           e.detonations++;

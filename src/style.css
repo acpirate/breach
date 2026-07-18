@@ -22,11 +22,13 @@ canvas {
   -webkit-user-select: none;
 }
 
-/* MK7.8: debug-only find-match button (dev builds only) */
+/* MK7.8: debug-only find-match button (dev builds only).
+   MK8.4: docked below the "Buffs —" line (left/top set by main.ts from the
+   view's layout anchor) instead of fixed bottom-left over the board. */
 #dbgfind {
   position: fixed;
   left: 8px;
-  bottom: 8px;
+  top: 8px;
   z-index: 5;
   padding: 6px 10px;
   font-size: 13px;
@@ -118,6 +120,32 @@ canvas {
   margin-left: 24px;
   font-size: 14px;
   color: #aab;
+}
+
+/* MK8.3: per-ability cost inputs — subsection shown only when flat-cost is off */
+.config div.suboption {
+  margin-left: 24px;
+}
+
+/* MK8.2: settings accordion sections */
+.config details.cfgsection {
+  border: 1px solid #444;
+  margin: 6px 0;
+  padding: 0 10px;
+  background: #23232c;
+}
+
+.config details.cfgsection summary {
+  cursor: pointer;
+  font-weight: bold;
+  color: #fff;
+  padding: 8px 0;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.config details.cfgsection[open] {
+  padding-bottom: 8px;
 }
 
 .config input[type='checkbox'] {

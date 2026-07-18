@@ -17,8 +17,10 @@ export enum Shape { Circle = 0, Square, Triangle, Diamond, Star, Cross }
 export type UnitType = 'bomber' | 'buffer' | 'attacker' | 'disabler';
 export const UNIT_ORDER: UnitType[] = ['bomber', 'buffer', 'attacker', 'disabler'];
 
+// MK9.3: 'shield' is the enemy Shielder's tile — an enemy-owned board object
+// that reduces incoming player-to-enemy damage while it sits on the board.
 export interface Special {
-  type: 'bomb' | 'buff';
+  type: 'bomb' | 'buff' | 'shield';
   owner: Side;
   countdown?: number; // bombs only
   seq: number; // global placement order — bombs tick oldest-first
@@ -66,6 +68,13 @@ export interface BattleConfig {
   // restores the original charge-agnostic prefer-4 logic. Default ON. Inert
   // when noMatchDamage is off.
   nmdChargeAwareBot: boolean;
+  // MK9.4: per-side STRONG bindings (approved: "per-side tier swap"). A tile
+  // whose color is in a side's strongColors deals the HIGH color value for
+  // that side's own match/blast damage (LOW otherwise); likewise strongShapes.
+  // Stored independently per side and stamped into logs — NOT derived from
+  // prose. A match may be strong for one side and weak for the other.
+  strongColors: Record<Side, Color[]>;
+  strongShapes: Record<Side, Shape[]>;
 }
 
 export interface GameState {
@@ -90,7 +99,7 @@ export interface TileView {
   kind: 'standard' | 'neutral';
   color?: Color;
   shape?: Shape;
-  special?: { type: 'bomb' | 'buff'; owner: Side; countdown?: number };
+  special?: { type: 'bomb' | 'buff' | 'shield'; owner: Side; countdown?: number };
 }
 
 export function tileViewOf(t: Tile): TileView {
@@ -132,7 +141,20 @@ export type GameEvent =
   | { t: 'over'; winner: Side }
   // metrics/logging-only events (no visual representation; renderer skips them)
   | { t: 'shakeUsed' }
-  | { t: 'ability'; side: Side; unit: UnitType; drained?: number }
+  // MK9: `name` is the player-facing/log identity (e.g. 'E-Bomb', 'Shielder')
+  // when the enemy unit diverges from the shared type label; unit stays the
+  // canonical UnitType so metrics buckets are unchanged.
+  | { t: 'ability'; side: Side; unit: UnitType; drained?: number; name?: string }
+  // MK9.1/9.2/9.3 — bombs or shield tiles actually placed by one activation
+  // (may be fewer than requested if the board lacks legal targets).
+  | { t: 'placed'; side: Side; kind: 'bomb' | 'shield'; count: number }
+  // MK9.3 — one per shield-affected player->enemy damage instance. preShield =
+  // base+buff before absorption; shield = total active enemy shield; prevented
+  // = min(preShield, shield); final = preShield - prevented (the dealt amount).
+  | { t: 'shield'; source: 'match' | 'attacker' | 'bomb'; preShield: number; shield: number; prevented: number; final: number }
+  // MK9.3 — enemy shield tiles removed from the board this event (matched,
+  // cascaded, or blasted away).
+  | { t: 'shieldRemoved'; count: number }
   | { t: 'chargeWaste'; side: Side; unit: UnitType; amount: number }
   | { t: 'autoReshuffle' }
   | { t: 'cascadeDepth'; side: Side; depth: number }

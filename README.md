@@ -12,6 +12,18 @@ npm run batch      # headless batch: 100 bot-played battles, aggregate metrics r
 npm run typecheck  # tsc --noEmit
 ```
 
+## MK9 revisions (Section 1-MK9 — Asymmetric Enemy Roles, Binding Contest & Log Retention)
+
+Enemy roles diverge from the player's, offensive priorities separate across the shared board, the Player Bomber gets more reliable, and local log retention hardens. Deltas on MK8.
+
+- **MK9.1 Player Bomber → two bombs:** one activation places **2** player bombs (`PLAYER_BOMBER_BOMBS`), one cost, one activation, drawing two distinct legal targets without replacement (fewer if the board can't fit two — never hangs). Metrics record bombs placed per activation (`units.bomber.bombsPlaced`).
+- **MK9.2 E-Bomb (enemy Bomber replacement):** places **1** enemy bomb with the original **3-turn** fuse (`E_BOMB_COUNTDOWN`; player bombs keep the MK3.1 2-turn fuse). Its blast is the base 3×3 **plus one tile in each cardinal direction** (`E_BOMB_BLAST_OFFSETS`, 13 cells, edge-clipped, **no** extra diagonals). Footprint/fuse key off bomb owner.
+- **MK9.3 Shielder (enemy Buffer replacement):** places **2** shield tiles (`SHIELDER_TILES`), each worth **2** shield points (`SHIELD_POINTS_PER_TILE`). Total active enemy shield reduces **every separate** player→enemy damage instance (match, Attacker, each bomb blast, …) by the summed value, min 0, applied after base+Buffer but before HP. Shield tiles are removable board objects (match/cascade/blast); value is measured live so a shield removed in a step stops protecting the next instance. Prevention is **not** damage dealt — reported in a disjoint shield metric (created/removed/hits/prevented), never folded into damage buckets.
+- **MK9.4 Per-side strong bindings (approved "tier swap"):** player and enemy no longer share strong colors/shapes. Player strong = the historical HIGH sets (Red/Yellow/Magenta, Square/Cross/Diamond, 2 dmg); enemy strong = the **opposite** sets (Green/Cyan/Blue, Triangle/Star/Circle). Stored explicitly per side in `BattleConfig` (`strongColors`/`strongShapes`), stamped into saves and dumps. Match/blast damage is now owner-resolved — a match can be strong for one side and weak for the other. New enemy units bind on colors/shapes **unused by player abilities**: **E-Bomb = Magenta + Diamond**, **Shielder = Cyan + Circle**.
+- **MK9.5 Character Sheet:** player and enemy shown in separate sections, each with its own strong color/shape; general charge + neutral-tile lines moved to the bottom.
+- **MK9.6/9.7 Log retention (server-only, approved):** `logs:wipe` now removes only the raw `.jsonl` and **preserves** the readable dump. `logs:dump` **appends** a session block (with a `SESSION <id>` header and separator) instead of overwriting, and is retry-safe — an unchanged source dedups by content hash, new events append a fresh session. A named storage threshold (`LOG_STORAGE_THRESHOLD` in `scripts/logConfig.cjs`, default **99%** for this near-full dev drive; `BREACH_LOG_THRESHOLD` env override) gates the dev sink's raw writes and the dump: over threshold, the affected file is replaced with the line `storage media more than 99% full` (wording tracks the 99% default per user override; the spec's literal was "80%") and further writes stay bounded. Measured honestly against the real filesystem (`fs.statfsSync`); when unmeasurable, logging proceeds. All log/dump write paths are isolated so storage failures never touch gameplay.
+- Save/log versions are now `mk9`; older saves are rejected to a clean start (config gained per-side strong bindings and the `shield` special tile). Menu-config migrates conservatively (adds strong-binding defaults, re-stamps).
+
 ## MK7 revisions (Section 1-MK7 — Attribution, Cost Curve & Instrumentation)
 
 Theme: fix the instruments before running the experiment. No new mechanics beyond config.
@@ -113,7 +125,9 @@ No gameplay changes. Additions:
 | Attacker (cost 19) binding | Yellow + Star |
 | Disabler (cost 22) binding | Blue + Cross |
 
-Enemy minions use the **identical bindings** (approved). Cyan, Magenta, Circle, and Diamond are unbound — matching them deals damage but charges no unit (intentional).
+**As of MK9** (Section 1-MK9) sides diverge — see the MK9 section above:
+- **Strong tiers are per-side.** Player strong = Red/Yellow/Magenta + Square/Cross/Diamond (2 dmg); enemy strong = the opposite sets (Green/Cyan/Blue + Triangle/Star/Circle). A match is strong only for the side that owns that binding.
+- **Enemy Bomber→E-Bomb (Magenta + Diamond)** and **enemy Buffer→Shielder (Cyan + Circle)** now bind on colors/shapes unused by player abilities. Enemy Attacker (Yellow + Star) and Disabler (Blue + Cross) keep the shared bindings. The player program bindings above are unchanged.
 
 ## Clarified rules baked in (from designer Q&A)
 
