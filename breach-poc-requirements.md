@@ -822,6 +822,239 @@ Not in MK8 (deliberately, to keep it light and single-purpose): the **Disabler e
 
 ---
 
+# Section 1-MK9: Asymmetric Enemy Roles, Binding Contest & Log Retention (BUILD THIS, ON TOP OF MK8)
+
+Assumes Sections 1 and MK2–MK8 are built and working. Each item is a DELTA against the current build — where MK9 conflicts with an earlier section, MK9 governs; everything not mentioned remains unchanged. Section 2 (Roadmap) remains context only and out of scope.
+
+**Build purpose:** MK9 replaces two mechanically mirrored enemy abilities with enemy-specific threat forms, separates player and enemy offensive priorities on the shared board, improves the Player Bomber's reliability, and hardens local log retention. The combat hypothesis is that asymmetric bindings and inverse-role enemies will create clearer denial decisions without adding broad new systems. The logging hypothesis is that readable dumps should accumulate across test sessions while raw-event deletion and storage exhaustion remain safe and controllable.
+
+## MK9.1 Player Bomber — two-bomb cast
+
+- Activating the **Player Bomber** places **2 player bombs** instead of 1.
+- Both bombs are created by the same ability activation and use the existing player-bomb behavior:
+  - existing countdown;
+  - existing damage;
+  - existing explosion footprint;
+  - existing ownership, matching, cascade, destruction, persistence, rendering, attribution, and logging behavior.
+- Placement must follow the current valid bomb-placement rules. Claude Code must inspect the current one-bomb placement logic before implementation and extend it conservatively rather than inventing a new placement system.
+- If fewer than two valid placement locations exist, place as many bombs as can be placed legally; the activation must not hang, retry indefinitely, corrupt the board, or fail the turn.
+- The Player Bomber still pays its normal cost once and records one ability activation. Metrics must additionally report the number of bombs successfully placed by the activation.
+- Purpose: increase average impact and reduce all-or-nothing casts where the only bomb is matched away, removed by a cascade, or destroyed by another bomb before contributing.
+
+## MK9.2 Enemy Bomber replacement — E-Bomb
+
+- Replace the mirrored enemy Bomber behavior with an enemy-specific unit identified in player-facing text and logs as **E-Bomb**.
+- E-Bomb places **1 enemy bomb** per activation.
+- The E-Bomb countdown default is **3 turns**, matching the original bomb countdown.
+- The E-Bomb explosion uses the current bomb footprint plus **1 additional tile in each cardinal direction**.
+  - Preserve the current footprint's shape and add one outward tile to its north, south, east, and west reach.
+  - Clip cleanly at board edges; never address off-board coordinates.
+  - Do not add diagonal reach unless diagonals already belong to the existing footprint.
+- All other bomb behavior remains unchanged unless explicitly overridden here: matching/removal, cascade interaction, chain reactions, ownership, damage attribution, rendering, persistence, simulation, and logging.
+- Intended identity: one slower, highly visible, higher-impact threat rather than the Player Bomber's two smaller redundant threats.
+
+## MK9.3 Enemy Buffer replacement — Shielder
+
+- Replace the mirrored enemy Buffer with an enemy-specific unit identified in player-facing text and logs as **Shielder**.
+- Shielder places **2 enemy shield tiles** per activation.
+- Each shield tile contributes **2 shield points** while it remains active on the board.
+- **Total active enemy shield value** is the sum of the shield-point values of all active enemy shield tiles currently on the board.
+- Every separate incoming damage instance against the enemy is reduced by the total active enemy shield value, to a minimum of 0.
+- Apply this reduction independently to every discrete damage event, including:
+  - match damage;
+  - Attacker direct damage;
+  - each bomb explosion damage event;
+  - any other separately resolved player-to-enemy damage event.
+- Example: two active 2-point shield tiles produce 4 shield. A 3-damage match deals 0. A separate 8-damage Attacker hit deals 4.
+- Shield reduction occurs after the incoming instance's normal base damage and Player Buffer contribution have been calculated, but before enemy HP is reduced and final damage is recorded.
+- Shield absorption is not damage dealt. Metrics must distinguish:
+  - pre-shield incoming damage;
+  - shield value applied to the instance;
+  - damage prevented;
+  - final damage dealt.
+- Shield tiles remain board objects and can be removed through normal matching, deterministic settling/cascades, bombs, or other tile-clearing effects under the same removal rules used by comparable special tiles.
+- When a shield tile leaves the board, its shield points cease applying immediately before the next damage instance resolves.
+- If fewer than two valid placement locations exist, place as many shield tiles as can be placed legally; the activation must fail gracefully and must not loop indefinitely or corrupt state.
+- Intended identity: inverse of the Player Buffer, reducing incoming damage rather than increasing outgoing damage.
+
+## MK9.4 Strong color and shape separation
+
+- Player and enemy no longer share the same strong color or strong shape.
+- Store player and enemy strong bindings independently in defaults/configuration and persistence.
+- The enemy receives a designated **opposite** strong color and **opposite** strong shape from the player.
+- Strong-color and strong-shape matches continue to deal **2 damage** for the side that owns that binding.
+- A match may be strong for one side without being strong for the other.
+- New enemy units introduced in MK9 must use ability-charge color and shape bindings that are currently unused by player abilities.
+- The exact default player/enemy color and shape mapping must not be guessed from prose. During pre-build inspection, Claude Code must report:
+  1. the current player strong color and strong shape;
+  2. all current player ability charge bindings;
+  3. the currently unused colors and shapes;
+  4. a proposed explicit opposite mapping for the enemy and explicit E-Bomb/Shielder charge bindings.
+- Claude Code must wait for user authorization after reporting the mapping before implementing MK9.
+- Purpose: create separate offensive priorities and more deliberate denial decisions on the shared board.
+
+## MK9.5 Character Sheet separation and ordering
+
+- Update the pause-menu **Character Sheet** so player and enemy statistics are presented in visibly distinct sections.
+- Each section must show that side's strong color and strong shape independently; do not retain a single shared-strength presentation.
+- Preserve the existing Character Sheet content unless MK9 explicitly changes its placement.
+- Move the general **charge** explanation and **neutral-tile** explanation lines to the bottom of the Character Sheet scroll content so side-specific combat information appears earlier.
+- The Character Sheet remains read-only and available only through the existing pause-menu flow.
+
+## MK9.6 Log wipe, cumulative dumps, and storage protection
+
+### Raw-log wipe behavior
+
+- Modify the existing log-wipe function so it removes only the stored raw JSON/JSONL event logs.
+- It must not remove existing human-readable log dumps.
+- Any unrelated save, settings, or battle-persistence data must remain untouched.
+
+### Cumulative dump behavior
+
+- A newly generated readable log dump must append to the existing readable dump rather than replacing it.
+- Preserve a clear separator between appended dump sessions and retain enough session metadata to distinguish runs.
+- Dump generation must remain deterministic from the underlying stored events and must not duplicate an already-appended session when the same action is retried after a recoverable failure.
+
+### Storage threshold
+
+- Add a gameplay-independent default named for the log-storage threshold, with a default value of **80%**.
+- Before adding a new raw log entry and before generating/appending a dump, inspect the best storage-usage measurement actually available in the current browser/runtime.
+- If measured usage is greater than the configured threshold:
+  - do not add the new raw log entry;
+  - do not generate or append a normal dump;
+  - replace the affected stored raw-log or dump content with exactly this single line:
+
+  `storage media more than 80% full`
+
+- After the sentinel line has replaced the affected content, subsequent logging/dump attempts while storage remains above threshold must remain bounded and safe; they must not repeatedly grow storage or throw uncaught errors.
+- The configured threshold applies to logging only and must never alter battle behavior.
+
+### Required storage-model inspection
+
+- Browser APIs may expose per-origin quota and usage rather than the device filesystem's true percentage. Before implementation, Claude Code must inspect the current persistence layer and available runtime APIs and report:
+  - where raw logs and readable dumps are stored;
+  - whether actual device/filesystem percentage can be measured;
+  - whether only origin quota/usage can be measured;
+  - the proposed interpretation of the 80% threshold;
+  - behavior when the estimate API is absent, denied, incomplete, or returns invalid values.
+- Claude Code must not fabricate a device-storage percentage. If the literal requirement cannot be implemented with available APIs, it must stop and request user authorization for the closest honest interpretation.
+
+### Graceful failure requirement
+
+- All logging and dump operations must be isolated so storage exhaustion, quota errors, write failures, unavailable storage, serialization failures, permission failures, or partial writes cannot crash, freeze, or interrupt the game.
+- Gameplay must continue even when logging is disabled or fails.
+- Logging failures must be caught and reported through the safest existing diagnostic path without recursively trying to log the logging failure.
+- Claude Code must explicitly confirm after inspection and after implementation whether every filesystem/storage write path fails gracefully.
+
+## MK9.7 Defaults
+
+Add or update all gameplay- or behavior-affecting values through the existing defaults/configuration pattern; do not scatter literals through implementation code.
+
+Required MK9 defaults:
+
+- Player Bomber bombs per activation: **2**.
+- E-Bomb bombs per activation: **1**.
+- E-Bomb countdown: **3 turns**.
+- E-Bomb cardinal footprint extension: **1 tile**.
+- Shielder tiles per activation: **2**.
+- Shield points per tile: **2**.
+- Strong match damage remains **2**.
+- Log-storage threshold: **80%**.
+- Explicit player strong color/shape, enemy strong color/shape, E-Bomb charge bindings, and Shielder charge bindings after the pre-build mapping is approved.
+
+Every combat default must affect both human play and simulation. Logging defaults apply wherever the same storage/logging path is used.
+
+## MK9.8 Metrics and logging
+
+Extend the existing event-sourced metrics stream; do not create a parallel telemetry system.
+
+Record for human play and simulation where applicable:
+
+- Player Bomber activations and bombs successfully placed per activation.
+- E-Bomb activations, bombs placed, countdown at creation, and explosion footprint/radius identifier.
+- Shielder activations and shield tiles successfully placed.
+- Shield tiles created, removed, and current total active shield value.
+- For every shield-affected damage instance: source/cause, pre-shield damage, shield value, damage prevented, and final damage.
+- Player and enemy strong color/shape bindings stamped into battle configuration and dumps.
+- Which side received strong-match damage and which axis/binding caused it.
+- Raw-log wipe attempts and outcomes without recording deleted event payloads.
+- Dump append attempts and outcomes.
+- Storage-threshold trips, measured usage/quota values when available, chosen measurement interpretation, and sentinel replacement outcome.
+- Storage/logging failures as bounded diagnostic events where safe; never recursively log a failed log write.
+
+Existing damage attribution rules remain in force. Shield prevention must not be inserted into damage-source totals as damage dealt.
+
+## MK9.9 Persistence, compatibility, and unchanged behavior
+
+- Existing in-progress saves must either migrate conservatively to MK9 defaults or be rejected through the project's existing invalid-save handling; do not silently load malformed mixed-version state.
+- Persist new enemy-unit identities, special tiles, countdowns, shield values, strong bindings, and relevant config using the existing save/config architecture.
+- Continue to support restore/reload without duplicating bombs, shield tiles, charges, ability activations, or dump sessions.
+- Preserve existing turn order: abilities fire in the existing pre-match ability phase; matching still ends the acting side's turn.
+- Preserve cap-0 cascade behavior, causal damage attribution, hint behavior, debug controls, settings structure, aspect-ratio containment, and all MK8 behavior unless explicitly changed here.
+- Do not redesign the Player Buffer, Attacker, Disabler, enemy Attacker, or enemy Disabler.
+- Do not add broader status effects, armor systems, unit rosters, new scenes, progression, content, or visual polish beyond what MK9 requires.
+
+## MK9.10 Verification and acceptance criteria
+
+Claude Code must run the repository's existing build/test commands and any focused tests needed for MK9. At minimum verify:
+
+1. One Player Bomber activation attempts two legal bomb placements, charges/costs once, and preserves existing bomb countdown/damage/footprint.
+2. Removal of one player bomb does not implicitly remove the second.
+3. E-Bomb places one 3-turn bomb and its explosion extends exactly one additional cardinal tile, clips at edges, and does not gain unintended diagonal reach.
+4. Shielder places two 2-point shield tiles when two legal positions exist.
+5. Two active shield tiles reduce each separate incoming instance by 4, independently, to a minimum of 0.
+6. Shield applies correctly to match, Attacker, and bomb damage, including multiple discrete events in one round.
+7. Removing a shield tile immediately lowers the shield value for later damage instances.
+8. Player and enemy strong bindings are distinct, persisted, displayed, stamped into logs, and honored by both human play and simulation.
+9. New enemy charge bindings do not overlap player ability bindings unless the user explicitly approved an exception.
+10. Character Sheet visibly separates player and enemy sections and places charge/neutral explanations last.
+11. Raw-log wipe removes raw JSON/JSONL logs while preserving existing readable dumps and unrelated storage.
+12. Successive dump generations append distinct sessions without erasing earlier dumps or duplicating the same session on retry.
+13. A simulated over-threshold condition suppresses new entries/dumps and replaces affected content with the exact sentinel line.
+14. Missing/invalid storage estimates and forced quota/write/serialization failures do not crash, freeze, or interrupt a battle.
+15. Save/reload preserves bombs, E-Bomb countdown, shield tiles/value, strong bindings, and battle config without duplication.
+16. Existing MK8 functionality passes regression checks.
+
+Manual human-play checks must include one battle emphasizing denial of enemy strong bindings and one battle exercising repeated low-damage instances against active shields.
+
+## MK9.11 Pre-build inspection and authorization stop
+
+Before writing code, Claude Code must inspect and report:
+
+1. Current files/modules responsible for bomb placement, bomb footprint resolution, special-tile placement/removal, damage application, Buffer attribution, strong bindings, Character Sheet rendering, save/config persistence, raw log storage, log wipe, and dump generation.
+2. Current player strong color/shape and all player ability charge bindings.
+3. Available unused colors/shapes and the proposed explicit enemy/E-Bomb/Shielder mapping.
+4. Whether two-tile placement can reuse an existing multi-placement helper or requires a bounded extension.
+5. The exact damage-instance boundary used for shield application, especially bomb chains and multi-match rounds.
+6. The actual browser/runtime storage measurement available and the honest interpretation of the 80% rule.
+7. Every storage write path and how it currently behaves on quota/write failure.
+8. Any meaningful deviation, contradiction, missing convention, or structural issue when this requirements document is compared with previous Breach requirements documents or the existing implementation.
+
+**Claude Code must wait for user authorization after this report.** Do not begin MK9 implementation until the user approves the proposed mappings, storage interpretation, and any meaningful deviations.
+
+## MK9.12 Post-build report
+
+After implementation, report:
+
+- files changed;
+- behavioral changes;
+- exact defaults and approved bindings added or changed;
+- tests/build commands run and results;
+- human and simulation checks performed;
+- shield metrics and bomb-placement metrics observed;
+- storage-threshold test method and results;
+- confirmation that all storage/logging failures are graceful and gameplay-safe;
+- save/migration behavior;
+- known limitations;
+- every deviation from MK9 requirements;
+- every meaningful issue or divergence discovered relative to previous requirements documents or established project conventions.
+
+## MK9 — Explicit exclusions
+
+Do not implement: additional player units; additional enemy units beyond E-Bomb and Shielder replacements; Player Buffer redesign; cooldown redesign; new shield variants; shield decay; shield caps; shield piercing; shield ownership transfer; diagonal E-Bomb growth; new board sizes; new scenes; alpha run structure; roadmap systems; unrelated refactors; speculative polish; or changes to Section 2.
+
+---
+
 # Section 2: Roadmap (DO NOT BUILD — CONTEXT ONLY)
 
 This section exists so future work has a documented home and so deferred ideas aren't lost. Nothing in this section should be implemented as part of the PoC. If anything here appears to conflict with Section 1, Section 1 governs for this build.
@@ -1601,3 +1834,119 @@ desktop AND by touch on mobile; (b) FLAT_ABILITY_COST defaults ON and the per-ab
 cost inputs appear only when it's turned off; (c) default HP is 150/150; and (d) the
 find-match button no longer overlaps the board.
 ```
+# Coding Agent Prompt — MK9 Iteration (Ready to Paste)
+
+```
+This is the ninth iteration on the existing, working "Breach" build in this repo.
+Sections 1 and MK2-MK8 are the established baseline. Implement only
+"Section 1-MK9: Asymmetric Enemy Roles, Binding Contest & Log Retention" from
+breach-poc-requirements.md after completing the required inspection and receiving
+user authorization.
+
+IMPORTANT PROCESS NOTICE: this requirements document was generated through a different
+requirements-authoring process than previous Breach documents. Compare MK9 against the
+previous requirements documents, current implementation, naming conventions, defaults/
+config architecture, persistence model, metrics conventions, and restore-point history.
+Report every MEANINGFUL deviation, contradiction, missing convention, or issue to the
+user. Do not silently normalize differences or choose an interpretation yourself.
+
+Read the full Section 1 baseline and every intervening delta MK2-MK9 before acting.
+Later deltas override earlier requirements only where they conflict. Section 2 is
+context only and MUST NOT be implemented. Existing behavior remains unchanged unless
+MK9 explicitly overrides it.
+
+MK9 scope:
+
+1. PLAYER BOMBER — one activation places 2 otherwise unchanged player bombs. Pay cost
+   once and count one activation. Use current legal placement rules. If fewer than two
+   legal positions exist, place only what can be placed; never hang or corrupt state.
+   Log bombs successfully placed per activation.
+
+2. E-BOMB — replace the mirrored enemy Bomber with E-Bomb. It places one bomb with the
+   original 3-turn countdown. Its current explosion footprint extends one additional
+   tile north, south, east, and west, clipped at board edges, with no new diagonal reach.
+   Preserve existing bomb matching, chain, attribution, persistence, simulation, and
+   rendering behavior unless MK9 explicitly changes it.
+
+3. SHIELDER — replace the mirrored enemy Buffer with Shielder. One activation places
+   two shield tiles; each contributes 2 shield. Sum all active shield tiles. Reduce
+   EVERY separate incoming player-to-enemy damage instance by total shield, minimum 0,
+   after normal base damage and Player Buffer contribution but before HP reduction.
+   Apply independently to match, Attacker, bomb, and all other discrete damage events.
+   Shield tiles are removable board objects. Log pre-shield damage, shield applied,
+   prevented damage, and final damage. Shield prevention is not damage dealt.
+
+4. STRONG BINDINGS — player and enemy strong color/shape are stored independently and
+   are distinct/opposite. Strong matches remain 2 damage. E-Bomb and Shielder use
+   currently unused player ability charge colors/shapes. DO NOT GUESS THE MAPPING.
+   Inspect current bindings, identify unused bindings, propose explicit mappings, and
+   wait for user approval before implementation.
+
+5. CHARACTER SHEET — visibly separate player and enemy statistics and show each side's
+   strong color/shape independently. Move the general charge and neutral-tile
+   explanation lines to the bottom of the scroll content.
+
+6. LOG RETENTION — log wipe removes only raw JSON/JSONL logs and preserves readable
+   dumps plus unrelated storage. New readable dumps append to the existing dump with
+   clear session separation and retry-safe deduplication.
+
+7. STORAGE PROTECTION — add an 80% log-storage threshold through the existing defaults
+   pattern. Before raw-event writes and dump generation/appending, use the best HONEST
+   storage measurement available. When measured usage exceeds threshold, suppress the
+   normal write and replace the affected stored raw log or dump with exactly:
+
+   storage media more than 80% full
+
+   Browsers may expose origin quota rather than device filesystem percentage. Inspect
+   and report what is actually measurable. Never fabricate a device-storage value. If
+   the literal requirement cannot be implemented, stop and request approval for the
+   closest honest interpretation.
+
+8. FAILURE SAFETY — quota exhaustion, insufficient storage, unavailable APIs,
+   permission failures, serialization failures, partial writes, or any other log/dump
+   failure must never crash, freeze, or interrupt gameplay. Catch failures without
+   recursively logging a logging failure. Explicitly verify every storage write path
+   fails gracefully.
+
+9. DEFAULTS / CONFIG / SIMULATION — all gameplay-affecting values use the established
+   defaults/configuration pattern and apply to both human play and simulation. Persist
+   approved strong/charge bindings, E-Bomb state, shield tiles/value, and relevant
+   config through the existing architecture.
+
+10. METRICS — extend the EXISTING event-sourced stream. Do not build a parallel
+    pipeline. Add bomb placement, E-Bomb, shield creation/removal/value, per-instance
+    shield prevention, strong-binding, dump append/wipe, threshold-trip, and bounded
+    storage-failure reporting required by MK9. Preserve MK7 causal attribution rules.
+
+PRE-BUILD INSPECTION — before writing code, report:
+- relevant modules/files for bombs, footprint resolution, special tiles, damage,
+  bindings, Character Sheet, persistence, raw logs, wipe, and dump generation;
+- current player strong color/shape and all player ability charge bindings;
+- unused colors/shapes and your explicit proposed enemy/E-Bomb/Shielder mapping;
+- how two-object placement will be bounded;
+- the exact damage-instance boundary for shield application, including bomb chains;
+- actual available storage/quota APIs and your interpretation of the 80% rule;
+- every storage write path and current failure behavior;
+- every meaningful divergence or issue compared with previous Breach requirements docs
+  or established implementation conventions.
+
+WAIT FOR USER AUTHORIZATION after the inspection. Do not implement until the user
+approves the mappings, storage interpretation, and identified deviations.
+
+CRITICAL:
+- Implement only MK9. No roadmap work, unrelated refactors, speculative polish, new
+  units beyond E-Bomb/Shielder replacement, shield variants, cooldown redesign, run
+  structure, or progression systems.
+- Preserve prior MK sections as restore points. Keep MK8 as a clean committed restore
+  point.
+- Ask about genuine contradictions rather than silently choosing an interpretation.
+- Existing behavior remains unchanged unless MK9 explicitly overrides it.
+
+After implementation, run existing build/tests plus focused MK9 tests and provide a
+final report covering files changed, behavior, approved defaults/bindings, tests and
+simulation results, manual checks, metrics, storage-threshold tests, graceful-failure
+verification, persistence/migration, known limitations, every requirements deviation,
+and every meaningful issue relative to previous requirements documents or project
+conventions.
+```
+
