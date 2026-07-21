@@ -1,0 +1,10 @@
+FNC_ID,name,cost,payload,notes,quantity,countdown,areaPattern,magnitude,damage
+FNC_001,BOMB,7,EFFECT_BOMB,player bomb,2,2,AREA_SQUARE_3X3,,
+FNC_002,BUFF,8,EFFECT_BUFF,player buffer,1,,,5,
+FNC_003,ATTACK,10,EFFECT_ATTACK,direct damage to opponent,,,,,30
+FNC_004,DRAIN,9,EFFECT_DRAIN,"unit target, remove all charge",,,,,
+FNC_005,EBOMB,7,EFFECT_BOMB,,1,3,AREA_SQUARE_3X3_CARDINAL_2,,
+FNC_006,SHIELD,8,EFFECT_SHIELD,,2,,,2,
+FNC_007,SHOWCASE,9,FNC_008:FNC_009,"chained function example, costs of called functions are ignored",,,,,
+FNC_008,ONEBOMB,5,EFFECT_BOMB,chained function payload,1,2,AREA_SQUARE_3X3,,
+FNC_009,ONESHIELD,5,EFFECT_SHIELD,chained function payload,1,,,2,
