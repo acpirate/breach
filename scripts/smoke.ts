@@ -1,14 +1,19 @@
 // Headless smoke test: drives the pure logic layer through full battles
 // across config variants, checking core invariants after every turn.
-// Run with `npm run smoke`.
+// Alpha 0.1.0: content loads from the packaged CSV datasets through the same
+// shared pipeline the browser uses. Run with `npm run smoke`.
 
 import { findValidMove, swap } from '../src/logic/board';
-import { BOARD_HEIGHT, BOARD_SHAKE_COST, BOARD_WIDTH, DEFAULT_BATTLE_CONFIG, effectiveCost } from '../src/logic/constants';
+import { BOARD_HEIGHT, BOARD_SHAKE_COST, BOARD_WIDTH, DEFAULT_BATTLE_CONFIG } from '../src/logic/constants';
+import { getContent, programsFor } from '../src/logic/data/content';
 import { Game } from '../src/logic/game';
 import { detectMatches } from '../src/logic/match';
-import { deserializeGame, serializeGame } from '../src/logic/save';
+import { SAVE_VERSION, deserializeGame, serializeGame } from '../src/logic/save';
 import { BattleConfig } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
+import { initContentOrExit } from './dataNode';
+
+initContentOrExit();
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`SMOKE FAIL: ${msg}`);
@@ -16,8 +21,7 @@ function assert(cond: unknown, msg: string): asserts cond {
 
 function checkInvariants(g: Game): void {
   const s = g.state;
-  // board fully populated between turns (resolution halts at game over, so a
-  // finished battle may legitimately leave holes behind the game-over dialog)
+  // board fully populated between turns (resolution halts at game over)
   if (!s.winner) {
     for (let y = 0; y < BOARD_HEIGHT; y++) {
       for (let x = 0; x < BOARD_WIDTH; x++) {
@@ -25,12 +29,14 @@ function checkInvariants(g: Game): void {
       }
     }
   }
-  // charge caps respected (MK7.1: against effective costs)
+  // charge caps respected (Alpha: against each Program's data cost)
   for (const side of ['player', 'enemy'] as const) {
-    for (const u of s.units[side]) {
-      const cost = effectiveCost(s.config, u.type);
-      assert(u.charge >= 0 && u.charge <= cost, `${side} ${u.type} charge ${u.charge} out of [0,${cost}]`);
-    }
+    const programs = programsFor(side);
+    s.units[side].forEach((u, i) => {
+      const cap = programs[i].chargeCap;
+      assert(u.programId === programs[i].id, `${side} slot ${i} program mismatch`);
+      assert(u.charge >= 0 && u.charge <= cap, `${side} ${u.programId} charge ${u.charge} out of [0,${cap}]`);
+    });
   }
   assert(s.shakeCharge >= 0 && s.shakeCharge <= BOARD_SHAKE_COST, `shake charge ${s.shakeCharge} out of range`);
   // deadlock prevention: a settled board always has a valid move
@@ -38,8 +44,6 @@ function checkInvariants(g: Game): void {
 }
 
 function testInvalidSwapDoesNotConsumeTurn(g: Game): void {
-  // find an adjacent pair verified (via tentative swap) to produce no match,
-  // then confirm attemptSwap reverts it without consuming the turn
   for (let y = 0; y < BOARD_HEIGHT; y++) {
     for (let x = 0; x < BOARD_WIDTH; x++) {
       for (const d of [{ dx: 1, dy: 0 }, { dx: 0, dy: 1 }]) {
@@ -69,15 +73,14 @@ function runBattle(label: string, config: BattleConfig, seed: number): void {
     botFireAbilities(g);
     if (g.state.winner) break;
     if (g.state.shakeCharge >= BOARD_SHAKE_COST && safety % 4 === 0) {
-      // MK2.2: shake is a pure anti-lock reshuffle — verify NO damage, NO
-      // charge, NO cascades, and a no-match board with >=1 valid move
+      // MK2.2/MK7.9: shake is a pure anti-lock PERMUTATION — verify NO damage,
+      // NO charge, NO cascades, composition preserved, valid no-match board.
       const hpBefore = JSON.stringify(g.state.hp);
       const chargesBefore = JSON.stringify({
         p: g.state.units.player.map((u) => u.charge),
         e: g.state.units.enemy.map((u) => u.charge),
       });
       const shakeBefore = g.state.shakeCharge;
-      // MK7.9: shake is a PERMUTATION — board composition must be preserved
       const compBefore = JSON.stringify(
         g.state.board.flat().map((t) => `${t!.kind}:${t!.color ?? '-'}:${t!.shape ?? '-'}`).sort(),
       );
@@ -150,7 +153,7 @@ function runBattle(label: string, config: BattleConfig, seed: number): void {
   );
 }
 
-// MK4.1: save/restore round trip — headless, pure logic (no storage APIs)
+// MK4.1/Alpha §14: save/restore round trip — headless, pure logic
 function testSaveRoundTrip(): void {
   const cfg: BattleConfig = {
     ...DEFAULT_BATTLE_CONFIG,
@@ -158,7 +161,6 @@ function testSaveRoundTrip(): void {
     maxCascadeSteps: 4,
     playerHp: 222,
     enemyHp: 333,
-    abilityCosts: { bomber: 5, buffer: 11, attacker: 17, disabler: 23 },
     hintEnabled: true,
     hintDelaySeconds: 3,
   };
@@ -180,7 +182,7 @@ function testSaveRoundTrip(): void {
   assert(serializeGame(r.state) === json, 'restored state must re-serialize identically');
   assert(r.state.turn === g.state.turn && r.state.battleId === g.state.battleId, 'turn/battleId survive');
   assert(r.state.config.playerHp === 222 && r.state.config.enemyHp === 333, 'HP config survives the round trip');
-  assert(r.state.config.abilityCosts.disabler === 23 && r.state.config.hintDelaySeconds === 3, 'MK7 config survives');
+  assert(r.state.config.hintDelaySeconds === 3, 'hint config survives');
   let safety = 0;
   while (!r.state.winner && safety++ < 600) {
     botFireAbilities(r);
@@ -192,17 +194,25 @@ function testSaveRoundTrip(): void {
     if (!r.state.winner) r.startPlayerPhase();
   }
   assert(r.state.winner, 'restored game plays to completion');
-  const tampered = JSON.parse(json) as { version: string };
-  tampered.version = 'mk999';
-  assert(deserializeGame(JSON.stringify(tampered)) === null, 'incompatible version -> no save');
+  // §14.1: pre-Alpha saves reject cleanly
+  const preAlpha = JSON.parse(json) as { version: string };
+  preAlpha.version = 'mk9';
+  assert(deserializeGame(JSON.stringify(preAlpha)) === null, 'pre-Alpha version -> no save');
+  // §14.3: content-fingerprint mismatch rejects
+  const fpMismatch = JSON.parse(json) as { fp: string };
+  fpMismatch.fp = 'deadbeef-0';
+  assert(deserializeGame(JSON.stringify(fpMismatch)) === null, 'fingerprint mismatch -> no save');
   assert(deserializeGame('{"not":"a save"}') === null, 'wrong shape -> no save');
   assert(deserializeGame('garbage{{{') === null, 'corrupt JSON -> no save');
   assert(deserializeGame(null) === null, 'missing -> no save');
   console.log('save round-trip OK');
 }
 
+assert(SAVE_VERSION === 'alpha-0.1.0', 'save version must be alpha-0.1.0');
+console.log(`content fingerprint: ${getContent().fingerprint}`);
+
 const D = DEFAULT_BATTLE_CONFIG;
-// new defaults (cap-0, hacker off) — standard and low-player-HP (ex-forced-loss)
+// defaults (cap-0, hacker off) — standard and low-player-HP
 for (let seed = 1; seed <= 10; seed++) {
   runBattle('default', D, seed);
   runBattle('lowHp', { ...D, playerHp: 1 }, 1000 + seed);
@@ -218,7 +228,6 @@ for (let seed = 1; seed <= 5; seed++) {
   runBattle('singleAxis', { ...D, singleAxisPayout: true }, 5000 + seed);
 }
 // MK6.2: no-match-damage — abilities are the only damage source, bombs intact
-// (MK7.13: charge-aware bot tier active by default under NMD)
 for (let seed = 1; seed <= 5; seed++) {
   runBattle('noMatchDmg', { ...D, noMatchDamage: true }, 6000 + seed);
   runBattle('noMatchDmg+enemyMatch', { ...D, noMatchDamage: true, enemyMatching: true }, 7000 + seed);
@@ -226,11 +235,6 @@ for (let seed = 1; seed <= 5; seed++) {
 // MK7.13 addendum: sub-option off restores the classic charge-agnostic tier
 for (let seed = 1; seed <= 3; seed++) {
   runBattle('noMatchDmg+classicBot', { ...D, noMatchDamage: true, enemyMatching: true, nmdChargeAwareBot: false }, 7500 + seed);
-}
-// MK7.1: flat ability cost diagnostic — everything costs 7
-for (let seed = 1; seed <= 5; seed++) {
-  runBattle('flatCost', { ...D, flatAbilityCost: true }, 8000 + seed);
-  runBattle('flatCost+enemyMatch', { ...D, flatAbilityCost: true, enemyMatching: true }, 9000 + seed);
 }
 testSaveRoundTrip();
 console.log('SMOKE OK');

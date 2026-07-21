@@ -2,7 +2,7 @@
 // GameEvents emitted by the logic layer and reads HUD data through a getter.
 // Whitebox/greybox visuals only (spec 1.2).
 
-import { BOARD_HEIGHT, BOARD_WIDTH, BOMB_BLAST_OFFSETS } from '../logic/constants';
+import { BOARD_HEIGHT, BOARD_WIDTH } from '../logic/constants';
 import { Color, GameEvent, Pt, Shape, TileView } from '../logic/types';
 
 export interface HudUnit {
@@ -442,6 +442,7 @@ export class View {
         break;
       // metrics/logging-only events (MK2.3/MK4.3): nothing to draw
       case 'ability':
+      case 'op':
       case 'chargeWaste':
       case 'autoReshuffle':
       case 'cascadeDepth':
@@ -585,8 +586,15 @@ export class View {
     ctx.stroke();
 
     ctx.fillStyle = '#ddd';
-    // MK3.6: label/charge text scaled to the box height
-    ctx.font = `bold ${Math.max(12, Math.floor(r.h * 0.28))}px sans-serif`;
+    // MK3.6: label/charge text scaled to the box height. Alpha: labels are
+    // data display names (BOMBER, E-BOMBER, …) — shrink to fit the box width.
+    const maxLabelW = r.w - (4 + sw + 4) - 3;
+    let fs = Math.max(12, Math.floor(r.h * 0.28));
+    ctx.font = `bold ${fs}px sans-serif`;
+    while (fs > 8 && ctx.measureText(u.label).width > maxLabelW) {
+      fs--;
+      ctx.font = `bold ${fs}px sans-serif`;
+    }
     ctx.textAlign = 'left';
     ctx.fillText(u.label, r.x + 4 + sw + 4, r.y + 12);
 
@@ -687,10 +695,11 @@ export class View {
           ctx.fillRect(this.boardX + cc.x * c, this.boardY + cc.y * c, c, c);
         }
       } else if (this.cur.ev.t === 'detonate') {
+        // Alpha: the event carries the bomb's own data-defined footprint, so
+        // the flash matches the actual blast (E-Bomb included).
         ctx.fillStyle = `rgba(255,140,30,${a.toFixed(3)})`;
-        const pt = this.cur.ev.p;
-        for (const d of BOMB_BLAST_OFFSETS) {
-          ctx.fillRect(this.boardX + (pt.x + d.x) * c, this.boardY + (pt.y + d.y) * c, c, c);
+        for (const cc of this.cur.ev.cells) {
+          ctx.fillRect(this.boardX + cc.x * c, this.boardY + cc.y * c, c, c);
         }
       } else if (this.cur.ev.t === 'board') {
         ctx.fillStyle = `rgba(255,255,255,${(0.4 * (1 - Math.min(1, p))).toFixed(3)})`;

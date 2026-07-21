@@ -2,6 +2,8 @@
 
 import type { RNG } from './rng';
 import type { BattleMetrics } from './metrics';
+import type { AreaPatternId } from './data/areas';
+import type { EffectId } from './data/effects';
 
 export type Side = 'player' | 'enemy';
 export function opponentOf(s: Side): Side {
@@ -14,15 +16,17 @@ export function opponentOf(s: Side): Side {
 export enum Color { Red = 0, Yellow, Magenta, Green, Cyan, Blue }
 export enum Shape { Circle = 0, Square, Triangle, Diamond, Star, Cross }
 
-export type UnitType = 'bomber' | 'buffer' | 'attacker' | 'disabler';
-export const UNIT_ORDER: UnitType[] = ['bomber', 'buffer', 'attacker', 'disabler'];
-
-// MK9.3: 'shield' is the enemy Shielder's tile — an enemy-owned board object
-// that reduces incoming player-to-enemy damage while it sits on the board.
+// Alpha 0.1.0: a placed special tile carries the DATA that defines its
+// behavior — bombs their countdown/footprint, buff/shield tiles their per-tile
+// magnitude — plus the placing Program's stable ID for metrics attribution.
+// Nothing about a special's behavior is looked up from hardcoded tables.
 export interface Special {
   type: 'bomb' | 'buff' | 'shield';
   owner: Side;
   countdown?: number; // bombs only
+  areaPattern?: AreaPatternId; // bombs only — blast footprint from Function data
+  magnitude?: number; // buff/shield only — per-tile bonus/shield points from data
+  programId?: string; // placing Program (metrics/logging attribution)
   seq: number; // global placement order — bombs tick oldest-first
 }
 
@@ -39,14 +43,17 @@ export type Board = Cell[][]; // [y][x], y = 0 is the top row
 
 export interface Pt { x: number; y: number; }
 
-export interface UnitState { type: UnitType; charge: number; }
+// Alpha 0.1.0: a unit slot is a charge pool bound to a resolved Program by
+// stable ID. Program properties (cost, bindings, Function) live in the
+// resolved content model, never here.
+export interface UnitState { programId: string; charge: number; }
 
 export type Phase = 'playerPre' | 'resolving' | 'enemy' | 'over';
 
 // MK5.2/MK6 — per-battle configuration. Runtime state (part of GameState and
 // the save envelope), not global constants; defaults live in constants.ts.
-// The Scenario type is gone (MK6.4): HP is config, so "forced loss" is just
-// playerHp: 1.
+// Alpha 0.1.0: ability costs are CONTENT (Function data), not config — the
+// abilityCosts/flatAbilityCost fields are removed (approved change §4.2-4.4).
 export interface BattleConfig {
   enemyMatching: boolean; // MK5.1: enemy matches on the shared board (no charge clock)
   hackerBonusEnabled: boolean; // off = no Hacker color bonus at all (symmetric baseline)
@@ -55,11 +62,6 @@ export interface BattleConfig {
   noMatchDamage: boolean; // MK6.2: matches deal ZERO damage (charge unchanged; detonations unaffected)
   playerHp: number; // MK6.4: starting HP, menu-settable (1-9999)
   enemyHp: number;
-  // MK7.1: ability costs as config (defaults 7/13/19/22); flatAbilityCost is
-  // the diagnostic that prices ALL units at 7 to de-confound effect from
-  // firing rate. Expected to play badly — that's the point.
-  abilityCosts: Record<UnitType, number>;
-  flatAbilityCost: boolean;
   // MK7.7: hint system (default off; delay in seconds)
   hintEnabled: boolean;
   hintDelaySeconds: number;
@@ -73,6 +75,7 @@ export interface BattleConfig {
   // that side's own match/blast damage (LOW otherwise); likewise strongShapes.
   // Stored independently per side and stamped into logs — NOT derived from
   // prose. A match may be strong for one side and weak for the other.
+  // Alpha §4.7: charge bindings (Program data) remain independent from these.
   strongColors: Record<Side, Color[]>;
   strongShapes: Record<Side, Shape[]>;
 }
@@ -83,7 +86,7 @@ export interface GameState {
   nextId: number;
   nextSeq: number;
   hp: Record<Side, number>;
-  units: Record<Side, UnitState[]>; // 4 per side, in UNIT_ORDER
+  units: Record<Side, UnitState[]>; // one slot per resolved Program, content order
   shakeCharge: number; // player only — enemy has no board-shake
   phase: Phase;
   winner: Side | null;
@@ -129,33 +132,40 @@ export type GameEvent =
   | { t: 'board'; grid: TileView[][] }
   | { t: 'setTile'; p: Pt; view: TileView }
   | { t: 'countdown'; p: Pt; value: number }
-  | { t: 'detonate'; p: Pt }
+  // Alpha: the blast footprint comes from the bomb's own data, so the event
+  // carries the in-bounds cells for the renderer's flash overlay.
+  | { t: 'detonate'; p: Pt; cells: Pt[] }
   // damage carries metrics enrichment (MK2.3/MK7): source = the CAUSAL bucket
   // (the action that initiated the chain, not the mechanism); buffBonus = the
   // buff-tile portion of `amount` (subtracted out into the disjoint buffer
   // bucket, MK7.4); colorRaw/shapeRaw = pre-floor per-axis match damage
   // (MK7.5); cascadeRaw = pre-floor damage from tiles destroyed exclusively
-  // by STOCHASTIC refill matches (MK7.3 cross-cut)
-  | { t: 'damage'; target: Side; amount: number; label: string; source: 'match' | 'attacker' | 'bomb'; critExtra?: number; buffBonus?: number; colorRaw?: number; shapeRaw?: number; cascadeRaw?: number }
+  // by STOCHASTIC refill matches (MK7.3 cross-cut); programId = the acting
+  // Program for ability-caused damage (attacker fire / bomb detonation).
+  | { t: 'damage'; target: Side; amount: number; label: string; source: 'match' | 'attacker' | 'bomb'; programId?: string; critExtra?: number; buffBonus?: number; colorRaw?: number; shapeRaw?: number; cascadeRaw?: number }
   | { t: 'msg'; text: string }
   | { t: 'over'; winner: Side }
   // metrics/logging-only events (no visual representation; renderer skips them)
   | { t: 'shakeUsed' }
-  // MK9: `name` is the player-facing/log identity (e.g. 'E-Bomb', 'Shielder')
-  // when the enemy unit diverges from the shared type label; unit stays the
-  // canonical UnitType so metrics buckets are unchanged.
-  | { t: 'ability'; side: Side; unit: UnitType; drained?: number; name?: string }
+  // Alpha §7.5/§13.4 — one per parent Function ACTIVATION (the player-paid
+  // event); `fn` is the activated Function, `name` the Program's display name.
+  | { t: 'ability'; side: Side; programId: string; fn: string; name: string }
+  // Alpha §7.5 — one per expanded payload OPERATION (child resolution attempt
+  // / Effect execution). resolved=false is a LEGAL fizzle (no valid target or
+  // placement); unexpected exceptions are implementation failures and
+  // propagate through the failure boundary instead of appearing here.
+  | { t: 'op'; side: Side; programId: string; fnId: string; effectId: EffectId; resolved: boolean; drained?: number }
   // MK9.1/9.2/9.3 — bombs or shield tiles actually placed by one activation
   // (may be fewer than requested if the board lacks legal targets).
-  | { t: 'placed'; side: Side; kind: 'bomb' | 'shield'; count: number }
-  // MK9.3 — one per shield-affected player->enemy damage instance. preShield =
-  // base+buff before absorption; shield = total active enemy shield; prevented
-  // = min(preShield, shield); final = preShield - prevented (the dealt amount).
-  | { t: 'shield'; source: 'match' | 'attacker' | 'bomb'; preShield: number; shield: number; prevented: number; final: number }
-  // MK9.3 — enemy shield tiles removed from the board this event (matched,
+  | { t: 'placed'; side: Side; kind: 'bomb' | 'shield'; count: number; programId: string }
+  // MK9.3 — one per shield-affected damage instance. preShield = base+buff
+  // before absorption; shield = total active defender shield; prevented =
+  // min(preShield, shield); final = preShield - prevented (the dealt amount).
+  | { t: 'shield'; target: Side; source: 'match' | 'attacker' | 'bomb'; preShield: number; shield: number; prevented: number; final: number }
+  // MK9.3 — shield tiles removed from the board this event (matched,
   // cascaded, or blasted away).
   | { t: 'shieldRemoved'; count: number }
-  | { t: 'chargeWaste'; side: Side; unit: UnitType; amount: number }
+  | { t: 'chargeWaste'; side: Side; programId: string; amount: number }
   | { t: 'autoReshuffle' }
   | { t: 'cascadeDepth'; side: Side; depth: number }
   // MK5.6 — per match step: destroyed-tile count and how many of those tiles

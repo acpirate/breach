@@ -7,6 +7,9 @@ import { DEFAULT_BATTLE_CONFIG } from '../src/logic/constants';
 import { Game } from '../src/logic/game';
 import { BattleConfig } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
+import { initContentOrExit } from './dataNode';
+
+initContentOrExit();
 
 const N = 100;
 const TIERS = [100, 500, 2000];

@@ -1,30 +1,39 @@
 // Orchestrator: wires the pure logic layer to the canvas view and DOM dialogs.
-// Owns the interaction flow (title → battle → pause/game-over) but no game rules.
+// Owns the interaction flow (data load → title → battle → pause/game-over)
+// but no game rules.
+//
+// Alpha 0.1.0: startup loads and validates the CSV datasets BEFORE any title
+// or battle initialization (§5.3/§10.4). Any validation error shows a
+// blocking developer-facing failure screen with no bypass; the resolved
+// runtime model is then the single source of truth for every consumer here.
 
 import {
   BOARD_SHAKE_COST,
-  BUFFER_DAMAGE_BONUS,
   CHARGE_PER_TILE_COLOR_MATCH,
   CHARGE_PER_TILE_SHAPE_MATCH,
-  SHIELD_POINTS_PER_TILE,
   DAMAGE_PER_TILE_HIGH_COLOR,
   DAMAGE_PER_TILE_HIGH_SHAPE,
   DAMAGE_PER_TILE_LOW_COLOR,
   DAMAGE_PER_TILE_LOW_SHAPE,
   DAMAGE_PER_TILE_NEUTRAL,
   DEFAULT_BATTLE_CONFIG,
-  ENEMY_UNIT_DEFS,
-  UNIT_DEFS,
-  UnitDef,
-  effectiveCost,
-  unitDisplayName,
 } from './logic/constants';
+import {
+  ResolvedProgram,
+  contentStamp,
+  getContent,
+  programsFor,
+  requiresTarget,
+  setActiveContent,
+} from './logic/data/content';
+import { formatIssue, loadContent } from './logic/data/load';
 import { findBotMove, findHintMove } from './logic/bot';
 import { Game } from './logic/game';
 import { LOG_VERSION } from './logic/logger';
 import { BattleMetrics } from './logic/metrics';
 import { deserializeGame, serializeGame } from './logic/save';
-import { BattleConfig, Color, Pt, Shape, Side, UNIT_ORDER, gridViewOf } from './logic/types';
+import { BattleConfig, Color, Pt, Shape, Side, gridViewOf } from './logic/types';
+import { browserDataFiles } from './dataBrowser';
 import { attachInput } from './render/input';
 import { Hud, View } from './render/view';
 import {
@@ -49,18 +58,18 @@ let selection: Pt | null = null;
 // read when the match commits. Abilities/invalid swaps leave it running.
 let thinkStart: number | null = null;
 let battleStartAt = 0; // wall-clock anchor for this session's battle
-// MK7.7 — hint state: whether a hint fired this turn (logged, excludable from
-// think-time analysis) and the last raw pointer input (idle detection)
+// MK7.7 — hint state
 let hintFiredThisTurn = false;
 let lastInputAt = performance.now();
-// MK3.2: Disabler targeting mode — armed by tapping the charged Disabler;
-// the next tap on an enemy minion fires it, any other tap cancels (free).
-let targeting = false;
+// Targeting mode: which player slot is armed and awaiting an enemy target
+// (Alpha: any Program whose plan leads with the player-targeted Drain).
+let targetingSlot: number | null = null;
 // MK5.4: the menu's battle config — persisted, never implicitly reset. A
 // running battle uses ITS OWN immutable copy (game.state.config), not this.
-let menuConfig: BattleConfig = loadMenuConfig();
+let menuConfig: BattleConfig = DEFAULT_BATTLE_CONFIG;
 
 // canonical value list — safer than field-by-field as the config grows
+// (Alpha: cost fields removed from config; costs are content)
 function configKey(c: BattleConfig): string {
   return JSON.stringify([
     c.enemyMatching,
@@ -71,10 +80,10 @@ function configKey(c: BattleConfig): string {
     c.nmdChargeAwareBot,
     c.playerHp,
     c.enemyHp,
-    UNIT_ORDER.map((t) => c.abilityCosts[t]),
-    c.flatAbilityCost,
     c.hintEnabled,
     c.hintDelaySeconds,
+    c.strongColors,
+    c.strongShapes,
   ]);
 }
 
@@ -95,12 +104,14 @@ function canAct(): boolean {
   return !!game && !busy && !game.state.winner && game.state.phase === 'playerPre';
 }
 
-function specialCount(kind: 'buff' | 'shield', side: Side): number {
+// Sum of active special-tile magnitudes for a side (buff bonus / shield
+// points come from the per-tile data stamped at placement).
+function specialMagnitude(kind: 'buff' | 'shield', side: Side): number {
   if (!game) return 0;
   let n = 0;
   for (const row of game.state.board) {
     for (const t of row) {
-      if (t?.special?.type === kind && t.special.owner === side) n++;
+      if (t?.special?.type === kind && t.special.owner === side) n += t.special.magnitude ?? 0;
     }
   }
   return n;
@@ -110,36 +121,37 @@ function getHud(): Hud | null {
   if (!game) return null;
   const s = game.state;
   const act = canAct();
+  const hacker = programsFor('player');
+  const system = programsFor('enemy');
   return {
     hpPlayer: Math.max(0, s.hp.player),
     hpPlayerMax: s.config.playerHp, // MK6.4: HP lives in the config
     hpEnemy: Math.max(0, s.hp.enemy),
     hpEnemyMax: s.config.enemyHp,
-    programs: s.units.player.map((u) => {
-      const d = UNIT_DEFS[u.type];
-      const cost = effectiveCost(s.config, u.type); // MK7.1
-      return { label: d.label, cost, charge: u.charge, ready: act && u.charge >= cost, color: d.color, shape: d.shape };
+    programs: s.units.player.map((u, i) => {
+      const p = hacker[i];
+      return { label: p.name, cost: p.cost, charge: u.charge, ready: act && u.charge >= p.cost, color: p.colors[0], shape: p.shapes[0] };
     }),
-    minions: s.units.enemy.map((u) => {
-      const d = ENEMY_UNIT_DEFS[u.type]; // MK9.2/9.3: enemy shows E-Bomb/Shielder identities + bindings
-      return { label: d.label, cost: effectiveCost(s.config, u.type), charge: u.charge, ready: false, color: d.color, shape: d.shape };
+    minions: s.units.enemy.map((u, i) => {
+      const p = system[i];
+      return { label: p.name, cost: p.cost, charge: u.charge, ready: false, color: p.colors[0], shape: p.shapes[0] };
     }),
     shakeCharge: s.shakeCharge,
     shakeCost: BOARD_SHAKE_COST,
     shakeReady: act && s.shakeCharge >= BOARD_SHAKE_COST,
-    buffPlayer: specialCount('buff', 'player') * BUFFER_DAMAGE_BONUS,
-    buffEnemy: specialCount('buff', 'enemy') * BUFFER_DAMAGE_BONUS,
-    shieldEnemy: specialCount('shield', 'enemy') * SHIELD_POINTS_PER_TILE, // MK9.3
+    buffPlayer: specialMagnitude('buff', 'player'),
+    buffEnemy: specialMagnitude('buff', 'enemy'),
+    shieldEnemy: specialMagnitude('shield', 'enemy'), // MK9.3
     turn: s.turn,
     canAct: act,
     statusText: s.winner
       ? ''
-      : targeting
-        ? 'Tap an enemy minion to disable it'
+      : targetingSlot !== null
+        ? 'Tap an enemy program to drain it'
         : act
           ? 'Fire abilities, then swap to match'
           : '…',
-    targeting,
+    targeting: targetingSlot !== null,
   };
 }
 
@@ -186,7 +198,7 @@ function metricsElement(m: BattleMetrics): HTMLElement {
   row('BATTLE', true);
   row(`Turns to resolution: ${m.turns}`);
   row(`Match-locks (auto-reshuffles): ${m.autoReshuffles}`);
-  // MK9.3 — enemy Shielder (prevention is NOT damage dealt; reported separately)
+  // MK9.3 — enemy shields (prevention is NOT damage dealt; reported separately)
   row(`Enemy shields — created ${m.enemyShieldCreated}, removed ${m.enemyShieldRemoved}`);
   row(`Shielded hits: ${m.enemyShieldInstances}, damage prevented: ${fmt(m.enemyShieldPrevented)}`);
 
@@ -197,7 +209,7 @@ function metricsElement(m: BattleMetrics): HTMLElement {
     row(`Total damage dealt: ${fmt(sm.totalDamage)}`);
     row(`  match-caused (incl. its cascades): ${fmt(sm.matchDamage)}`);
     row(`  bomb-caused (incl. its cascades): ${fmt(sm.bombDamage)}`);
-    row(`  Attacker: ${fmt(sm.attackerDamage)}`);
+    row(`  Attack: ${fmt(sm.attackerDamage)}`);
     row(`  Buffer added: ${fmt(sm.bufferDamageAdded)}`);
     row(`Cascade (RNG-refill) damage, any cause: ${fmt(sm.cascadeDamage)}`); // MK7.3 cross-cut
     row(`Match damage by axis: color ${fmt(sm.matchDamageColor)} / shape ${fmt(sm.matchDamageShape)}`); // MK7.5
@@ -205,14 +217,17 @@ function metricsElement(m: BattleMetrics): HTMLElement {
     row(`Crit bonus damage (1.5x extra): ${fmt(sm.critExtra)} (${critPct}% of match damage)`);
     row(`Largest single hit: ${fmt(sm.largestHit)}`);
     row(`Biggest round: ${fmt(sm.biggestRound)}`); // MK7.6 swinginess
-    row(`Avg round damage (nonzero rounds): ${sm.roundDamageCount ? fmt(sm.roundDamageSum / sm.roundDamageCount) : '0'}`); // MK7.6 effectiveness
-    row(`Deepest cascade: ${sm.deepestCascade} RNG round${sm.deepestCascade === 1 ? '' : 's'}`); // MK7.2 redefined
+    row(`Avg round damage (nonzero rounds): ${sm.roundDamageCount ? fmt(sm.roundDamageSum / sm.roundDamageCount) : '0'}`);
+    row(`Deepest cascade: ${sm.deepestCascade} RNG round${sm.deepestCascade === 1 ? '' : 's'}`);
     const contPct = sm.tilesDestroyed > 0 ? ((sm.contentionTiles / sm.tilesDestroyed) * 100).toFixed(1) : '0.0';
     row(`Opponent-bound tiles destroyed: ${sm.contentionTiles} of ${sm.tilesDestroyed} (${contPct}%)`);
-    for (const t of UNIT_ORDER) {
-      const u = sm.units[t];
-      const placed = t === 'bomber' ? `, bombs placed ${u.bombsPlaced}` : ''; // MK9.1/9.2
-      row(`${unitDisplayName(side, t)}: fired ${u.fires}, effect ${fmt(u.effect)}, charge wasted ${fmt(u.chargeWasted)}${placed}`);
+    // Alpha §13.4: metrics keyed by stable Program ID; display names joined here
+    for (const p of programsFor(side)) {
+      const u = sm.units[p.id];
+      if (!u) continue;
+      const placed = u.bombsPlaced > 0 ? `, bombs placed ${u.bombsPlaced}` : '';
+      const fizz = u.fizzles > 0 ? `, fizzles ${u.fizzles}` : '';
+      row(`${p.name} [${p.id}]: fired ${u.fires}, effect ${fmt(u.effect)}, charge wasted ${fmt(u.chargeWasted)}${placed}${fizz}`);
     }
   }
 
@@ -237,10 +252,8 @@ function hideDialog(): void {
 }
 
 // MK5.3/MK7.10 — battle config panel (lives in the Settings modal). Persists
-// on every change; "Reset to Defaults" is the only reset. `rerender` rebuilds
-// the hosting modal after a reset so the controls show default values.
-// MK8.2 — grouped into an accordion of native <details> sections (collapsed
-// by default) for scannability; no settings added or removed.
+// on every change; "Reset to Defaults" is the only reset. MK8.2 accordion.
+// Alpha §12.4/12.5: the flat-cost and per-ability-cost controls are REMOVED.
 function configPanel(rerender: () => void): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'config';
@@ -261,7 +274,6 @@ function configPanel(rerender: () => void): HTMLElement {
 
   const modes = section('Game modes');
   const health = section('Starting HP');
-  const costs = section('Ability costs');
   const hints = section('Hints');
   const cascades = section('Cascades');
 
@@ -282,8 +294,7 @@ function configPanel(rerender: () => void): HTMLElement {
   check(modes, 'Hacker color bonus', 'hackerBonusEnabled');
   check(modes, 'Single-axis payout', 'singleAxisPayout');
 
-  // MK6.2 No match damage + MK7.13 addendum sub-option (charge-aware bot,
-  // default on, only meaningful while NMD is on)
+  // MK6.2 No match damage + MK7.13 addendum sub-option
   const nmdRow = document.createElement('label');
   const nmdCb = document.createElement('input');
   nmdCb.type = 'checkbox';
@@ -331,44 +342,6 @@ function configPanel(rerender: () => void): HTMLElement {
   };
   hpInput('Player HP', 'playerHp');
   hpInput('Enemy HP', 'enemyHp');
-
-  // MK7.1 — flat-cost diagnostic + per-ability costs (1-99).
-  // MK8.3 — the per-ability inputs are a SUBSECTION shown only while
-  // flat-cost is OFF (irrelevant while every unit costs 7).
-  const flatRow = document.createElement('label');
-  const flatCb = document.createElement('input');
-  flatCb.type = 'checkbox';
-  flatCb.checked = menuConfig.flatAbilityCost;
-  flatRow.appendChild(flatCb);
-  flatRow.appendChild(document.createTextNode(' Flat ability cost (all 7) — diagnostic'));
-  costs.appendChild(flatRow);
-  const costSub = document.createElement('div');
-  costSub.className = 'suboption';
-  costSub.style.display = menuConfig.flatAbilityCost ? 'none' : '';
-  costs.appendChild(costSub);
-  flatCb.addEventListener('change', () => {
-    menuConfig = { ...menuConfig, flatAbilityCost: flatCb.checked };
-    costSub.style.display = flatCb.checked ? 'none' : '';
-    saveMenuConfig(menuConfig);
-  });
-  for (const t of UNIT_ORDER) {
-    const l = document.createElement('label');
-    l.appendChild(document.createTextNode(`${UNIT_DEFS[t].label} cost `));
-    const n = document.createElement('input');
-    n.type = 'number';
-    n.min = '1';
-    n.max = '99';
-    n.step = '1';
-    n.value = String(menuConfig.abilityCosts[t]);
-    n.addEventListener('change', () => {
-      const v = Math.max(1, Math.min(99, Math.floor(Number(n.value) || 1)));
-      n.value = String(v);
-      menuConfig = { ...menuConfig, abilityCosts: { ...menuConfig.abilityCosts, [t]: v } };
-      saveMenuConfig(menuConfig);
-    });
-    l.appendChild(n);
-    costSub.appendChild(l);
-  }
 
   // MK7.7 — hint system
   const hintRow = document.createElement('label');
@@ -440,7 +413,7 @@ function configPanel(rerender: () => void): HTMLElement {
   reset.className = 'cfgreset';
   reset.textContent = 'Reset to Defaults';
   reset.addEventListener('click', () => {
-    menuConfig = { ...DEFAULT_BATTLE_CONFIG, abilityCosts: { ...DEFAULT_BATTLE_CONFIG.abilityCosts } };
+    menuConfig = { ...DEFAULT_BATTLE_CONFIG };
     saveMenuConfig(menuConfig);
     rerender(); // rebuild the modal with default values
   });
@@ -448,7 +421,8 @@ function configPanel(rerender: () => void): HTMLElement {
   return wrap;
 }
 
-// Read-only config summary (pause panel + divergent-resume acknowledgment)
+// Read-only config summary (pause panel + divergent-resume acknowledgment).
+// Alpha: cost rows removed — costs are content, shown on the Character Sheet.
 function configSummary(c: BattleConfig, heading: string): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'config readonly';
@@ -463,7 +437,6 @@ function configSummary(c: BattleConfig, heading: string): HTMLElement {
     `No match damage: ${c.noMatchDamage ? `ON (${c.nmdChargeAwareBot ? 'charge-aware' : 'classic'} bot)` : 'OFF'}`,
     `Cascade cap: ${c.maxCascadeSteps === null ? 'Infinite' : c.maxCascadeSteps}`,
     `Starting HP: you ${c.playerHp} / enemy ${c.enemyHp}`,
-    `Ability costs: ${c.flatAbilityCost ? 'FLAT 7 (diagnostic)' : UNIT_ORDER.map((t) => `${UNIT_DEFS[t].label} ${c.abilityCosts[t]}`).join(', ')}`,
     `Hints: ${c.hintEnabled ? `ON (${c.hintDelaySeconds}s)` : 'OFF'}`,
   ];
   for (const r of rows) {
@@ -474,9 +447,8 @@ function configSummary(c: BattleConfig, heading: string): HTMLElement {
   return wrap;
 }
 
-// MK6.5 — character sheet: the game's numbers, readable in-game. Built
-// against per-side unit defs because bindings MAY diverge in future
-// experiments — no hardcoded shared table.
+// MK6.5 — character sheet: the game's numbers, readable in-game. Alpha §12.1:
+// names, costs, and bindings come from the RESOLVED DATA.
 const COLOR_NAMES: Record<Color, string> = {
   [Color.Red]: 'Red', [Color.Yellow]: 'Yellow', [Color.Magenta]: 'Magenta',
   [Color.Green]: 'Green', [Color.Cyan]: 'Cyan', [Color.Blue]: 'Blue',
@@ -486,7 +458,7 @@ const SHAPE_NAMES: Record<Shape, string> = {
   [Shape.Diamond]: 'Diamond', [Shape.Star]: 'Star', [Shape.Cross]: 'Cross',
 };
 
-function characterSheet(cfg: BattleConfig, playerDefs: Record<string, UnitDef>, enemyDefs: Record<string, UnitDef>): HTMLElement {
+function characterSheet(cfg: BattleConfig): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'config readonly';
   const row = (text: string, head = false): void => {
@@ -496,37 +468,33 @@ function characterSheet(cfg: BattleConfig, playerDefs: Record<string, UnitDef>, 
     wrap.appendChild(d);
   };
   row('CHARACTER SHEET', true);
-  // MK9.5: player and enemy statistics are visibly separated; each side shows
-  // its OWN strong color/shape (they now diverge — MK9.4). Weak = every other
-  // color/shape. Charge & neutral explanations move to the bottom.
-  const sides: Array<[string, Side, Record<string, UnitDef>]> = [
-    ['YOU', 'player', playerDefs],
-    ['ENEMY', 'enemy', enemyDefs],
+  // MK9.5: player and enemy statistics visibly separated; each side shows its
+  // OWN strong color/shape. Charge & neutral explanations stay at the bottom.
+  const sides: Array<[string, Side]> = [
+    ['YOU', 'player'],
+    ['ENEMY', 'enemy'],
   ];
-  for (const [label, side, defs] of sides) {
+  for (const [label, side] of sides) {
     row(label, true);
     const sc = cfg.strongColors[side];
     const ss = cfg.strongShapes[side];
     row(`Strong colors (${DAMAGE_PER_TILE_HIGH_COLOR} dmg): ${sc.length ? sc.map((c) => COLOR_NAMES[c]).join(', ') : 'none'}`);
     row(`Strong shapes (${DAMAGE_PER_TILE_HIGH_SHAPE} dmg): ${ss.length ? ss.map((s) => SHAPE_NAMES[s]).join(', ') : 'none'}`);
     row(`Weak (all other) colors/shapes: ${DAMAGE_PER_TILE_LOW_COLOR}/${DAMAGE_PER_TILE_LOW_SHAPE} dmg`);
-    for (const t of UNIT_ORDER) {
-      const d = defs[t];
-      // MK7.1: show the EFFECTIVE cost for this battle (config / flat mode)
-      row(`${unitDisplayName(side, t)} — cost ${effectiveCost(cfg, t)} — ${COLOR_NAMES[d.color]} + ${SHAPE_NAMES[d.shape]}`);
+    for (const p of programsFor(side)) {
+      const colors = p.colors.map((c) => COLOR_NAMES[c]).join('/');
+      const shapes = p.shapes.map((s) => SHAPE_NAMES[s]).join('/');
+      row(`${p.name} [${p.id}] — cost ${p.cost} — ${colors} + ${shapes} — ${p.fn.name}`);
     }
   }
   // MK9.5: general charge + neutral explanations LAST, after side-specific info.
   row('GENERAL', true);
-  row(`Charge: +${CHARGE_PER_TILE_COLOR_MATCH} per tile of a unit's bound color, +${CHARGE_PER_TILE_SHAPE_MATCH} per bound shape`);
+  row(`Charge: +${CHARGE_PER_TILE_COLOR_MATCH} per tile of a program's bound color, +${CHARGE_PER_TILE_SHAPE_MATCH} per bound shape`);
   row(`Neutral damage: ${DAMAGE_PER_TILE_NEUTRAL} (matches only other neutrals; refills your Shake)`);
   return wrap;
 }
 
 // MK7.10 — title screen is ACTIONS ONLY: New Game / Continue / Settings.
-// All config lives in the Settings modal (not reachable mid-battle — config
-// is immutable for a battle in progress). No confirm on New Game (standing
-// principle: confirms are reserved for meaningful consequences).
 function showTitle(): void {
   game = null;
   view.clearBoard(); // MK7.11: no ghost board behind the title after Quit
@@ -537,7 +505,7 @@ function showTitle(): void {
   }
   buttons.push(['New Game', () => void startBattle()]);
   buttons.push(['Settings', showSettings]);
-  showDialog('BREACH — PoC', '', buttons);
+  showDialog('BREACH — alpha-0.1.0', '', buttons);
 }
 
 function showSettings(): void {
@@ -550,11 +518,11 @@ function showSettings(): void {
 // MK5.4: `cfg` is supplied by Restart paths (a restart is the same battle —
 // its rules are part of its identity); new games use the menu's config.
 async function startBattle(cfg?: BattleConfig): Promise<void> {
-  clearBattleSave(); // MK4.2: starting fresh wipes any resident save (also the corrupt-save escape hatch)
+  clearBattleSave(); // MK4.2: starting fresh wipes any resident save
   hideDialog();
   game = new Game(cfg ?? menuConfig);
   selection = null;
-  targeting = false;
+  targetingSlot = null;
   battleStartAt = Date.now();
   view.reset(gridViewOf(game.state.board));
   view.setSelection(null);
@@ -574,7 +542,7 @@ async function resumeBattle(): Promise<void> {
   hideDialog();
   game = g;
   selection = null;
-  targeting = false;
+  targetingSlot = null;
   battleStartAt = Date.now(); // wall-clock counts this session (MK6.6 discretion)
   view.reset(gridViewOf(game.state.board));
   view.setSelection(null);
@@ -583,9 +551,7 @@ async function resumeBattle(): Promise<void> {
   await view.play([{ t: 'msg', text: `Battle resumed — turn ${game.state.turn}` }]);
   endBusy();
   // MK5.4: the save's config is authoritative for this battle. If it differs
-  // from the current menu config, force an acknowledgment — auto-open the
-  // config panel; the player must dismiss it to proceed (the overlay blocks
-  // all board/ability input until then). Only when they actually differ.
+  // from the current menu config, force an acknowledgment.
   if (!configsEqual(game.state.config, menuConfig)) {
     showDialog(
       'BATTLE CONFIG',
@@ -598,7 +564,7 @@ async function resumeBattle(): Promise<void> {
 
 // MK4: after every completed action — drain turn logs, then autosave (stable
 // point) or, the moment the battle is over, clear the save and append the
-// Tier 1 metrics log entry.
+// Tier 1 metrics log entry (with the Alpha content-identity stamp, §13.2).
 function afterAction(): void {
   if (!game) return;
   appendTurnLogs(game.drainTurnLogs());
@@ -608,6 +574,7 @@ function afterAction(): void {
       v: LOG_VERSION,
       battleId: game.state.battleId,
       config: { ...game.state.config }, // MK5.5 — config stamp (HP included)
+      content: contentStamp(), // §13.2 — loaded-content identity
       endedAt: new Date().toISOString(),
       winner: game.state.winner,
       wallClockMs: Date.now() - battleStartAt, // MK6.6
@@ -622,8 +589,7 @@ function maybeGameOver(): void {
   if (!game?.state.winner) return;
   busy = true; // lock input for good
   const won = game.state.winner === 'player';
-  // MK5.4: Restart ALWAYS reuses the exact config of the battle just played,
-  // regardless of the current menu config
+  // MK5.4: Restart ALWAYS reuses the exact config of the battle just played
   const cfg = { ...game.state.config };
   showDialog(
     won ? 'VICTORY' : 'DEFEAT',
@@ -640,8 +606,7 @@ function maybeGameOver(): void {
 
 async function doSwap(a: Pt, b: Pt): Promise<void> {
   if (!game) return;
-  // MK6.6: think-time = input-available -> this committed move (only recorded
-  // if the swap matches; the clock keeps running through invalid attempts)
+  // MK6.6: think-time = input-available -> this committed move
   const thinkMs = thinkStart !== null ? performance.now() - thinkStart : undefined;
   busy = true;
   view.setHint(null);
@@ -653,162 +618,200 @@ async function doSwap(a: Pt, b: Pt): Promise<void> {
     afterAction();
     endBusy(); // move committed: next turn's think clock starts fresh
   } else {
-    busy = false; // invalid swap: the think clock keeps running (Q4)
+    busy = false; // invalid swap: the think clock keeps running
   }
   maybeGameOver();
 }
 
-attachInput(canvas, view, {
-  onTap(p: Pt): void {
-    if (!canAct()) return;
-    if (targeting) {
-      targeting = false; // tap elsewhere cancels targeting (consumes the tap)
-      return;
-    }
-    if (selection && selection.x === p.x && selection.y === p.y) {
-      selection = null; // tap the selected tile again: deselect
-    } else if (selection && Math.abs(selection.x - p.x) + Math.abs(selection.y - p.y) === 1) {
-      const a = selection;
+// ---- startup: load + validate data BEFORE any title/battle init (§10.4) ----
+
+function showDataFailure(errors: number, warnings: number, lines: string[]): void {
+  // Blocking developer-facing failure screen: concise count, details in the
+  // console, NO bypass button (§10.4).
+  const list = document.createElement('div');
+  list.className = 'metrics';
+  for (const l of lines.slice(0, 20)) {
+    const d = document.createElement('div');
+    d.textContent = l;
+    list.appendChild(d);
+  }
+  if (lines.length > 20) {
+    const d = document.createElement('div');
+    d.textContent = `… ${lines.length - 20} more — see the browser console for the full validation report.`;
+    list.appendChild(d);
+  }
+  showDialog(
+    'DATA LOAD FAILED',
+    `${errors} error(s), ${warnings} warning(s). Startup blocked — fix the CSV datasets and reload. Full report in the browser console.`,
+    [],
+    list,
+  );
+}
+
+function boot(): void {
+  menuConfig = loadMenuConfig();
+
+  attachInput(canvas, view, {
+    onTap(p: Pt): void {
+      if (!canAct()) return;
+      if (targetingSlot !== null) {
+        targetingSlot = null; // tap elsewhere cancels targeting (consumes the tap)
+        return;
+      }
+      if (selection && selection.x === p.x && selection.y === p.y) {
+        selection = null; // tap the selected tile again: deselect
+      } else if (selection && Math.abs(selection.x - p.x) + Math.abs(selection.y - p.y) === 1) {
+        const a = selection;
+        selection = null;
+        view.setSelection(null);
+        void doSwap(a, p);
+        return;
+      } else {
+        selection = p; // no selection, or non-adjacent tap: (move) selection
+      }
+      view.setSelection(selection);
+    },
+    onDrag(a: Pt, b: Pt): void {
+      if (!canAct()) return;
+      if (targetingSlot !== null) {
+        targetingSlot = null;
+        return;
+      }
       selection = null;
       view.setSelection(null);
-      void doSwap(a, p);
-      return;
-    } else {
-      selection = p; // no selection, or non-adjacent tap: (move) selection
-    }
-    view.setSelection(selection);
-  },
-  onDrag(a: Pt, b: Pt): void {
-    if (!canAct()) return;
-    if (targeting) {
-      targeting = false;
-      return;
-    }
-    selection = null;
-    view.setSelection(null);
-    void doSwap(a, b);
-  },
-  onProgram(i: number): void {
-    if (!canAct() || !game) return;
-    if (targeting) {
-      targeting = false; // tapping any program (incl. Disabler again) cancels
-      return;
-    }
-    const u = game.state.units.player[i];
-    if (u.type === 'disabler') {
-      // MK3.2: charged Disabler arms targeting mode instead of firing blind.
-      // MK8.1: gate on the EFFECTIVE cost (config/flat mode), not the static
-      // UNIT_DEFS cost — charge caps at effectiveCost, so a static-22 check
-      // could never pass under flat-cost and the Disabler was unarmable.
-      if (u.charge >= effectiveCost(game.state.config, u.type)) targeting = true;
-      return;
-    }
-    const events = game.fireProgram(i);
-    if (!events.length) return;
-    busy = true;
-    void view.play(events).then(() => {
-      afterAction();
-      busy = false;
-      maybeGameOver();
-    });
-  },
-  onMinion(i: number): void {
-    if (!canAct() || !game || !targeting) return;
-    targeting = false;
-    const events = game.fireProgram(UNIT_ORDER.indexOf('disabler'), i);
-    if (!events.length) return;
-    busy = true;
-    void view.play(events).then(() => {
-      afterAction();
-      busy = false;
-      maybeGameOver();
-    });
-  },
-  onShake(): void {
-    if (!canAct() || !game) return;
-    if (targeting) {
-      targeting = false;
-      return;
-    }
-    const events = game.fireShake();
-    if (!events.length) return;
-    busy = true;
-    void view.play(events).then(() => {
-      afterAction();
-      busy = false;
-      maybeGameOver();
-    });
-  },
-  onMenu(): void {
-    // Pause menu only in the make-a-match phase, never mid-resolution (spec 1.12).
-    // MK5.3: active config read-only; MK6.5: character sheet alongside it;
-    // MK5.4: mid-battle Reset reuses this battle's config (same identity).
-    if (!canAct() || !game) return;
-    targeting = false;
-    const cfg = { ...game.state.config };
-    const panels = document.createElement('div');
-    panels.className = 'panelscroll';
-    panels.appendChild(configSummary(cfg, 'ACTIVE BATTLE CONFIG'));
-    panels.appendChild(characterSheet(cfg, UNIT_DEFS, ENEMY_UNIT_DEFS)); // MK9.4: sides diverge
-    showDialog(
-      'PAUSED',
-      '',
-      [
-        ['Resume', hideDialog],
-        ['Reset', () => void startBattle(cfg)],
-        ['Quit', showTitle],
-      ],
-      panels,
-    );
-  },
-});
+      void doSwap(a, b);
+    },
+    onProgram(i: number): void {
+      if (!canAct() || !game) return;
+      if (targetingSlot !== null) {
+        targetingSlot = null; // tapping any program (incl. the armed one) cancels
+        return;
+      }
+      const u = game.state.units.player[i];
+      const prog: ResolvedProgram = programsFor('player')[i];
+      if (requiresTarget(prog)) {
+        // A targeted Program (plan leads with player-choice Drain) arms
+        // targeting mode instead of firing blind; gate on the data cost.
+        if (u.charge >= prog.cost) targetingSlot = i;
+        return;
+      }
+      const events = game.fireProgram(i);
+      if (!events.length) return;
+      busy = true;
+      void view.play(events).then(() => {
+        afterAction();
+        busy = false;
+        maybeGameOver();
+      });
+    },
+    onMinion(i: number): void {
+      if (!canAct() || !game || targetingSlot === null) return;
+      const slot = targetingSlot;
+      targetingSlot = null;
+      const events = game.fireProgram(slot, i);
+      if (!events.length) return;
+      busy = true;
+      void view.play(events).then(() => {
+        afterAction();
+        busy = false;
+        maybeGameOver();
+      });
+    },
+    onShake(): void {
+      if (!canAct() || !game) return;
+      if (targetingSlot !== null) {
+        targetingSlot = null;
+        return;
+      }
+      const events = game.fireShake();
+      if (!events.length) return;
+      busy = true;
+      void view.play(events).then(() => {
+        afterAction();
+        busy = false;
+        maybeGameOver();
+      });
+    },
+    onMenu(): void {
+      // Pause menu only in the make-a-match phase, never mid-resolution.
+      if (!canAct() || !game) return;
+      targetingSlot = null;
+      const cfg = { ...game.state.config };
+      const panels = document.createElement('div');
+      panels.className = 'panelscroll';
+      panels.appendChild(configSummary(cfg, 'ACTIVE BATTLE CONFIG'));
+      panels.appendChild(characterSheet(cfg)); // Alpha: built from resolved data
+      showDialog(
+        'PAUSED',
+        '',
+        [
+          ['Resume', hideDialog],
+          ['Reset', () => void startBattle(cfg)],
+          ['Quit', showTitle],
+        ],
+        panels,
+      );
+    },
+  });
 
-showTitle();
+  showTitle();
 
-// MK7.7 — hint timer: after hintDelaySeconds with no input during the
-// make-a-match phase, highlight an available 4-match (if any). Fires at most
-// once per turn; the fact that it fired is logged with the turn.
-window.addEventListener('pointerdown', () => {
-  lastInputAt = performance.now();
-});
-setInterval(() => {
-  if (!game || !canAct() || hintFiredThisTurn) return;
-  const cfg = game.state.config;
-  if (!cfg.hintEnabled || thinkStart === null) return;
-  const idleSince = Math.max(thinkStart, lastInputAt);
-  if (performance.now() - idleSince < cfg.hintDelaySeconds * 1000) return;
-  const mv = findHintMove(game.state.board);
-  if (mv) {
-    view.setHint(mv);
-    hintFiredThisTurn = true;
-  }
-}, 400);
-
-// MK7.8 — debug-only find-match button (dev server builds only; import.meta
-// guards it out of production bundles entirely). MK8.4: docked just below the
-// "Buffs —" status line — its old fixed bottom-left spot overlapped (and
-// blocked taps on) the lower-left board tile.
-if (import.meta.env.DEV) {
-  const b = document.createElement('button');
-  b.id = 'dbgfind';
-  b.textContent = 'find match';
-  b.addEventListener('click', () => {
-    if (!game || !canAct()) return;
-    const mv = findBotMove(game.state.board);
+  // MK7.7 — hint timer
+  window.addEventListener('pointerdown', () => {
+    lastInputAt = performance.now();
+  });
+  setInterval(() => {
+    if (!game || !canAct() || hintFiredThisTurn) return;
+    const cfg = game.state.config;
+    if (!cfg.hintEnabled || thinkStart === null) return;
+    const idleSince = Math.max(thinkStart, lastInputAt);
+    if (performance.now() - idleSince < cfg.hintDelaySeconds * 1000) return;
+    const mv = findHintMove(game.state.board);
     if (mv) {
       view.setHint(mv);
-      hintFiredThisTurn = true; // counts as assisted for think-time honesty
+      hintFiredThisTurn = true;
     }
-  });
-  document.body.appendChild(b);
-  const placeDbg = (): void => {
-    const r = canvas.getBoundingClientRect();
-    const a = view.debugAnchor;
-    b.style.left = `${Math.round(r.left + a.x)}px`;
-    b.style.top = `${Math.round(r.top + a.y)}px`;
-  };
-  placeDbg();
-  window.addEventListener('resize', placeDbg);
+  }, 400);
+
+  // MK7.8 — debug-only find-match button (dev builds only)
+  if (import.meta.env.DEV) {
+    const b = document.createElement('button');
+    b.id = 'dbgfind';
+    b.textContent = 'find match';
+    b.addEventListener('click', () => {
+      if (!game || !canAct()) return;
+      const mv = findBotMove(game.state.board);
+      if (mv) {
+        view.setHint(mv);
+        hintFiredThisTurn = true; // counts as assisted for think-time honesty
+      }
+    });
+    document.body.appendChild(b);
+    const placeDbg = (): void => {
+      const r = canvas.getBoundingClientRect();
+      const a = view.debugAnchor;
+      b.style.left = `${Math.round(r.left + a.x)}px`;
+      b.style.top = `${Math.round(r.top + a.y)}px`;
+    };
+    placeDbg();
+    window.addEventListener('resize', placeDbg);
+  }
+}
+
+{
+  const result = loadContent(browserDataFiles());
+  const lines = result.issues.map(formatIssue);
+  if (result.content) {
+    setActiveContent(result.content);
+    if (result.warnings > 0) {
+      console.warn(`[breach] data loaded with ${result.warnings} warning(s):\n${lines.join('\n')}`);
+    }
+    console.info(`[breach] content loaded: ${getContent().fingerprint} (${LOG_VERSION})`);
+    boot();
+  } else {
+    console.error(`[breach] DATA VALIDATION FAILED — ${result.errors} error(s), ${result.warnings} warning(s):\n${lines.join('\n')}`);
+    showDataFailure(result.errors, result.warnings, lines);
+  }
 }
 
 // MK4.3 console-dump helpers (sanctioned log access — no viewing UI):

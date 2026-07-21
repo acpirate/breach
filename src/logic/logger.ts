@@ -3,17 +3,19 @@
 // there is no second pipeline). Pure data in, pure data out — persistence is
 // the platform adapter's job (src/storage.ts in the browser).
 //
-// Tier 1: one MetricLogEntry per completed battle (final metrics).
+// Tier 1: one MetricLogEntry per completed battle (final metrics + the
+//         Alpha content-identity stamp, §13.2).
 // Tier 2: one TurnLogEntry per game turn — the actions taken and their
-//         outcome, enough to reconstruct the turn without a board snapshot.
-// Tier 3 (full board snapshots): PARKED — deliberately not built.
+//         outcome; stamps the content fingerprint so entries stay
+//         attributable without duplicating the full content identity.
 
+import { ContentStamp, GAME_VERSION, getContent } from './data/content';
 import { BattleMetrics } from './metrics';
 import { BattleConfig, GameEvent, GameState, Side, opponentOf } from './types';
 
-// Version tag stamped on every log entry (designer-set; placeholder scheme).
-// Older-version entries remain in the logs until explicitly cleared.
-export const LOG_VERSION = 'mk7';
+// Version tag stamped on every log entry. Alpha 0.1.0: no active output path
+// may continue to emit a stale MK tag (§13.1).
+export const LOG_VERSION = GAME_VERSION;
 
 // Log-size caps — directly controlled here, comfortably under the ~5MB
 // localStorage quota (entries are a few hundred bytes each). The storage
@@ -30,6 +32,7 @@ interface SideDamage {
 
 export interface TurnLogEntry {
   v: string; // LOG_VERSION
+  fp: string; // content fingerprint (§13.2 attribution, compact form)
   battleId: string;
   config: BattleConfig; // MK5.5 — active config; entries are uninterpretable without it
   turn: number;
@@ -39,15 +42,16 @@ export interface TurnLogEntry {
   reshuffles: number;
   hpAfter: Record<Side, number>;
   chargesAfter: { player: number[]; enemy: number[]; shake: number };
-  thinkMs?: number; // MK6.6 — RAW think-time for this turn's committed move (no aggregation)
-  hintShown?: boolean; // MK7.7 — a hint fired before this turn's move (exclude from think-time analysis)
+  thinkMs?: number; // MK6.6 — RAW think-time for this turn's committed move
+  hintShown?: boolean; // MK7.7
   result?: Side; // present on a battle's final entry: who won
 }
 
 export interface MetricLogEntry {
   v: string; // LOG_VERSION
   battleId: string;
-  config: BattleConfig; // MK5.5 — active config stamp (HP included as of MK6.4)
+  config: BattleConfig; // MK5.5 — active config stamp (HP included)
+  content: ContentStamp; // §13.2 — loaded-content identity
   endedAt: string; // ISO timestamp
   winner: Side;
   wallClockMs?: number; // MK6.6 — total battle wall-clock (this session)
@@ -67,6 +71,7 @@ export class TurnLogger {
   private fresh(state: GameState): TurnLogEntry {
     return {
       v: LOG_VERSION,
+      fp: getContent().fingerprint,
       battleId: this.battleId,
       config: { ...state.config },
       turn: state.turn,
@@ -80,8 +85,6 @@ export class TurnLogger {
   }
 
   // Consume one event batch; returns any turn entries finalized by it.
-  // (The turn counter advances at the end of the enemy phase, so a batch's
-  // events always belong to the entry opened before it.)
   consume(state: GameState, events: GameEvent[]): TurnLogEntry[] {
     if (!this.current) this.current = this.fresh(state);
     const e = this.current;
@@ -94,8 +97,13 @@ export class TurnLogger {
           e.actions.push('player board-shake');
           break;
         case 'ability':
-          // MK9: prefer the player-facing identity (E-Bomb / Shielder) when set.
-          e.actions.push(`${ev.side} fired ${ev.name ?? ev.unit}${ev.drained !== undefined ? ` (drained ${ev.drained})` : ''}`);
+          // Alpha: one action per parent Function activation, by display name.
+          e.actions.push(`${ev.side} fired ${ev.name} [${ev.fn}]`);
+          break;
+        case 'op':
+          // §7.5: expanded ops log their outcome (drain amounts, fizzles).
+          if (ev.drained !== undefined) e.actions.push(`${ev.side} ${ev.effectId} drained ${ev.drained}`);
+          else if (!ev.resolved) e.actions.push(`${ev.side} ${ev.effectId} fizzled (${ev.fnId})`);
           break;
         case 'placed':
           if (ev.count > 0) e.actions.push(`${ev.side} placed ${ev.count} ${ev.kind}${ev.count === 1 ? '' : 's'}`);

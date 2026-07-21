@@ -5,7 +5,8 @@
 // first valid move. No look-ahead, no board evaluation — this tier doubles as
 // the enemy's difficulty knob later (future work, not a setting now).
 
-import { BOARD_HEIGHT, BOARD_WIDTH, unitDefsFor } from './constants';
+import { BOARD_HEIGHT, BOARD_WIDTH } from './constants';
+import { programsFor } from './data/content';
 import { swap } from './board';
 import { detectMatches } from './match';
 import { BattleConfig, Board, Pt, Side } from './types';
@@ -38,13 +39,15 @@ export function findBotMove(board: Board): { a: Pt; b: Pt } | null {
 // This tier scores each valid move by how many matched tiles feed the mover's
 // unit bindings (color or shape), i.e. it matches for CHARGE. Still one dumb
 // selection rule — the bot remains a floor indicator.
-// MK9.4: bindings now differ per side, so the scorer uses the ACTING side's
-// bindings (the harness drives the player; the enemy's own matching turn
-// passes 'enemy').
+// MK9.4: bindings may differ per side, so the scorer uses the ACTING side's
+// resolved Program bindings (Alpha: from the loaded content, not tables).
 export function findChargeMove(board: Board, side: Side = 'player'): { a: Pt; b: Pt } | null {
-  const defs = unitDefsFor(side);
-  const boundColors = new Set(Object.values(defs).map((d) => d.color));
-  const boundShapes = new Set(Object.values(defs).map((d) => d.shape));
+  const boundColors = new Set<number>();
+  const boundShapes = new Set<number>();
+  for (const p of programsFor(side)) {
+    for (const c of p.colors) boundColors.add(c);
+    for (const s of p.shapes) boundShapes.add(s);
+  }
   const dirs = [{ dx: 1, dy: 0 }, { dx: 0, dy: 1 }];
   let best: { a: Pt; b: Pt } | null = null;
   let bestScore = -1;

@@ -7,7 +7,7 @@
 import { COLOR_COUNT, DEFAULT_BATTLE_CONFIG, SHAPE_COUNT } from './logic/constants';
 import { MAX_METRIC_LOG_ENTRIES, MAX_TURN_LOG_ENTRIES, MetricLogEntry, TurnLogEntry } from './logic/logger';
 import { isValidStrongRecord } from './logic/save';
-import { BattleConfig, Color, Shape, Side, UNIT_ORDER } from './logic/types';
+import { BattleConfig, Color, Shape, Side } from './logic/types';
 
 const SAVE_KEY = 'breach:save';
 const METRICS_LOG_KEY = 'breach:log:metrics';
@@ -68,15 +68,12 @@ export function clearBattleSave(): void {
 // ---- MK5.4 menu-config persistence (persists across sessions; nothing
 // resets it implicitly — "Reset to Defaults" in the UI is the only reset) ----
 
-// MK8.3/MK9.4: stored-config format version. Migrations are conservative and
-// field-scoped so a user's intentional settings survive:
-//   • pre-MK8 configs (no stamp at all) adopt the MK8 defaults for the fields
-//     whose defaults changed then (flat-cost ON, HP 150/150);
-//   • any config lacking well-formed per-side strong bindings gets the MK9
-//     defaults for those fields only.
-// Everything else is preserved, and the stamp is rewritten so migration never
-// re-runs. (Approved deviation from MK5.4's "nothing resets it implicitly.")
-const MENU_CONFIG_VERSION = 3;
+// Alpha 0.1.0 (cfgV 4): the flat-cost and per-ability-cost fields are REMOVED
+// from BattleConfig (§4.3-4.5). Obsolete persisted cost settings from earlier
+// builds are ignored without crashing — the migration simply does not copy
+// them; every surviving field is preserved. Pre-MK8 stampless configs and
+// missing strong bindings migrate as before.
+const MENU_CONFIG_VERSION = 4;
 
 function cloneStrong<T extends Color | Shape>(r: Record<Side, T[]>): Record<Side, T[]> {
   return { player: [...r.player], enemy: [...r.enemy] };
@@ -95,12 +92,9 @@ export function loadMenuConfig(): BattleConfig {
       !(c.maxCascadeSteps === null || (Number.isInteger(c.maxCascadeSteps) && c.maxCascadeSteps >= 0 && c.maxCascadeSteps <= 9)) ||
       !(Number.isInteger(c.playerHp) && c.playerHp >= 1 && c.playerHp <= 9999) ||
       !(Number.isInteger(c.enemyHp) && c.enemyHp >= 1 && c.enemyHp <= 9999) ||
-      typeof c.flatAbilityCost !== 'boolean' ||
       typeof c.hintEnabled !== 'boolean' ||
       typeof c.nmdChargeAwareBot !== 'boolean' ||
-      !(Number.isInteger(c.hintDelaySeconds) && c.hintDelaySeconds >= 1 && c.hintDelaySeconds <= 60) ||
-      !c.abilityCosts ||
-      UNIT_ORDER.some((t) => !(Number.isInteger(c.abilityCosts[t]) && c.abilityCosts[t] >= 1 && c.abilityCosts[t] <= 99))
+      !(Number.isInteger(c.hintDelaySeconds) && c.hintDelaySeconds >= 1 && c.hintDelaySeconds <= 60)
     ) {
       return { ...DEFAULT_BATTLE_CONFIG };
     }
@@ -112,13 +106,11 @@ export function loadMenuConfig(): BattleConfig {
       noMatchDamage: c.noMatchDamage,
       playerHp: c.playerHp,
       enemyHp: c.enemyHp,
-      abilityCosts: { ...c.abilityCosts },
-      flatAbilityCost: c.flatAbilityCost,
       hintEnabled: c.hintEnabled,
       hintDelaySeconds: c.hintDelaySeconds,
       nmdChargeAwareBot: c.nmdChargeAwareBot,
       // MK9.4: use stored strong bindings when well-formed; otherwise fill from
-      // defaults (the MK9 migration for older configs that predate them).
+      // defaults (migration for older configs that predate them).
       strongColors: isValidStrongRecord(c.strongColors, COLOR_COUNT)
         ? cloneStrong(c.strongColors)
         : cloneStrong(DEFAULT_BATTLE_CONFIG.strongColors),
@@ -128,13 +120,13 @@ export function loadMenuConfig(): BattleConfig {
     };
     if (c.cfgV === undefined) {
       // pre-MK8 config (never stamped): adopt the MK8.3 defaults for the fields
-      // whose defaults changed then. Post-MK8 configs (cfgV >= 2) keep their own.
-      cfg.flatAbilityCost = DEFAULT_BATTLE_CONFIG.flatAbilityCost;
+      // whose defaults changed then. Post-MK8 configs keep their own.
       cfg.playerHp = DEFAULT_BATTLE_CONFIG.playerHp;
       cfg.enemyHp = DEFAULT_BATTLE_CONFIG.enemyHp;
     }
     if (c.cfgV !== MENU_CONFIG_VERSION) {
-      // strong-binding fill (above) + re-stamp so migration never re-runs
+      // Alpha migration: obsolete cost fields (if present) are dropped by the
+      // explicit field copy above; re-stamp so migration never re-runs.
       saveMenuConfig(cfg);
     }
     return cfg;
@@ -154,7 +146,9 @@ export function saveMenuConfig(c: BattleConfig): void {
 // ---- MK4.3 log persistence ----
 
 function postToSink(kind: 'metrics' | 'turn', entry: unknown): void {
-  if (!import.meta.env.DEV) return; // dev-server sink only exists under `npm run dev`
+  // dev-server sink only exists under `npm run dev`; guarded so non-Vite
+  // runtimes (tests) can import this module safely
+  if (!(import.meta as { env?: { DEV?: boolean } }).env?.DEV) return;
   void fetch('/__breach/log', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

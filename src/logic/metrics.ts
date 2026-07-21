@@ -1,71 +1,66 @@
 // MK2.3 — Per-battle metrics, collected in the PURE LOGIC LAYER.
 // A collector consumes the same GameEvent stream the resolver already emits
-// (enriched with source/crit/waste data) and accumulates counters. No gameplay
-// effect, no rendering dependency — headless batch runs read these directly.
+// and accumulates counters. No gameplay effect, no rendering dependency.
+//
+// Alpha 0.1.0 (§13.4): per-unit metrics are keyed by STABLE PROGRAM ID (the
+// display name joins at presentation time), and composite execution
+// distinguishes parent Function activations (fires) from expanded payload
+// operations (ops) and their legal fizzles (§7.5). Child Functions are never
+// counted as separately paid parent activations.
 
-import { GameEvent, Side, UNIT_ORDER, UnitType, opponentOf } from './types';
+import { programsFor } from './data/content';
+import { GameEvent, Side, opponentOf } from './types';
 
 export interface UnitMetrics {
-  fires: number;
-  // "effect" per unit type (designer-confirmed definitions):
-  //   attacker → direct damage dealt
-  //   bomber   → total detonation damage from this side's bombs
-  //   buffer   → total bonus damage its buff tiles added to damage events
-  //   disabler → total charge drained from opponent units
+  fires: number; // parent Function activations (player-paid events)
+  ops: number; // expanded payload operations attempted (Effect executions)
+  fizzles: number; // ops that legally fizzled (no valid target/placement)
+  // "effect" per Program (aggregate of its ability-caused contribution):
+  //   EFFECT_ATTACK  → direct damage dealt (incl. its share after shields)
+  //   EFFECT_BOMB    → detonation damage from this Program's bombs (+ chains)
+  //   EFFECT_BUFF    → bonus damage its buff tiles added to damage events
+  //   EFFECT_DRAIN   → total charge drained from opponent Programs
   effect: number;
-  chargeWasted: number; // charge granted but discarded at the cost cap
-  // MK9.1/9.2 — bomber only: total bombs successfully placed across all
-  // activations (2/activation for the player, 1 for the enemy E-Bomb).
-  bombsPlaced: number;
+  chargeWasted: number; // charge granted but discarded at the cap
+  bombsPlaced: number; // EFFECT_BOMB deployments that actually placed a bomb
 }
 
 export interface SideMetrics {
   totalDamage: number;
   // MK7.3/7.4 — FOUR DISJOINT causal buckets: match + bomb + attacker +
-  // bufferDamageAdded === totalDamage, exactly. Each damage event's buff
-  // portion is subtracted out of its causal bucket into the buffer bucket;
-  // bomb-caused settling and cascades credit to bomb, not match.
+  // bufferDamageAdded === totalDamage, exactly.
   matchDamage: number;
   attackerDamage: number;
   bombDamage: number;
-  // MK7.3 cross-cutting (overlaps the buckets, does NOT sum with them):
-  // pre-floor damage from tiles destroyed exclusively by stochastic refill
-  // matches, regardless of cause — "how much is unearned RNG?"
+  // MK7.3 cross-cutting (overlaps the buckets, does NOT sum with them)
   cascadeDamage: number;
-  // MK7.5 — behavioral split of match-cause damage by paying axis (pre-floor
-  // raw; neutral-tile damage belongs to neither axis)
+  // MK7.5 — behavioral split of match-cause damage by paying axis
   matchDamageColor: number;
   matchDamageShape: number;
   // MK7.6 — per-round (per game turn) damage: ceiling and baseline
   biggestRound: number;
   roundDamageSum: number; // over rounds where this side dealt > 0
   roundDamageCount: number;
-  // Crit metric: only the portion ADDED by the 1.5x multiplier
-  // (sum of tile base x 0.5 for crit-multiplied tiles, measured pre-floor).
   critExtra: number;
   largestHit: number; // biggest single damage event (match step, ability, or bomb)
-  deepestCascade: number; // max steps in one move/detonation (1 = no cascading)
-  // MK5.6 — charge-source contention: of the tiles this side destroyed in
-  // match steps, how many were bound (by color or shape) to an opposing unit
+  deepestCascade: number;
+  // MK5.6 — charge-source contention
   tilesDestroyed: number;
   contentionTiles: number;
-  // MK6.7 — buffer damage added: sum over damage events of (dealt − what
-  // would have been dealt with zero active buff stacks). Stacking-safe.
+  // MK6.7 — buffer damage added (disjoint bucket)
   bufferDamageAdded: number;
-  units: Record<UnitType, UnitMetrics>;
+  units: Record<string, UnitMetrics>; // keyed by stable Program ID
 }
 
 export interface BattleMetrics {
   turns: number;
-  autoReshuffles: number; // match-lock count: automatic deadlock reshuffles fired
+  autoReshuffles: number;
   winner: Side | null;
-  // MK6.6 — RAW per-turn think-times (input-available -> move-committed),
-  // never pre-aggregated; medians are computed at display/analysis time
   thinkTimesMs: number[];
-  hintsShown: number; // MK7.7 — hint-assisted turns are excludable from think-time analysis
-  // MK9.3 — enemy Shielder instrumentation (battle-level; shields are enemy-
-  // only). `prevented` is damage absorbed, NOT damage dealt — it is never added
-  // to any damage-source bucket.
+  hintsShown: number;
+  // MK9.3 — Shielder instrumentation. Alpha data places shields only on the
+  // System side; these track ENEMY-owned shields (prevention is NOT damage
+  // dealt and never enters a damage-source bucket).
   enemyShieldCreated: number;
   enemyShieldRemoved: number;
   enemyShieldInstances: number; // player->enemy damage instances that hit active shield
@@ -73,9 +68,11 @@ export interface BattleMetrics {
   sides: Record<Side, SideMetrics>;
 }
 
-function emptySide(): SideMetrics {
-  const units = {} as Record<UnitType, UnitMetrics>;
-  for (const t of UNIT_ORDER) units[t] = { fires: 0, effect: 0, chargeWasted: 0, bombsPlaced: 0 };
+const emptyUnit = (): UnitMetrics => ({ fires: 0, ops: 0, fizzles: 0, effect: 0, chargeWasted: 0, bombsPlaced: 0 });
+
+function emptySide(side: Side): SideMetrics {
+  const units: Record<string, UnitMetrics> = {};
+  for (const p of programsFor(side)) units[p.id] = emptyUnit();
   return {
     totalDamage: 0,
     matchDamage: 0,
@@ -108,8 +105,23 @@ export function createBattleMetrics(): BattleMetrics {
     enemyShieldRemoved: 0,
     enemyShieldInstances: 0,
     enemyShieldPrevented: 0,
-    sides: { player: emptySide(), enemy: emptySide() },
+    sides: { player: emptySide('player'), enemy: emptySide('enemy') },
   };
+}
+
+// Buff attribution: the damage event carries the aggregate buff bonus; the
+// per-Program credit goes to the side's Program whose plan contains
+// EFFECT_BUFF (unique in the Alpha datasets — one Buffer per side at most).
+// Revisit if future data gives one side multiple buff sources.
+function buffProgramId(side: Side): string | null {
+  for (const p of programsFor(side)) {
+    if (p.fn.plan.some((op) => op.effectId === 'EFFECT_BUFF')) return p.id;
+  }
+  return null;
+}
+
+function unitOf(sm: SideMetrics, programId: string): UnitMetrics {
+  return (sm.units[programId] ??= emptyUnit());
 }
 
 export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
@@ -129,32 +141,41 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
           sm.matchDamageShape += ev.shapeRaw ?? 0;
         } else if (ev.source === 'attacker') {
           sm.attackerDamage += base;
-          sm.units.attacker.effect += base;
+          if (ev.programId) unitOf(sm, ev.programId).effect += base;
         } else {
           sm.bombDamage += base; // MK7.3: includes bomb-caused settling + cascades
-          sm.units.bomber.effect += base;
+          if (ev.programId) unitOf(sm, ev.programId).effect += base;
         }
         sm.cascadeDamage += ev.cascadeRaw ?? 0; // cross-cutting, any cause
-        sm.units.buffer.effect += bonus;
+        if (bonus > 0) {
+          const buffProg = buffProgramId(side);
+          if (buffProg) unitOf(sm, buffProg).effect += bonus;
+        }
         sm.bufferDamageAdded += bonus; // MK6.7/MK7.4 disjoint bucket
         break;
       }
-      case 'ability': {
-        const sm = m.sides[ev.side];
-        sm.units[ev.unit].fires++;
-        if (ev.drained) sm.units.disabler.effect += ev.drained;
+      case 'ability':
+        unitOf(m.sides[ev.side], ev.programId).fires++;
+        break;
+      case 'op': {
+        const um = unitOf(m.sides[ev.side], ev.programId);
+        um.ops++;
+        if (!ev.resolved) um.fizzles++;
+        if (ev.drained) um.effect += ev.drained;
         break;
       }
       case 'chargeWaste':
-        m.sides[ev.side].units[ev.unit].chargeWasted += ev.amount;
+        unitOf(m.sides[ev.side], ev.programId).chargeWasted += ev.amount;
         break;
       case 'placed':
-        if (ev.kind === 'bomb') m.sides[ev.side].units.bomber.bombsPlaced += ev.count;
-        else m.enemyShieldCreated += ev.count; // shields are enemy-only
+        if (ev.kind === 'bomb') unitOf(m.sides[ev.side], ev.programId).bombsPlaced += ev.count;
+        else if (ev.side === 'enemy') m.enemyShieldCreated += ev.count;
         break;
       case 'shield':
-        m.enemyShieldInstances++;
-        m.enemyShieldPrevented += ev.prevented;
+        if (ev.target === 'enemy') {
+          m.enemyShieldInstances++;
+          m.enemyShieldPrevented += ev.prevented;
+        }
         break;
       case 'shieldRemoved':
         m.enemyShieldRemoved += ev.count;

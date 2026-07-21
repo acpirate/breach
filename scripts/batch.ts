@@ -1,13 +1,18 @@
 // Headless batch runner (MK2.3 + MK3.5 + MK5): plays N full battles through
 // the pure logic layer with the shared bot and reports aggregate metrics
-// SPLIT BY OUTCOME, for BOTH enemy modes (ENEMY_MATCHING off and on).
-// Run with `npm run batch`.
+// SPLIT BY OUTCOME, for the main config modes. Alpha 0.1.0: definitions load
+// from the same CSV datasets as the browser; the summary header stamps the
+// content identity (§13.2). Run with `npm run batch`.
 
-import { DEFAULT_BATTLE_CONFIG, UNIT_DEFS } from '../src/logic/constants';
+import { DEFAULT_BATTLE_CONFIG } from '../src/logic/constants';
+import { contentStamp, getContent, programsFor } from '../src/logic/data/content';
 import { Game } from '../src/logic/game';
 import { BattleMetrics } from '../src/logic/metrics';
-import { BattleConfig, UNIT_ORDER } from '../src/logic/types';
+import { BattleConfig } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
+import { initContentOrExit } from './dataNode';
+
+initContentOrExit();
 
 const N = 100;
 
@@ -52,11 +57,13 @@ function report(label: string, group: BattleMetrics[]): void {
     console.log(`  Deepest cascade: avg ${f1(avg(s.map((x) => x.deepestCascade)))}, max ${max(s.map((x) => x.deepestCascade))}`);
     const contPcts = s.map((x) => (x.tilesDestroyed > 0 ? (x.contentionTiles / x.tilesDestroyed) * 100 : 0));
     console.log(`  Contention: ${f1(avg(s.map((x) => x.contentionTiles)))} opp-bound tiles of ${f1(avg(s.map((x) => x.tilesDestroyed)))} destroyed (avg ${f1(avg(contPcts))}%)`);
-    for (const t of UNIT_ORDER) {
-      const fires = avg(s.map((x) => x.units[t].fires));
-      const effect = avg(s.map((x) => x.units[t].effect));
-      const wasted = avg(s.map((x) => x.units[t].chargeWasted));
-      console.log(`  ${UNIT_DEFS[t].label}: fires ${f1(fires)}, effect ${f1(effect)}, charge wasted ${f1(wasted)}`);
+    // Alpha §13.4: per-Program rows by stable ID, display name joined here
+    for (const p of programsFor(side)) {
+      const fires = avg(s.map((x) => x.units[p.id]?.fires ?? 0));
+      const effect = avg(s.map((x) => x.units[p.id]?.effect ?? 0));
+      const wasted = avg(s.map((x) => x.units[p.id]?.chargeWasted ?? 0));
+      const fizzles = avg(s.map((x) => x.units[p.id]?.fizzles ?? 0));
+      console.log(`  ${p.name} [${p.id}]: fires ${f1(fires)}, effect ${f1(effect)}, charge wasted ${f1(wasted)}, fizzles ${f1(fizzles)}`);
     }
   }
 }
@@ -75,11 +82,17 @@ function runMode(label: string, config: BattleConfig): void {
   report('BATTLES THE PLAYER LOST', lost);
 }
 
+// §13.2 — simulation records are attributable to the loaded content
+const stamp = contentStamp();
+console.log(`build ${stamp.gameVersion} | schema ${stamp.schemaVersion} | content ${stamp.fingerprint}`);
+console.log(`hacker: ${stamp.hackerPrograms.join(', ')}`);
+console.log(`system: ${stamp.systemPrograms.join(', ')}`);
+console.log(`functions: ${stamp.functions.map((f) => `${f.id}=${f.cost}`).join(', ')}`);
+console.log(`fingerprint: ${getContent().fingerprint}`);
+
 const D = DEFAULT_BATTLE_CONFIG;
-// MK7 matrix: baseline modes + flat-cost diagnostic + NMD (charge-aware bot)
-runMode('DEFAULT (cap-0, costs 7/13/19/22)', { ...D });
+// Alpha matrix: data-driven costs (7/8/10/9) across the main modes
+runMode('DEFAULT (cap-0, data costs)', { ...D });
 runMode('ENEMY_MATCHING ON', { ...D, enemyMatching: true });
-runMode('FLAT_ABILITY_COST ON (all cost 7)', { ...D, flatAbilityCost: true });
-runMode('FLAT_ABILITY_COST + ENEMY_MATCHING', { ...D, flatAbilityCost: true, enemyMatching: true });
 runMode('NO_MATCH_DAMAGE ON (charge-aware bot)', { ...D, noMatchDamage: true });
 runMode('NO_MATCH_DAMAGE + ENEMY_MATCHING (charge-aware bot)', { ...D, noMatchDamage: true, enemyMatching: true });
