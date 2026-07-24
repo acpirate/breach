@@ -68,6 +68,10 @@ if (!files.length) {
 }
 
 const arr = (a) => (Array.isArray(a) ? a : []);
+// Alpha 0.2.0 §13.2 — mode/Run context prefix, shared by metrics/turn/wizard
+// lines. Quick Match entries carry no runStep (never fake Run values).
+const modeStr = (entry) =>
+  entry.mode === 'RUN' ? `mode=RUN step=${entry.runStep ?? '?'}` : entry.mode === 'QUICK_MATCH' ? 'mode=QUICK_MATCH' : 'mode=?';
 const cfgStr = (c) =>
   c
     ? `cfg[em:${c.enemyMatching ? 1 : 0} hb:${c.hackerBonusEnabled ? 1 : 0} sa:${c.singleAxisPayout ? 1 : 0} nmd:${c.noMatchDamage ? 1 : 0} cap:${c.maxCascadeSteps === null ? 'inf' : c.maxCascadeSteps} hp:${c.playerHp ?? '?'}v${c.enemyHp ?? '?'}` +
@@ -80,6 +84,7 @@ const rawParts = [];
 const bodyLines = [];
 let metrics = 0;
 let turns = 0;
+let wizards = 0;
 let bad = 0;
 
 for (const file of files) {
@@ -94,7 +99,8 @@ for (const file of files) {
         metrics++;
         const m = entry.metrics;
         bodyLines.push(
-          `[${at}] === BATTLE ${entry.battleId} v=${entry.v} ${cfgStr(entry.config)} winner=${entry.winner} turns=${m.turns}` +
+          `[${at}] === BATTLE ${entry.battleId} v=${entry.v} ${modeStr(entry)} natural=${entry.natural ?? '?'} ${cfgStr(entry.config)} winner=${entry.winner} turns=${m.turns}` +
+            `${entry.encounterSystemHp !== undefined ? ` encounterHp=${entry.encounterSystemHp}` : ''}` +
             `${entry.wallClockMs !== undefined ? ` wallClock=${(entry.wallClockMs / 1000).toFixed(0)}s` : ''} ===`,
         );
         // MK9.3 — enemy Shielder (prevention is NOT damage dealt)
@@ -123,7 +129,7 @@ for (const file of files) {
       } else if (kind === 'turn') {
         turns++;
         bodyLines.push(
-          `[${at}] turn ${entry.turn} (${entry.battleId} v=${entry.v} ${cfgStr(entry.config)})` +
+          `[${at}] turn ${entry.turn} (${entry.battleId} v=${entry.v} ${modeStr(entry)} ${cfgStr(entry.config)})` +
             `${entry.thinkMs !== undefined ? ` think=${(entry.thinkMs / 1000).toFixed(1)}s` : ''}` +
             `${entry.hintShown ? ' HINTED' : ''}` +
             `${entry.result ? `  RESULT: ${entry.result} wins` : ''}`,
@@ -134,6 +140,13 @@ for (const file of files) {
         );
         bodyLines.push(
           `  charges P:[${entry.chargesAfter.player}] E:[${entry.chargesAfter.enemy}] shake:${entry.chargesAfter.shake}`,
+        );
+      } else if (kind === 'wizard') {
+        // Alpha 0.2.0 §5.4/§13.4 — wizard invocation, distinct from the
+        // natural battle outcome it acted on (never overwrites it).
+        wizards++;
+        bodyLines.push(
+          `[${at}] WIZARD ${entry.battleId} v=${entry.v} ${modeStr(entry)} natural=${entry.natural} action=${entry.action}`,
         );
       } else {
         bad++;
@@ -150,7 +163,7 @@ const existing = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : '';
 // retry-safe dedup: this exact source was already appended (the session id is
 // written into the header below, so a re-run with identical source finds it)
 if (existing.includes(`SESSION ${sessionId} `)) {
-  console.log(`session ${sessionId} already appended to ${out} — nothing to do (${metrics} battle-metrics + ${turns} turns in source)`);
+  console.log(`session ${sessionId} already appended to ${out} — nothing to do (${metrics} battle-metrics + ${turns} turns + ${wizards} wizard entries in source)`);
   process.exit(0);
 }
 
@@ -164,8 +177,8 @@ if (overThreshold(dir)) {
 
 const header =
   `\n===== SESSION ${sessionId} | ${new Date().toISOString()} | files: ${files.map((f) => path.basename(f)).join(', ')} ` +
-  `| ${metrics} battle-metrics, ${turns} turns${bad ? `, ${bad} unparsable` : ''} =====`;
+  `| ${metrics} battle-metrics, ${turns} turns, ${wizards} wizard${bad ? `, ${bad} unparsable` : ''} =====`;
 fs.appendFileSync(out, `${header}\n${bodyLines.join('\n')}\n`);
 console.log(
-  `appended session ${sessionId}: ${metrics} battle-metrics + ${turns} turn entries from ${files.length} file(s)${bad ? ` (${bad} unparsable)` : ''} -> ${out}`,
+  `appended session ${sessionId}: ${metrics} battle-metrics + ${turns} turn + ${wizards} wizard entries from ${files.length} file(s)${bad ? ` (${bad} unparsable)` : ''} -> ${out}`,
 );

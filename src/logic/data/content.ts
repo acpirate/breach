@@ -9,8 +9,8 @@ import { AreaPatternId } from './areas';
 import { EffectId, EffectParamName } from './effects';
 import type { Color, Shape, Side } from '../types';
 
-export const GAME_VERSION = 'alpha-0.1.0';
-export const DATA_SCHEMA_VERSION = 1;
+export const GAME_VERSION = 'alpha-0.2.0';
+export const DATA_SCHEMA_VERSION = 1; // dataset schema unchanged by Alpha 0.2.0
 
 // One validated leaf operation of a Function's payload plan. A leaf Function
 // has exactly one op (its own Effect); a composite Function has one op per

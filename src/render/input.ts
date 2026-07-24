@@ -10,9 +10,10 @@ export interface InputHandlers {
   onTap(p: Pt): void;
   onDrag(a: Pt, b: Pt): void;
   onProgram(i: number): void;
-  onMinion(i: number): void; // MK3.2: Disabler target selection
+  onMinion(i: number): void; // targeted-Drain target selection
   onShake(): void;
   onMenu(): void;
+  onAvatar(side: 'player' | 'enemy'): void; // Alpha 0.2.0 §10 — character sheets
 }
 
 export function attachInput(canvas: HTMLCanvasElement, view: View, h: InputHandlers): void {
@@ -70,6 +71,9 @@ export function attachInput(canvas: HTMLCanvasElement, view: View, h: InputHandl
             break;
           case 'menu':
             h.onMenu();
+            break;
+          case 'avatar':
+            if (downHit.kind === 'avatar' && hit.side === downHit.side) h.onAvatar(hit.side);
             break;
         }
       }

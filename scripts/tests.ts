@@ -3,6 +3,9 @@
 // regression (15.4), settings/persistence (15.5), and version stamps (15.6).
 // Pure logic + the shared loader; no browser required. Run with `npm test`.
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { AREA_PATTERNS } from '../src/logic/data/areas';
 import { getContent, setActiveContent } from '../src/logic/data/content';
 import { DataFiles, loadContent } from '../src/logic/data/load';
@@ -10,7 +13,23 @@ import { DEFAULT_BATTLE_CONFIG } from '../src/logic/constants';
 import { Game } from '../src/logic/game';
 import { LOG_VERSION } from '../src/logic/logger';
 import { SAVE_VERSION } from '../src/logic/save';
+import {
+  RUN_ENCOUNTERS,
+  RUN_LENGTH,
+  contextLabel,
+  continueLabel,
+  createRunBattle,
+  deserializeSession,
+  encounterFor,
+  isRunComplete,
+  nextStep,
+  progressesAsVictory,
+  serializeSession,
+  snapshotRunConfig,
+} from '../src/logic/session';
+import { RunStep } from '../src/logic/types';
 import { GameEvent, Tile } from '../src/logic/types';
+import { botFireAbilities, botMove } from './bot';
 import { nodeDataFiles } from './dataNode';
 
 let passed = 0;
@@ -65,9 +84,50 @@ function expectErrors(over: Partial<Record<keyof DataFiles, string>>, reasonPart
 
 // ---- 15.6 / §13.1 version stamps ----
 
-test('version stamps are alpha-0.1.0', () => {
-  assert(SAVE_VERSION === 'alpha-0.1.0', `SAVE_VERSION = ${SAVE_VERSION}`);
-  assert(LOG_VERSION === 'alpha-0.1.0', `LOG_VERSION = ${LOG_VERSION}`);
+test('version stamps are alpha-0.2.0', () => {
+  assert(SAVE_VERSION === 'alpha-0.2.0', `SAVE_VERSION = ${SAVE_VERSION}`);
+  assert(LOG_VERSION === 'alpha-0.2.0', `LOG_VERSION = ${LOG_VERSION}`);
+});
+
+// §13.1 — no active output path may continue to emit a stale build tag.
+// Scans active source (not node_modules/dist/.git) for a literal older
+// version string or a quoted bare mk-tag; the ONLY allowed hits are the
+// deliberate pre-Alpha-0.2.0 save-rejection fixtures.
+test('no stale build tags in active source (§13.1)', () => {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const dirs = ['src', 'scripts'];
+  const files: string[] = [path.join(root, 'index.html'), path.join(root, 'vite.config.ts')];
+  const walk = (dir: string): void => {
+    for (const name of fs.readdirSync(dir)) {
+      const p = path.join(dir, name);
+      const st = fs.statSync(p);
+      if (st.isDirectory()) walk(p);
+      else if (/\.(ts|cjs|html)$/.test(name)) files.push(p);
+    }
+  };
+  for (const d of dirs) walk(path.join(root, d));
+
+  // no `g` flag: these are used as stateless containment tests per file, and
+  // a global-flag regex's `lastIndex` would otherwise persist across the
+  // per-file .test() calls in the loop below.
+  const stalePattern = /alpha-0\.1\.0/;
+  const mkTagPattern = /(['"`])mk\d+\1/i;
+  // smoke.ts: the deliberate pre-Alpha-0.2.0 rejection fixture. This test
+  // file itself is excluded too — it necessarily quotes both tags below to
+  // verify the fixture's content, which would otherwise self-match.
+  const allowedFiles = new Set([path.join(root, 'scripts', 'smoke.ts'), path.join(root, 'scripts', 'tests.ts')]);
+  const offenders: string[] = [];
+  for (const f of files) {
+    if (allowedFiles.has(f)) continue;
+    const text = fs.readFileSync(f, 'utf8');
+    if (stalePattern.test(text) || mkTagPattern.test(text)) offenders.push(path.relative(root, f));
+  }
+  assert(offenders.length === 0, `stale build tag found outside the allowed fixture: ${offenders.join(', ')}`);
+
+  // the allowed fixture itself must still contain exactly the expected
+  // rejection-test tags (proves the allowlist isn't hiding a real leak)
+  const smokeText = fs.readFileSync(path.join(root, 'scripts', 'smoke.ts'), 'utf8');
+  assert(smokeText.includes("'mk9'") && smokeText.includes("'alpha-0.1.0'"), 'expected pre-Alpha rejection fixture strings in smoke.ts');
 });
 
 // ---- 15.1 loader & schema ----
@@ -585,6 +645,67 @@ test('repeated leaf IDs in a composite execute repeatedly (§7.2 rule 9)', () =>
 // restore real content for anything after
 install();
 
+// ---- Alpha 0.2.0 SENIOR-1/2 foundation acceptance (session layer). The full
+// §14.1-14.6 suites are JUNIOR-7 scope; this proves the senior contract. ----
+
+test('session foundation: Run encounters, envelope round-trip, rejections', () => {
+  // §4.1 exact table, §4.3 fresh-state creation without UI logic
+  assert(RUN_ENCOUNTERS.map((e) => e.systemHp).join(',') === '100,150,200,250', 'encounter HP table');
+  for (const step of [1, 2, 3, 4] as const) {
+    const g = createRunBattle(DEFAULT_BATTLE_CONFIG, step, 50 + step);
+    assert(g.state.config.enemyHp === encounterFor(step).systemHp, `step ${step} System HP override`);
+    assert(g.state.hp.player === DEFAULT_BATTLE_CONFIG.playerHp, 'Hacker at full configured HP');
+    assert(g.state.units.player.every((u) => u.charge === 0), 'fresh charge');
+  }
+  // Run envelope round-trip at step 2 (active battle)
+  const runCfg = { ...DEFAULT_BATTLE_CONFIG, playerHp: 175 };
+  const g2 = createRunBattle(runCfg, 2, 99);
+  g2.startPlayerPhase();
+  const json = serializeSession({ mode: 'RUN', step: 2, config: runCfg }, g2, null);
+  const r = deserializeSession(json);
+  assert(r && r.info.mode === 'RUN' && r.info.step === 2, 'Run step round-trips');
+  assert(r.info.mode === 'RUN' && r.info.config.playerHp === 175, 'Run config snapshot round-trips');
+  assert(r.game.state.config.enemyHp === 150, 'effective encounter HP round-trips');
+  // §6.2: Quick Match must not carry Run values
+  const qmJson = serializeSession({ mode: 'QUICK_MATCH' }, g2, null);
+  assert(!qmJson.includes('"run"'), 'QM envelope has no run field');
+  const fakeRun = JSON.parse(qmJson) as Record<string, unknown>;
+  fakeRun.run = { step: 1, config: runCfg };
+  assert(deserializeSession(JSON.stringify(fakeRun)) === null, 'QM save with Run values rejects');
+  // a Run save whose battle HP contradicts its encounter rejects
+  const tampered = JSON.parse(json) as { run: { step: number } };
+  tampered.run.step = 3;
+  assert(deserializeSession(JSON.stringify(tampered)) === null, 'step/encounter-HP mismatch rejects');
+  // §5.1 pending-result envelope: play a 1-HP battle to conclusion, save, restore
+  const g3 = createRunBattle({ ...DEFAULT_BATTLE_CONFIG, playerHp: 1 }, 1, 7);
+  g3.startPlayerPhase();
+  let safety = 0;
+  while (!g3.state.winner && safety++ < 600) {
+    botFireAbilities(g3);
+    if (g3.state.winner) break;
+    const mv = botMove(g3);
+    assert(mv, 'move available');
+    g3.attemptSwap(mv.a, mv.b);
+    if (!g3.state.winner) g3.runEnemyPhase();
+    if (!g3.state.winner) g3.startPlayerPhase();
+  }
+  assert(g3.state.winner, 'battle concluded');
+  const natural = g3.state.winner === 'player' ? 'NATURAL_VICTORY' : 'NATURAL_DEFEAT';
+  const pendingJson = serializeSession(
+    { mode: 'RUN', step: 1, config: { ...DEFAULT_BATTLE_CONFIG, playerHp: 1 } },
+    g3,
+    { natural, metricsLogged: true },
+  );
+  const rp = deserializeSession(pendingJson);
+  assert(rp && rp.pending, 'pending result restores');
+  assert(rp.pending.natural === natural && rp.pending.metricsLogged, 'result context round-trips');
+  assert(rp.game.state.winner === g3.state.winner, 'concluded state restores');
+  // an active-battle envelope claiming a result rejects
+  const bad = JSON.parse(json) as Record<string, unknown>;
+  bad.result = { natural: 'NATURAL_VICTORY', metricsLogged: true };
+  assert(deserializeSession(JSON.stringify(bad)) === null, 'active battle with result field rejects');
+});
+
 // ---- 15.5 settings & persistence (browser-storage migration, mocked) ----
 
 await (async () => {
@@ -624,6 +745,149 @@ await (async () => {
     assert(!('abilityCosts' in resaved), 'obsolete fields not re-persisted');
   });
 })();
+
+// ---- §14.1 mode/title label tests ----
+
+test('§14.1 Continue/context labels identify mode and exact Run step', () => {
+  assert(continueLabel({ mode: 'QUICK_MATCH' }) === 'Continue Quick Match', 'QM continue label');
+  assert(contextLabel({ mode: 'QUICK_MATCH' }) === 'Quick Match', 'QM context label');
+  for (const step of [1, 2, 3, 4] as const) {
+    const info = { mode: 'RUN' as const, step, config: DEFAULT_BATTLE_CONFIG };
+    assert(continueLabel(info) === `Continue Run — Battle ${step} of 4`, `Run step ${step} continue label`);
+    assert(contextLabel(info) === `Run — Battle ${step} of 4`, `Run step ${step} context label`);
+  }
+});
+
+// ---- §14.2 Run progression (headless, full 4-step chain) ----
+
+test('§14.2 Run progression: HP table, fresh state every step, 1-3 advance, 4 does not', () => {
+  const runCfg = snapshotRunConfig(DEFAULT_BATTLE_CONFIG);
+  let step: RunStep | null = 1;
+  let stepsVisited = 0;
+  const seenBoards = new Set<string>();
+  while (step !== null) {
+    // distinct seeds per step stand in for "a new battle RNG state/seed is
+    // used" (§4.3) — the resulting board layouts must actually differ
+    const g = createRunBattle(runCfg, step, 1000 + step * 97);
+    assert(g.state.config.enemyHp === encounterFor(step).systemHp, `step ${step} System HP matches table`);
+    assert(g.state.hp.player === runCfg.playerHp, `step ${step} Hacker starts at full configured HP`);
+    assert(g.state.hp.enemy === encounterFor(step).systemHp, `step ${step} System starts at encounter HP`);
+    assert(g.state.units.player.every((u) => u.charge === 0) && g.state.units.enemy.every((u) => u.charge === 0), `step ${step} charges reset`);
+    assert(g.state.shakeCharge > 0, `step ${step} Board-Shake starts charged`);
+    assert(g.state.turn === 1, `step ${step} fresh turn counter`);
+    assert(g.state.metrics.turns === 0 && g.state.metrics.autoReshuffles === 0, `step ${step} fresh metrics`);
+    for (const row of g.state.board) for (const t of row) assert(!t?.special, `step ${step} no carried special objects on a fresh board`);
+    const boardKey = g.state.board.flat().map((t) => `${t!.kind}:${t!.color ?? '-'}:${t!.shape ?? '-'}`).join(',');
+    assert(!seenBoards.has(boardKey), `step ${step} gets a genuinely new random board`);
+    seenBoards.add(boardKey);
+    stepsVisited++;
+    step = nextStep(step);
+  }
+  assert(stepsVisited === RUN_LENGTH, 'all 4 steps visited exactly once');
+  assert(nextStep(4) === null, 'Battle 4 has no next step (Run Complete, not advance)');
+});
+
+// ---- §14.3 save/envelope cases beyond the foundation test ----
+
+test('§14.3 every Run step round-trips through the save envelope', () => {
+  const runCfg = snapshotRunConfig(DEFAULT_BATTLE_CONFIG);
+  for (const step of [1, 2, 3, 4] as const) {
+    const g = createRunBattle(runCfg, step, 2000 + step);
+    g.startPlayerPhase();
+    const json = serializeSession({ mode: 'RUN', step, config: runCfg }, g, null);
+    const r = deserializeSession(json);
+    assert(r && r.info.mode === 'RUN' && r.info.step === step, `step ${step} round-trips`);
+    assert(r.game.state.config.enemyHp === encounterFor(step).systemHp, `step ${step} encounter HP round-trips`);
+  }
+});
+
+test('§14.3 pending-result restore preserves metricsLogged and forcedWin', () => {
+  const runCfg = snapshotRunConfig(DEFAULT_BATTLE_CONFIG);
+  const g = createRunBattle({ ...runCfg, playerHp: 1 }, 1, 71);
+  g.startPlayerPhase();
+  let safety = 0;
+  while (!g.state.winner && safety++ < 600) {
+    botFireAbilities(g);
+    if (g.state.winner) break;
+    const mv = botMove(g);
+    assert(mv, 'move available');
+    g.attemptSwap(mv.a, mv.b);
+    if (!g.state.winner) g.runEnemyPhase();
+    if (!g.state.winner) g.startPlayerPhase();
+  }
+  assert(g.state.winner, 'battle concluded');
+  const natural = g.state.winner === 'player' ? ('NATURAL_VICTORY' as const) : ('NATURAL_DEFEAT' as const);
+  const json = serializeSession({ mode: 'RUN', step: 1, config: { ...runCfg, playerHp: 1 } }, g, { natural, forcedWin: true, metricsLogged: true });
+  const r = deserializeSession(json);
+  assert(r && r.pending, 'pending result restores');
+  assert(r.pending.metricsLogged === true, 'metricsLogged survives (prevents double-logging on resume)');
+  assert(r.pending.forcedWin === true, 'forcedWin survives (natural outcome not overwritten)');
+  assert(r.pending.natural === natural, 'natural outcome preserved alongside the wizard flag');
+});
+
+test('§14.3/§14.5 tampered Program order in the save rejects', () => {
+  const g = createRunBattle(DEFAULT_BATTLE_CONFIG, 1, 88);
+  g.startPlayerPhase();
+  const json = serializeSession({ mode: 'RUN', step: 1, config: DEFAULT_BATTLE_CONFIG }, g, null);
+  const env = JSON.parse(json) as { hackerOrder: string[] };
+  assert(deserializeSession(json), 'sanity: untampered save restores');
+  [env.hackerOrder[0], env.hackerOrder[1]] = [env.hackerOrder[1], env.hackerOrder[0]];
+  assert(deserializeSession(JSON.stringify(env)) === null, 'reordered hackerOrder rejects');
+});
+
+test('§14.3 schema-version mismatch rejects', () => {
+  const g = createRunBattle(DEFAULT_BATTLE_CONFIG, 1, 89);
+  g.startPlayerPhase();
+  const json = serializeSession({ mode: 'RUN', step: 1, config: DEFAULT_BATTLE_CONFIG }, g, null);
+  const env = JSON.parse(json) as { schema: number };
+  env.schema = env.schema + 1;
+  assert(deserializeSession(JSON.stringify(env)) === null, 'schema mismatch rejects');
+});
+
+// ---- §14.4 wizard/progression semantics at the session level ----
+
+test('§14.4 progressesAsVictory: natural win, forced win on a natural loss, plain loss', () => {
+  assert(progressesAsVictory({ natural: 'NATURAL_VICTORY', metricsLogged: true }) === true, 'natural win progresses as victory');
+  assert(progressesAsVictory({ natural: 'NATURAL_DEFEAT', forcedWin: true, metricsLogged: true }) === true, 'forced win on a loss progresses as victory');
+  assert(progressesAsVictory({ natural: 'NATURAL_DEFEAT', metricsLogged: true }) === false, 'plain loss does not progress as victory');
+});
+
+test('§14.4 isRunComplete truth table across all 4 steps × outcome', () => {
+  for (const step of [1, 2, 3, 4] as const) {
+    const info = { mode: 'RUN' as const, step, config: DEFAULT_BATTLE_CONFIG };
+    const win = isRunComplete(info, { natural: 'NATURAL_VICTORY', metricsLogged: true });
+    const forcedOnLoss = isRunComplete(info, { natural: 'NATURAL_DEFEAT', forcedWin: true, metricsLogged: true });
+    const loss = isRunComplete(info, { natural: 'NATURAL_DEFEAT', metricsLogged: true });
+    if (step === 4) {
+      assert(win, 'step 4 natural win is Run Complete');
+      assert(forcedOnLoss, 'step 4 forced win is Run Complete');
+    } else {
+      assert(!win, `step ${step} natural win is not Run Complete`);
+      assert(!forcedOnLoss, `step ${step} forced win is not Run Complete`);
+    }
+    assert(!loss, `step ${step} defeat is never Run Complete`);
+  }
+  const qm = isRunComplete({ mode: 'QUICK_MATCH' }, { natural: 'NATURAL_VICTORY', metricsLogged: true });
+  assert(!qm, 'Quick Match is never Run Complete');
+});
+
+// ---- §14.5 Program order stability (content-level; save-level covered above) ----
+
+test('§14.5 authored Program order is stable and independent of charge/readiness', () => {
+  const hackerIds = getContent().hacker.map((p) => p.id);
+  const g1 = createRunBattle(DEFAULT_BATTLE_CONFIG, 1, 5);
+  assert(g1.state.units.player.map((u) => u.programId).join(',') === hackerIds.join(','), 'runtime slot order matches content order');
+  // charging every slot to its cap (readiness) must not reorder anything
+  for (const u of g1.state.units.player) u.charge = getContent().programsById.get(u.programId)!.chargeCap;
+  assert(g1.state.units.player.map((u) => u.programId).join(',') === hackerIds.join(','), 'order unaffected by charge/readiness');
+});
+
+// ---- §14.6 layout/geometry ----
+// The View requires a live DOM <canvas> 2D context, unavailable in this
+// headless Node harness. Per the escalation guidance in the task packet,
+// this is intentionally left as a MANUAL check rather than mocking a canvas
+// (which would test the mock, not the real renderer). See the manual-checks
+// list in the final report.
 
 // ---- summary ----
 

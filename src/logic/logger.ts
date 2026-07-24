@@ -11,7 +11,7 @@
 
 import { ContentStamp, GAME_VERSION, getContent } from './data/content';
 import { BattleMetrics } from './metrics';
-import { BattleConfig, GameEvent, GameState, Side, opponentOf } from './types';
+import { BattleConfig, GameEvent, GameState, Mode, NaturalOutcome, RunStep, Side, WizardAction, opponentOf } from './types';
 
 // Version tag stamped on every log entry. Alpha 0.1.0: no active output path
 // may continue to emit a stale MK tag (§13.1).
@@ -33,6 +33,11 @@ interface SideDamage {
 export interface TurnLogEntry {
   v: string; // LOG_VERSION
   fp: string; // content fingerprint (§13.2 attribution, compact form)
+  // Alpha 0.2.0 §13.2 — mode/Run context, stamped by the orchestrator at the
+  // persistence boundary (the pure logger is mode-agnostic). Quick Match
+  // entries carry no runStep (never fake Run values).
+  mode?: Mode;
+  runStep?: RunStep;
   battleId: string;
   config: BattleConfig; // MK5.5 — active config; entries are uninterpretable without it
   turn: number;
@@ -54,8 +59,28 @@ export interface MetricLogEntry {
   content: ContentStamp; // §13.2 — loaded-content identity
   endedAt: string; // ISO timestamp
   winner: Side;
+  // Alpha 0.2.0 §13.2/§5.4 — the battle's NATURAL outcome and its mode/Run
+  // context. Wizard actions are recorded as separate WizardLogEntry records;
+  // they never overwrite `natural`/`winner` here.
+  natural: NaturalOutcome;
+  mode: Mode;
+  runStep?: RunStep; // RUN only
+  encounterSystemHp?: number; // RUN only
   wallClockMs?: number; // MK6.6 — total battle wall-clock (this session)
   metrics: BattleMetrics;
+}
+
+// Alpha 0.2.0 §5.4/§13.4 — one record per explicit wizard invocation, kept
+// DISTINCT from the natural battle outcome (both are preserved). Appended by
+// the orchestrator through the same storage/log-sink path as other entries.
+export interface WizardLogEntry {
+  v: string; // LOG_VERSION
+  battleId: string;
+  mode: Mode;
+  runStep?: RunStep; // RUN only
+  natural: NaturalOutcome; // the result the wizard acted on
+  action: WizardAction;
+  at: string; // ISO timestamp
 }
 
 const freshDamage = (): Record<Side, SideDamage> => ({

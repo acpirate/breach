@@ -1,153 +1,306 @@
-# Breach — Match-3 Hacking RPG (Proof of Concept)
+# Breach — Alpha 0.1.0
 
-Whitebox PoC of the core combat loop from `breach-poc-requirements.md`: matching, damage, charge, abilities, win/loss. TypeScript + Vite + canvas; mobile-first portrait; no backend, no persistence. Includes the Section 1-MK2 revisions (see below).
+Breach is a mobile-first match-3 combat game with a cyberpunk hacking theme. The project is now in its Alpha phase: the proof of concept established the combat model, and Alpha 0.1.0 replaces hardcoded Programs and Functions with validated external data intended to support the final game's content architecture.
 
-## Run
+The current build is a whitebox combat sandbox, not a complete run-based game. It supports human play, deterministic headless simulation, persistent in-progress battles, event-sourced metrics, and developer logging.
 
+## Current status
+
+**Build:** `alpha-0.1.0`
+
+Alpha 0.1.0 introduces a shared data pipeline for:
+
+- Hacker/player Programs
+- System/enemy Programs
+- Functions
+- coded Effects and their parameter contracts
+
+The browser and Node-based tools load the same CSV datasets, validate them through the same pure TypeScript pipeline, and resolve them into one immutable runtime content model. Human battles, automated battles, UI, saves, logs, and metrics all consume that resolved model. There is no hardcoded Program or Function fallback.
+
+The current authoritative requirements are in:
+
+```text
+breach-alpha-0.1.0-requirements.md
 ```
+
+Earlier PoC and MK requirements remain useful as development history, but they are no longer the canonical current specification.
+
+## Run locally
+
+```bash
 npm install
-npm run dev        # local dev server (Vite prints the URL; use --host + a tunnel for phone testing)
-npm run smoke      # headless logic smoke test: full battles, both scenarios, 10 seeds each
-npm run batch      # headless batch: 100 bot-played battles, aggregate metrics report
-npm run typecheck  # tsc --noEmit
+npm run dev
 ```
 
-## MK9 revisions (Section 1-MK9 — Asymmetric Enemy Roles, Binding Contest & Log Retention)
+Vite prints the local development URL. Use `--host` when testing from another device on the same network.
 
-Enemy roles diverge from the player's, offensive priorities separate across the shared board, the Player Bomber gets more reliable, and local log retention hardens. Deltas on MK8.
+Production build:
 
-- **MK9.1 Player Bomber → two bombs:** one activation places **2** player bombs (`PLAYER_BOMBER_BOMBS`), one cost, one activation, drawing two distinct legal targets without replacement (fewer if the board can't fit two — never hangs). Metrics record bombs placed per activation (`units.bomber.bombsPlaced`).
-- **MK9.2 E-Bomb (enemy Bomber replacement):** places **1** enemy bomb with the original **3-turn** fuse (`E_BOMB_COUNTDOWN`; player bombs keep the MK3.1 2-turn fuse). Its blast is the base 3×3 **plus one tile in each cardinal direction** (`E_BOMB_BLAST_OFFSETS`, 13 cells, edge-clipped, **no** extra diagonals). Footprint/fuse key off bomb owner.
-- **MK9.3 Shielder (enemy Buffer replacement):** places **2** shield tiles (`SHIELDER_TILES`), each worth **2** shield points (`SHIELD_POINTS_PER_TILE`). Total active enemy shield reduces **every separate** player→enemy damage instance (match, Attacker, each bomb blast, …) by the summed value, min 0, applied after base+Buffer but before HP. Shield tiles are removable board objects (match/cascade/blast); value is measured live so a shield removed in a step stops protecting the next instance. Prevention is **not** damage dealt — reported in a disjoint shield metric (created/removed/hits/prevented), never folded into damage buckets.
-- **MK9.4 Per-side strong bindings (approved "tier swap"):** player and enemy no longer share strong colors/shapes. Player strong = the historical HIGH sets (Red/Yellow/Magenta, Square/Cross/Diamond, 2 dmg); enemy strong = the **opposite** sets (Green/Cyan/Blue, Triangle/Star/Circle). Stored explicitly per side in `BattleConfig` (`strongColors`/`strongShapes`), stamped into saves and dumps. Match/blast damage is now owner-resolved — a match can be strong for one side and weak for the other. New enemy units bind on colors/shapes **unused by player abilities**: **E-Bomb = Magenta + Diamond**, **Shielder = Cyan + Circle**.
-- **MK9.5 Character Sheet:** player and enemy shown in separate sections, each with its own strong color/shape; general charge + neutral-tile lines moved to the bottom.
-- **MK9.6/9.7 Log retention (server-only, approved):** `logs:wipe` now removes only the raw `.jsonl` and **preserves** the readable dump. `logs:dump` **appends** a session block (with a `SESSION <id>` header and separator) instead of overwriting, and is retry-safe — an unchanged source dedups by content hash, new events append a fresh session. A named storage threshold (`LOG_STORAGE_THRESHOLD` in `scripts/logConfig.cjs`, default **99%** for this near-full dev drive; `BREACH_LOG_THRESHOLD` env override) gates the dev sink's raw writes and the dump: over threshold, the affected file is replaced with the line `storage media more than 99% full` (wording tracks the 99% default per user override; the spec's literal was "80%") and further writes stay bounded. Measured honestly against the real filesystem (`fs.statfsSync`); when unmeasurable, logging proceeds. All log/dump write paths are isolated so storage failures never touch gameplay.
-- Save/log versions are now `mk9`; older saves are rejected to a clean start (config gained per-side strong bindings and the `shield` special tile). Menu-config migrates conservatively (adds strong-binding defaults, re-stamps).
+```bash
+npm run build
+```
 
-## MK7 revisions (Section 1-MK7 — Attribution, Cost Curve & Instrumentation)
+The browser build packages the CSV resources into the generated application bundle. No production backend is required for the current game client.
 
-Theme: fix the instruments before running the experiment. No new mechanics beyond config.
+## Verification commands
 
-- **MK7.1 Costs as config + flat-cost diagnostic:** the four ability costs are per-battle config (Settings, 1–99, defaults 7/13/19/22); `flatAbilityCost` prices all four at 7 to de-confound effect from firing rate. All cost checks go through `effectiveCost()`.
-- **MK7.2 Cascade redefined (metric only):** only matches containing newly-spawned RNG tiles count as cascades; deterministic settling is part of the chosen move. No gameplay change (the cap already gated only stochastic refills). Cascade depths drop — that's the fix.
-- **MK7.3/7.4 Causal attribution:** damage rolls up to the action that initiated the chain. Four **disjoint** buckets summing exactly to total: `match` / `bomb` (incl. its own settling+cascades) / `atk` / `buffer` (subtracted out of the others). Plus one cross-cutting `cascadeDamage` (all stochastic-refill damage, any cause, pre-floor).
-- **MK7.5 Axis split:** match damage split `color` vs `shape` (per tile, by the axis that paid; ties→color; pre-floor). The color-matcher-bias instrument.
-- **MK7.6 Round metrics:** biggest round (swinginess) and average nonzero round (effectiveness), per side.
-- **MK7.7 Hints (default OFF):** after `hintDelaySeconds` (default 7) idle, highlights an available 4-match; every hint-assisted turn is flagged in the logs so think-time analysis can exclude it.
-- **MK7.8** Dev-build-only "find match" button. **MK7.9** Shake is now a **permutation** (composition preserved exactly; same validity contract; auto-reshuffle too, per designer ruling; re-randomization only as a never-softlock fallback). **MK7.10** Title = New Game / Continue / Settings; all config in the Settings modal (not reachable mid-battle); no confirm on New Game. **MK7.11** Quit clears the board render. **MK7.12** Letterboxed to 9:19.5 phone aspect — desktop testing is phone testing.
-- **MK7.13 + addendum:** under `noMatchDamage` the bot matches for **charge** (feeds its bindings) instead of damage — controlled by the `nmdChargeAwareBot` sub-option (default ON when NMD is on; OFF restores the classic prefer-4 tier).
-- Save/log versions `mk7`; log files roll daily and `logs:dump` is lossless.
+```bash
+npm test           # focused data, composition, effect, persistence, and version tests
+npm run smoke      # headless battle and save/restore regression suite
+npm run batch      # multi-configuration automated battle metrics
+npm run hpladder   # symmetric-HP balance ladder
+npm run typecheck  # TypeScript validation
+npm run build      # production bundle
+```
 
-## MK6 revisions (Section 1-MK6 — Shape Damage, No-Match-Damage, Instrumentation & QoL)
+At the Alpha 0.1.0 handoff, the focused suite passed 43 tests, the smoke suite completed all 48 configured battles, and both batch harnesses completed successfully.
 
-- **MK6.1 Shape damage:** shapes get their own damage tiers, symmetric with color (LOW 1 / HIGH 2). **HIGH shapes: Square, Cross, Diamond · LOW: Triangle, Star, Circle** — assigned so every unit binds one HIGH axis + one LOW axis (no unit's tiles are double-weighted). A color-match damages via the tile's color tier, a shape-match via its shape tier; a tile destroyed by both pays once at the higher applicable value. Supersedes the MK5 color-fallback stopgap.
-- **MK6.2 `NO_MATCH_DAMAGE` flag** (default OFF): matches deal zero damage; charge is unchanged (the denial contest survives); abilities become the only damage source. **Bomb detonations still deal full damage** — a detonation is an ability effect, not a match.
-- **MK6.3 Cap-0 is the default** (`maxCascadeSteps: 0`; the Infinite toggle and 0–9 input are unchanged).
-- **MK6.4 HP in config:** `playerHp`/`enemyHp` (1–9999) are menu-settable, persisted, saved, and stamped into logs. The forced-loss scenario and the Scenario concept are **removed** — the menu is config + one Play button (+ Continue when a save exists).
-- **MK6.5 Character sheet:** read-only pause-menu panel with damage tiers per axis, charge values, unit costs, and **both sides'** bindings (built to display divergent bindings when that experiment lands).
-- **MK6.6 Think-time metrics:** raw per-turn think-times measured strictly from input-available → match-committed (abilities/invalid swaps leave the clock running), logged unaggregated; medians computed at display. Battle wall-clock in the Tier 1 log.
-- **MK6.7 Buffer attribution:** per-side `bufferDamageAdded` (= dealt − zero-buff-dealt, stacking-safe) in metrics, game-over display, and batch output.
-- **MK6.8 Logging:** `logs:dump` is now lossless (version, config, contention, timing, buffer fields all included) and reads date-stamped files — the sink writes `logs/breach-logs-YYYY-MM-DD.jsonl`, rolling daily.
-- **MK6.9 Visuals:** special tiles lose the perimeter outline (the centered white/black badge is the ownership signal); floating damage numbers are large and outlined.
-- **New harness:** `npm run hpladder` — symmetric-HP ladder (100/500/2000, both enemy modes, 100 seeds per cell). `npm run batch` runs a 4-mode matrix (enemy matching × no-match-damage) with ability-share and buffer columns.
+Some interaction and rendering behavior still requires manual browser testing, particularly mouse/touch targeting, representative battles in each System mode, and the blocking data-validation failure screen.
 
-## MK5 revisions (Section 1-MK5 — Enemy Matching + Configurable Battle Modifiers)
+## Core combat
 
-- **MK5.1 Enemy matching:** with the `enemyMatching` flag on, the enemy's fixed charge clock is removed and it becomes a real matching opponent on the shared board — a structurally identical turn (fire charged abilities → make one match via the existing bot heuristic → resolve under all the same rules), charging only from matches on the same bindings as the player. Flag off (default) = the original timer-clock enemy. Both paths work.
-- **MK5.2 Config flags** (`BattleConfig`, runtime state on `GameState`, defaults in `constants.ts`):
-  - `enemyMatching` (default OFF)
-  - `hackerBonusEnabled` (default **OFF** — deliberate: the flat color bonus distorted the economy; off gives a symmetric baseline, so the first MK5 battle plays differently from MK4 even untouched)
-  - `singleAxisPayout` (default OFF; on = a match grants **charge** only on its matched axis — damage is unchanged, since damage is color-derived. Per-match ruling: a tile in both a color- and shape-match is destroyed once but pays both axes)
-  - `maxCascadeSteps` (default **infinite** via `null` sentinel; 0–9 otherwise). At a cap, refill tiles are rejection-rolled so no refill completes a match; matches from existing tiles falling together still resolve. Cap 0 = the initial match resolves, then the board goes inert.
-- **MK5.3/5.4 Config UI & lifecycle:** the scenario menu has checkboxes, an "Infinite cascades" toggle with a 0–9 input, and "Reset to Defaults" (the only reset). Config persists across sessions (`breach:config`), is **serialized into the save** and is authoritative/immutable for that battle. On Continue, if the save's config differs from the menu's, a forced acknowledgment panel auto-opens showing the battle's actual config. Restart (conclusion screen or pause) always reuses the just-played battle's config. The pause menu shows the active config read-only.
-- **MK5.5 Logging:** every Tier 1 and Tier 2 log entry stamps the active config alongside the version (now `mk5`). Old-version log entries persist until explicitly cleared.
-- **MK5.6 Contention metric:** per side, how many destroyed match-tiles were bound to the *opposing* side's units — surfaced in the batch output and the game-over metrics.
+The established combat model includes:
 
-`npm run batch` now runs 100 battles in **both** enemy modes, outcome-split.
+- 8×8 shared board
+- six colors and six shapes
+- neutral tiles
+- color-axis or shape-axis matching
+- blob/merge match detection
+- per-tile charge
+- charge caps based on Function cost
+- deterministic seeded logic
+- configurable cascade limits
+- player pre-match Function activation followed by one turn-ending match
+- System timer-charge and shared-board matching modes
+- player and System owner-dependent strong color and shape partitions
+- bombs, buffs, direct attacks, charge drain, and shield objects
+- automatic deadlock protection and the player Board-Shake Function
+- event-sourced metrics and causal damage attribution
 
-## MK4 revisions (Section 1-MK4 — Persistence, Logging & Visual Pass)
+The player Bomber deploys two bombs for redundancy. The System E-Bomb deploys one slower bomb with a larger cardinally extended footprint. The System Shielder deploys removable shield tiles that reduce each incoming damage instance using the defender's live shield total.
 
-No gameplay changes. Additions:
+Program bindings, Function costs, Function assignments, countdowns, footprints, magnitudes, and damage values come from the external datasets. The current Function-cost curve is:
 
-- **MK4.1 Save/restore:** the in-progress battle autosaves to localStorage at every stable point (battle start, after each ability, after each completed turn). `src/logic/save.ts` serializes the full logic-layer state — board, HP, charges, countdowns, metrics, and the RNG's internal state (resumes are deterministic) — in a `{version: "mk4", state}` envelope. Missing/incompatible/corrupt saves fail gracefully to a fresh start. The save is cleared the moment a battle ends. Console logs `[breach] state saved/restored (turn N)`.
-- **MK4.2 Continue:** the scenario selector shows a Continue button only when a valid, version-compatible in-progress save exists; starting any new game wipes the resident save (doubles as the corrupt-save escape hatch). Quit mid-battle keeps the save, so Continue reappears.
-- **MK4.3 Logging:** `src/logic/logger.ts` consumes the same event stream as the metrics collector (no second pipeline). Tier 1: final metrics per completed battle. Tier 2: one action+outcome entry per turn. All entries tagged `v: "mk4"`. Capped at `MAX_METRIC_LOG_ENTRIES`/`MAX_TURN_LOG_ENTRIES` (oldest evicted). Tier 3 (board snapshots) parked. Access:
-  - Browser console: `breachLogs()` to dump, `breachWipe({save: true})` to wipe.
-  - Dev-server sink: in dev, entries also POST to a Vite middleware that appends them to `logs/breach-logs.jsonl` on the dev machine — this captures logs from a phone playing over the LAN. `npm run logs:dump` pretty-prints to `logs/breach-logs.txt`; `npm run logs:wipe` deletes the server files.
-- **MK4.4 Gems as colored icons:** tiles render as enlarged colored shapes (silhouette near the tile edges, darker-shade outline) instead of glyphs on colored fields, leaving the center free for the special-tile badges. Supersedes MK2.1's white-fill rule. Neutral static tiles unchanged.
+| Function | Cost |
+|---|---:|
+| Bomb | 7 |
+| Buff | 8 |
+| Attack | 10 |
+| Drain | 9 |
+| E-Bomb | 7 |
+| Shield | 8 |
 
-## MK3 revisions (Section 1-MK3 — Combat Cohesion Pass)
-
-- **MK3.1 Constants:** match damage halved (low 1 / high 2 / neutral 2; charge unchanged); `ATTACKER_DAMAGE` 30; bomb fuse 2 turns and blast expanded to the full 3×3 (`BOMB_BLAST_OFFSETS` named constant).
-- **MK3.2 Disabler:** the player's Disabler is player-targetable — tapping the charged indicator arms a targeting mode (enemy minion boxes highlight; tap one to discharge it, tap anywhere else to cancel free). The enemy Disabler uses a fixed, legible rule: the player's highest-COST program with any charge, tie-break by raw charge then random; fizzles if nothing has charge.
-- **MK3.3 Blob/merge matching:** straight-line 3+ runs are detected per axis (color / shape / neutral, tagged with their value) then merged — same-axis same-value matches that share a tile or touch orthogonally union into one blob, repeated until stable. Blob tier = tile count; line 4+ clears its row/column; non-line 5+ crits with no clear. Cross-axis matches never merge. This makes `MATCH_5_NONLINE_MULTIPLIER` reachable (crits went from ~0.2% to ~2-4% of match damage in bot play).
-- **MK3.4 Bot:** harness bot (`scripts/bot.ts`) prefers any move producing a 4+ match, else first-found. Still a deliberately weak floor indicator.
-- **MK3.5 Metrics:** `npm run batch` splits all aggregates by outcome (player won vs lost) with the bot win rate as the headline calibration number.
-- **MK3.6 Visuals:** special-tile badges centered in the shape glyph; white (player) markers get black outlines; fonts sized to fill their allotted areas.
-
-## MK2 revisions (Section 1-MK2)
-
-- **MK2.1 Shape rendering:** standard-tile shapes are a white fill with a 1px outline in a darker shade of the tile's own color; each tile also gets a 1px darker-same-color border. Neutral tiles unchanged.
-- **MK2.2 Board-shake is pure anti-lock:** the paid shake is now identical to the automatic deadlock reshuffle — guaranteed ≥1 valid move, no pre-existing match, therefore no damage/charge/cascades. Cost 3, starts charged, neutral-match replenishment unchanged. The old cascade-payoff rule is removed.
-- **MK2.3 Per-battle metrics:** collected entirely in the logic layer (`src/logic/metrics.ts`) by consuming the resolver's event stream — the same collector powers the game-over display and headless batch runs (`npm run batch`). Metric definitions:
-  - Per-unit "effect": Attacker = direct damage; Bomber = detonation damage from that side's bombs; Buffer = bonus damage its buffs added to damage events; Disabler = charge drained.
-  - Crit metric counts only the damage **added** by the 1.5× multiplier (per-tile `base × 0.5`, measured pre-floor).
-  - Deepest cascade: steps in one move (1 = no cascading); a detonation counts its blast + subsequent cascade steps. Turn count and match-lock (auto-reshuffle) count are battle-global; everything else is per side.
-  - Displayed on the game-over dialog below the win/loss indicator and Reset/Quit, in a scrollable plain-text area, player side first.
-- `STARTING_HP_ENEMY` is 350 for this iteration (designer-set).
+The former flat-cost override and in-game ability-cost editors were removed. Edit the source datasets and restart the application to change content values.
 
 ## Controls
 
-- **Tap** a tile to select it (orange outline); tap an adjacent tile to swap, a non-adjacent tile to move the selection, the same tile to deselect. **Or press-and-drag** a tile toward a neighbor to swap.
-- Invalid swaps animate, revert with a "no match" notice, and do **not** consume the turn.
-- **Tap a charged program box** (top area) or **SHAKE** to fire it — only before you make your match.
-- **≡** opens the pause menu (Reset / Quit) — only available during your make-a-match phase.
+### Board
+
+- Tap a tile to select it.
+- Tap an adjacent tile to attempt a swap.
+- Tap a non-adjacent tile to move the selection.
+- Tap the selected tile again to deselect.
+- Press and drag toward an adjacent tile as an alternative swap input.
+- Invalid swaps animate, revert, and do not consume the turn.
+
+### Functions
+
+- Activate charged Hacker Functions before committing the turn-ending match.
+- Targeted Hacker Effects enter a targeting interface.
+- Canceling a target selection does not spend charge.
+- Board-Shake remains a separate pre-match control.
+
+### Menus
+
+- **New Game** starts a new battle and replaces any resident in-progress save.
+- **Continue** appears only when a compatible save is available.
+- **Settings** contains supported battle configuration.
+- The battle menu supports Resume, Reset, Quit, and the Character Sheet.
+
+## Data-driven content
+
+Runtime source files are stored under `data/`.
+
+The three required datasets are:
+
+```text
+Hacker Programs
+System Programs
+Functions
+```
+
+Both Program datasets use the same schema. Stable IDs preserve side identity in their values:
+
+```text
+PRG_H_...   Hacker Program
+PRG_S_...   System Program
+FNC_...     Function
+EFFECT_...  coded Effect
+```
+
+Programs define identity, display name, charge bindings, and Function references. Functions define cost, payload, and named Effect parameters. Effects remain coded TypeScript actions.
+
+### Function composition
+
+A Function may be:
+
+- a leaf that invokes one coded Effect; or
+- a one-level composite that invokes one or more leaf Functions sequentially.
+
+Composite Functions:
+
+- pay the parent cost once
+- ignore child costs
+- execute children in listed order
+- allow a legal child fizzle without stopping later children
+- cannot self-reference, form cycles, or nest another composite
+- cannot mix direct Effect and child-Function payload entries
+
+Only one non-random targeted operation may occur in an expanded Function plan, and it must execute first. This rule applies to both Hacker and System Functions.
+
+### Targeting
+
+Unless an Effect defines a specific override:
+
+- Hacker-targeted Effects present a player targeting interface.
+- System-targeted Effects choose randomly among valid targets.
+
+System Drain uses a specific priority rule:
+
+1. Consider opposing Programs with charge above zero.
+2. Prefer fully charged Programs.
+3. Among fully charged Programs, prefer highest raw charge.
+4. If none are fully charged, prefer highest partial charge.
+5. Break remaining ties by highest activation cost, then randomly.
+6. A drain-only System Function with no valid target withholds activation and preserves its charge.
+
+## Startup validation
+
+The application validates all external content before constructing the title screen or battle state.
+
+Validation covers:
+
+- required datasets and columns
+- stable ID formats and global uniqueness
+- side-specific Program prefixes
+- data types and numeric ranges
+- color, shape, area-pattern, Function, and Effect enums
+- required and unused Effect parameters
+- broken references
+- duplicate registrations
+- invalid composition
+- targeting-order restrictions
+- required baseline records
+
+Validation collects all errors and warnings with dataset, file, row, record ID, field, supplied value, expected form, and reason.
+
+- Any validation error blocks startup.
+- The browser displays a blocking failure screen with no gameplay bypass.
+- Node tools log the complete report and exit nonzero.
+- Warnings do not block startup.
+- Invalid data is never silently repaired.
+- There is no fallback to hardcoded content.
+
+Data is loaded once at application startup. It is not reloaded during an active session or battle.
 
 ## Architecture
 
-- `src/logic/` — pure, framework-agnostic game rules (no DOM, no rendering). Deterministic under a seeded RNG. This is the layer that would port to Godot.
-  - `constants.ts` — every gameplay-affecting number (the spec's Tunable Constants block plus the approved additions below). Nothing is hardcoded elsewhere.
-  - `types.ts`, `rng.ts`, `board.ts` (generation, deadlock scan, both reshuffle paths), `match.ts` (straight-line run detection), `resolve.ts` (per-destroyed-tile damage/charge, cascade steps, detonations), `game.ts` (turn structure, abilities, enemy phase).
-- `src/render/` + `src/main.ts` — canvas renderer/input and DOM dialogs. Logic methods return an ordered `GameEvent[]` which the renderer replays as animations; the renderer contains no game rules.
-- `scripts/smoke.ts` — headless battles verifying: both scenarios reach game over, board never deadlocks, charge caps hold, invalid swaps don't consume the turn, abilities can't fire after the match commits.
+```text
+data/
+  Authoritative Program and Function CSV resources
 
-## Agent-discretion choices (approved)
+src/logic/data/
+  Shared CSV parser, phased validator, resolver, and immutable content model
 
-| Decision | Choice |
-|---|---|
-| 6 colors | Red, Yellow, Magenta, Green, Cyan, Blue (flat canvas fills) |
-| 6 shapes | Circle, Square, Triangle, Diamond, Star, Cross (canvas glyphs drawn dark over the tile color) |
-| HIGH colors (4 dmg/tile) | Red, Yellow, Magenta — "warm hits harder" |
-| LOW colors (2 dmg/tile) | Green, Cyan, Blue |
-| Hacker bonus color | **Red** (+1 dmg and +1 charge per red tile, player match events only) |
-| Bomber (cost 7) binding | Red + Triangle (bonus color on the cheapest program so the interaction is exercised often) |
-| Buffer (cost 13) binding | Green + Square |
-| Attacker (cost 19) binding | Yellow + Star |
-| Disabler (cost 22) binding | Blue + Cross |
+src/dataBrowser.ts
+  Browser/Vite resource-loading adapter
 
-**As of MK9** (Section 1-MK9) sides diverge — see the MK9 section above:
-- **Strong tiers are per-side.** Player strong = Red/Yellow/Magenta + Square/Cross/Diamond (2 dmg); enemy strong = the opposite sets (Green/Cyan/Blue + Triangle/Star/Circle). A match is strong only for the side that owns that binding.
-- **Enemy Bomber→E-Bomb (Magenta + Diamond)** and **enemy Buffer→Shielder (Cyan + Circle)** now bind on colors/shapes unused by player abilities. Enemy Attacker (Yellow + Star) and Disabler (Blue + Cross) keep the shared bindings. The player program bindings above are unchanged.
+scripts/dataNode.ts
+  Node filesystem resource-loading adapter
 
-## Clarified rules baked in (from designer Q&A)
+src/logic/
+  Pure deterministic combat rules, state, saves, metrics, and events
 
-- Matches are **owned events**. Enemy bomb detonations trigger enemy-owned cascade matches: they damage the **player** (same formulas, enemy buffs apply per step) and charge **enemy minions**. Blast-destroyed tiles themselves grant no charge to anyone.
-- Charge is strictly **owner-scoped**: player matches charge only player units/shake; enemy cascades charge only enemy minions. Neutral tiles in enemy cascades damage the player but charge nothing.
-- The Hacker passive (Red +1/+1) applies **only to player-owned match events** — never to blasts or enemy cascades.
-- Board-shake is mechanically a unit ability: cost 3, +1 charge per neutral tile destroyed in a player match (including row/column-clear sweeps), capped at 3, starts charged. New constant: `SHAKE_CHARGE_PER_NEUTRAL_TILE = 1`. (Its effect is the MK2.2 pure anti-lock reshuffle — see above.)
-- Bombs/buffs swept by a 4/5-match row/column clear are destroyed as **normal tiles** (no detonation); a same-side buff destroyed in a step/blast still counts toward that same step's damage.
-- 4/5-tier effects (row/column clears, crits) can occur in any cascade step, from either side's events.
+src/render/
+  Canvas rendering and animation playback
 
-## Implementation notes & assumptions
+src/main.ts
+  Browser startup, input, and UI integration
 
-- **Fractional damage is floored** per step after the 1.5× crit multiplier (e.g. raw 22.5 → 22). Buff bonuses are added after flooring.
-- **Runs of 6+** in a line (possible after refills) are treated as the 5-line tier: crit + line clear.
-- `MATCH_5_NONLINE_MULTIPLIER` is defined but **unreachable**: with straight-line-only detection and no blob merging (spec 1.4 / rule 9), no single match can be 5 non-linear tiles. Kept for the Section 2 non-linear match roadmap.
-- A same-color-AND-same-shape run is detected as two coincident matches; per-destroyed-tile set resolution makes this harmless (each tile counted once, highest multiplier).
-- The pause dialog includes a **Resume** button in addition to the spec's Reset/Quit, purely so the menu can be dismissed.
-- The enemy Disabler targets the player's 4 **programs** only (the shake meter is not a unit).
-- HP display clamps at 0; the game-over dialog states victory/defeat and offers Reset/Quit.
+scripts/
+  Headless tests, smoke battles, batch analysis, HP ladder, and log tooling
+```
 
-## Out of scope (per spec Section 1.14 / Section 2)
+The renderer contains no combat rules. Logic produces ordered events that the renderer displays. Seeded logic can be run without a browser.
 
-No map, no build selection, no dongles, no dev console, no persistence, no deployment, no art/theming pass.
+Effect validation is centralized in the Effect registry. Runtime Effect dispatch remains exhaustive TypeScript code rather than a scripting language.
+
+## Persistence
+
+The current battle autosaves at stable state boundaries. Saves include:
+
+- game/build version
+- data-schema version
+- gameplay-content fingerprint
+- stable Program and Function IDs
+- board and special-object state
+- HP and charge
+- configuration
+- metrics
+- deterministic RNG state
+
+Pre-Alpha saves are rejected. A save whose content fingerprint no longer matches the loaded datasets is also rejected rather than resumed with changed Function behavior.
+
+The content fingerprint is based on normalized gameplay-relevant data; notes and formatting-only changes should not invalidate a save.
+
+## Metrics and logging
+
+Combat metrics consume the same logic-layer event stream as human play and automated simulations.
+
+Current instrumentation includes:
+
+- battle outcomes and turn counts
+- causal damage buckets
+- match, bomb, attack, and Buffer attribution
+- shield creation, removal, hits, and prevented damage
+- Function activation versus Effect-operation and fizzle counts
+- charge usage and waste
+- cascade behavior
+- think time
+- Program-ID keyed metrics
+- active build, schema, content fingerprint, Program IDs, and costs
+
+Browser logging remains separate from server-side development log operations.
+
+Developer commands:
+
+```bash
+npm run logs:dump
+npm run logs:wipe
+```
+
+The raw development log uses JSONL. Readable dumps append session blocks rather than replacing prior dumps. Raw-log wiping preserves the readable dump. Server-side writes are guarded by a configurable filesystem-usage threshold and are isolated so logging failures cannot interrupt gameplay.
+
+Browser console helpers remain available for inspecting or clearing browser-side logs where supported by the current build.
+
+## Current scope
+
+Alpha 0.1.0 establishes reusable combat-content infrastructure while preserving the tested battle model.
+
+Not included yet:
+
+- sequential multi-battle runs
+- map progression
+- Hacker or Deck selection
+- build and inventory interfaces
+- rewards
+- bosses
+- battlefields or map effects
+- procedural Program or Function generation
+- multiple active Functions per Program
+- arbitrary nested Function composition
+- a generalized targeting-rule data system
+- a generalized scripting language
+- production art or final visual theming
+
+The next development phase can add content and game structure on top of the current Program/Function/Effect architecture without returning to hardcoded combat definitions.

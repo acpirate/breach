@@ -1,22 +1,20 @@
 // Orchestrator: wires the pure logic layer to the canvas view and DOM dialogs.
-// Owns the interaction flow (data load → title → battle → pause/game-over)
-// but no game rules.
-//
-// Alpha 0.1.0: startup loads and validates the CSV datasets BEFORE any title
-// or battle initialization (§5.3/§10.4). Any validation error shows a
-// blocking developer-facing failure screen with no bypass; the resolved
-// runtime model is then the single source of truth for every consumer here.
+// Owns the interaction flow (data load → title → battle → pause/result) but
+// no game rules: mode/Run/result/save semantics live in logic/session.ts and
+// this file only composes dialogs and routes actions through that API.
 
 import {
   BOARD_SHAKE_COST,
   CHARGE_PER_TILE_COLOR_MATCH,
   CHARGE_PER_TILE_SHAPE_MATCH,
+  COLOR_COUNT,
   DAMAGE_PER_TILE_HIGH_COLOR,
   DAMAGE_PER_TILE_HIGH_SHAPE,
   DAMAGE_PER_TILE_LOW_COLOR,
   DAMAGE_PER_TILE_LOW_SHAPE,
   DAMAGE_PER_TILE_NEUTRAL,
   DEFAULT_BATTLE_CONFIG,
+  SHAPE_COUNT,
 } from './logic/constants';
 import {
   ResolvedProgram,
@@ -31,14 +29,31 @@ import { findBotMove, findHintMove } from './logic/bot';
 import { Game } from './logic/game';
 import { LOG_VERSION } from './logic/logger';
 import { BattleMetrics } from './logic/metrics';
-import { deserializeGame, serializeGame } from './logic/save';
-import { BattleConfig, Color, Pt, Shape, Side, gridViewOf } from './logic/types';
+import {
+  PendingResultInfo,
+  SessionInfo,
+  battleContext,
+  contextLabel,
+  continueLabel,
+  createQuickMatchBattle,
+  createRunBattle,
+  deserializeSession,
+  encounterFor,
+  isRunComplete,
+  naturalOf,
+  nextStep,
+  progressesAsVictory,
+  serializeSession,
+  snapshotRunConfig,
+} from './logic/session';
+import { BattleConfig, Color, Pt, Shape, Side, WizardAction, gridViewOf } from './logic/types';
 import { browserDataFiles } from './dataBrowser';
 import { attachInput } from './render/input';
 import { Hud, View } from './render/view';
 import {
   appendMetricsLog,
   appendTurnLogs,
+  appendWizardLog,
   clearBattleSave,
   loadBattleJson,
   loadMenuConfig,
@@ -51,25 +66,25 @@ import {
 const canvas = document.getElementById('game') as HTMLCanvasElement;
 const overlay = document.getElementById('overlay') as HTMLDivElement;
 
+// ---- session state (owned semantics live in logic/session.ts) ----
+let session: SessionInfo | null = null;
+let pending: PendingResultInfo | null = null;
 let game: Game | null = null;
+
 let busy = false; // true while animations / enemy phase are in flight
 let selection: Pt | null = null;
-// MK6.6 — think-time clock: stamped when the turn's input actually unlocks,
-// read when the match commits. Abilities/invalid swaps leave it running.
+// MK6.6 — think-time clock
 let thinkStart: number | null = null;
 let battleStartAt = 0; // wall-clock anchor for this session's battle
 // MK7.7 — hint state
 let hintFiredThisTurn = false;
 let lastInputAt = performance.now();
-// Targeting mode: which player slot is armed and awaiting an enemy target
-// (Alpha: any Program whose plan leads with the player-targeted Drain).
+// Targeting mode: which player slot is armed and awaiting an enemy target.
 let targetingSlot: number | null = null;
-// MK5.4: the menu's battle config — persisted, never implicitly reset. A
-// running battle uses ITS OWN immutable copy (game.state.config), not this.
+// MK5.4: the menu's battle config — persisted, never implicitly reset.
 let menuConfig: BattleConfig = DEFAULT_BATTLE_CONFIG;
 
 // canonical value list — safer than field-by-field as the config grows
-// (Alpha: cost fields removed from config; costs are content)
 function configKey(c: BattleConfig): string {
   return JSON.stringify([
     c.enemyMatching,
@@ -91,8 +106,6 @@ function configsEqual(a: BattleConfig, b: BattleConfig): boolean {
   return configKey(a) === configKey(b);
 }
 
-// input just unlocked into the make-a-match phase → start the think clock
-// and reset the per-turn hint state (MK7.7)
 function endBusy(): void {
   busy = false;
   thinkStart = canAct() ? performance.now() : null;
@@ -104,8 +117,8 @@ function canAct(): boolean {
   return !!game && !busy && !game.state.winner && game.state.phase === 'playerPre';
 }
 
-// Sum of active special-tile magnitudes for a side (buff bonus / shield
-// points come from the per-tile data stamped at placement).
+// Sum of active special-tile magnitudes for a side (§9.2 — Effect value from
+// authoritative logic state, not tile count, not render objects).
 function specialMagnitude(kind: 'buff' | 'shield', side: Side): number {
   if (!game) return 0;
   let n = 0;
@@ -125,7 +138,7 @@ function getHud(): Hud | null {
   const system = programsFor('enemy');
   return {
     hpPlayer: Math.max(0, s.hp.player),
-    hpPlayerMax: s.config.playerHp, // MK6.4: HP lives in the config
+    hpPlayerMax: s.config.playerHp,
     hpEnemy: Math.max(0, s.hp.enemy),
     hpEnemyMax: s.config.enemyHp,
     programs: s.units.player.map((u, i) => {
@@ -141,7 +154,8 @@ function getHud(): Hud | null {
     shakeReady: act && s.shakeCharge >= BOARD_SHAKE_COST,
     buffPlayer: specialMagnitude('buff', 'player'),
     buffEnemy: specialMagnitude('buff', 'enemy'),
-    shieldEnemy: specialMagnitude('shield', 'enemy'), // MK9.3
+    shieldPlayer: specialMagnitude('shield', 'player'),
+    shieldEnemy: specialMagnitude('shield', 'enemy'),
     turn: s.turn,
     canAct: act,
     statusText: s.winner
@@ -159,7 +173,12 @@ const view = new View(canvas, getHud);
 
 // ---- dialogs (DOM) ----
 
-function showDialog(title: string, sub: string, buttons: [string, () => void][], extra?: HTMLElement): void {
+// A button spec's optional third element is a CSS class — used to mark
+// wizard/dev controls as visually distinct (§5.2) without changing which
+// handler fires.
+type ButtonSpec = [string, () => void, string?];
+
+function showDialog(title: string, sub: string, buttons: ButtonSpec[], extra?: HTMLElement): void {
   overlay.innerHTML = '';
   const box = document.createElement('div');
   box.className = 'dialog';
@@ -171,19 +190,19 @@ function showDialog(title: string, sub: string, buttons: [string, () => void][],
     p.textContent = sub;
     box.appendChild(p);
   }
-  for (const [label, cb] of buttons) {
+  for (const [label, cb, cls] of buttons) {
     const b = document.createElement('button');
     b.textContent = label;
+    if (cls) b.className = cls;
     b.addEventListener('click', cb);
     box.appendChild(b);
   }
-  if (extra) box.appendChild(extra); // MK2.3: metrics go BELOW the buttons
+  if (extra) box.appendChild(extra);
   overlay.appendChild(box);
   overlay.classList.remove('hidden');
 }
 
-// MK2.3 game-over metrics: plain text rows in a scrollable area, player side
-// first, enemy side second. Reads only logic-layer metrics state.
+// MK2.3 game-over metrics panel (unchanged content).
 function metricsElement(m: BattleMetrics): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'metrics';
@@ -198,30 +217,27 @@ function metricsElement(m: BattleMetrics): HTMLElement {
   row('BATTLE', true);
   row(`Turns to resolution: ${m.turns}`);
   row(`Match-locks (auto-reshuffles): ${m.autoReshuffles}`);
-  // MK9.3 — enemy shields (prevention is NOT damage dealt; reported separately)
   row(`Enemy shields — created ${m.enemyShieldCreated}, removed ${m.enemyShieldRemoved}`);
   row(`Shielded hits: ${m.enemyShieldInstances}, damage prevented: ${fmt(m.enemyShieldPrevented)}`);
 
   for (const side of ['player', 'enemy'] as const) {
     const sm = m.sides[side];
     row(side === 'player' ? 'YOUR SIDE' : 'ENEMY SIDE', true);
-    // MK7.3/7.4 — four disjoint causal buckets (sum exactly to total)
     row(`Total damage dealt: ${fmt(sm.totalDamage)}`);
     row(`  match-caused (incl. its cascades): ${fmt(sm.matchDamage)}`);
     row(`  bomb-caused (incl. its cascades): ${fmt(sm.bombDamage)}`);
     row(`  Attack: ${fmt(sm.attackerDamage)}`);
     row(`  Buffer added: ${fmt(sm.bufferDamageAdded)}`);
-    row(`Cascade (RNG-refill) damage, any cause: ${fmt(sm.cascadeDamage)}`); // MK7.3 cross-cut
-    row(`Match damage by axis: color ${fmt(sm.matchDamageColor)} / shape ${fmt(sm.matchDamageShape)}`); // MK7.5
+    row(`Cascade (RNG-refill) damage, any cause: ${fmt(sm.cascadeDamage)}`);
+    row(`Match damage by axis: color ${fmt(sm.matchDamageColor)} / shape ${fmt(sm.matchDamageShape)}`);
     const critPct = sm.matchDamage > 0 ? ((sm.critExtra / sm.matchDamage) * 100).toFixed(1) : '0.0';
     row(`Crit bonus damage (1.5x extra): ${fmt(sm.critExtra)} (${critPct}% of match damage)`);
     row(`Largest single hit: ${fmt(sm.largestHit)}`);
-    row(`Biggest round: ${fmt(sm.biggestRound)}`); // MK7.6 swinginess
+    row(`Biggest round: ${fmt(sm.biggestRound)}`);
     row(`Avg round damage (nonzero rounds): ${sm.roundDamageCount ? fmt(sm.roundDamageSum / sm.roundDamageCount) : '0'}`);
     row(`Deepest cascade: ${sm.deepestCascade} RNG round${sm.deepestCascade === 1 ? '' : 's'}`);
     const contPct = sm.tilesDestroyed > 0 ? ((sm.contentionTiles / sm.tilesDestroyed) * 100).toFixed(1) : '0.0';
     row(`Opponent-bound tiles destroyed: ${sm.contentionTiles} of ${sm.tilesDestroyed} (${contPct}%)`);
-    // Alpha §13.4: metrics keyed by stable Program ID; display names joined here
     for (const p of programsFor(side)) {
       const u = sm.units[p.id];
       if (!u) continue;
@@ -231,12 +247,11 @@ function metricsElement(m: BattleMetrics): HTMLElement {
     }
   }
 
-  // MK6.6 — timing (median computed here at display time; raw values logged)
   row('TIMING', true);
   const med = median(m.thinkTimesMs);
   row(`Median think-time: ${med === null ? 'n/a' : `${(med / 1000).toFixed(1)}s`} (${m.thinkTimesMs.length} moves)`);
   row(`Battle wall-clock: ${((Date.now() - battleStartAt) / 1000).toFixed(0)}s (this session)`);
-  if (m.hintsShown > 0) row(`Hints shown: ${m.hintsShown}`); // MK7.7
+  if (m.hintsShown > 0) row(`Hints shown: ${m.hintsShown}`);
   return wrap;
 }
 
@@ -251,9 +266,7 @@ function hideDialog(): void {
   overlay.classList.add('hidden');
 }
 
-// MK5.3/MK7.10 — battle config panel (lives in the Settings modal). Persists
-// on every change; "Reset to Defaults" is the only reset. MK8.2 accordion.
-// Alpha §12.4/12.5: the flat-cost and per-ability-cost controls are REMOVED.
+// MK5.3/MK7.10 — battle config panel (Settings modal). Unchanged by 0.2.0.
 function configPanel(rerender: () => void): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'config';
@@ -294,7 +307,6 @@ function configPanel(rerender: () => void): HTMLElement {
   check(modes, 'Hacker color bonus', 'hackerBonusEnabled');
   check(modes, 'Single-axis payout', 'singleAxisPayout');
 
-  // MK6.2 No match damage + MK7.13 addendum sub-option
   const nmdRow = document.createElement('label');
   const nmdCb = document.createElement('input');
   nmdCb.type = 'checkbox';
@@ -321,7 +333,6 @@ function configPanel(rerender: () => void): HTMLElement {
     saveMenuConfig(menuConfig);
   });
 
-  // MK6.4 — starting HP inputs (1-9999)
   const hpInput = (label: string, key: 'playerHp' | 'enemyHp'): void => {
     const l = document.createElement('label');
     l.appendChild(document.createTextNode(`${label} `));
@@ -343,7 +354,6 @@ function configPanel(rerender: () => void): HTMLElement {
   hpInput('Player HP', 'playerHp');
   hpInput('Enemy HP', 'enemyHp');
 
-  // MK7.7 — hint system
   const hintRow = document.createElement('label');
   const hintCb = document.createElement('input');
   hintCb.type = 'checkbox';
@@ -372,7 +382,6 @@ function configPanel(rerender: () => void): HTMLElement {
   delayRow.appendChild(delayN);
   hints.appendChild(delayRow);
 
-  // cascade cap: "Infinite?" toggle + 0-9 integer input (0 = zero cascades)
   const capRow = document.createElement('label');
   const inf = document.createElement('input');
   inf.type = 'checkbox';
@@ -415,14 +424,13 @@ function configPanel(rerender: () => void): HTMLElement {
   reset.addEventListener('click', () => {
     menuConfig = { ...DEFAULT_BATTLE_CONFIG };
     saveMenuConfig(menuConfig);
-    rerender(); // rebuild the modal with default values
+    rerender();
   });
   wrap.appendChild(reset);
   return wrap;
 }
 
 // Read-only config summary (pause panel + divergent-resume acknowledgment).
-// Alpha: cost rows removed — costs are content, shown on the Character Sheet.
 function configSummary(c: BattleConfig, heading: string): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'config readonly';
@@ -447,8 +455,8 @@ function configSummary(c: BattleConfig, heading: string): HTMLElement {
   return wrap;
 }
 
-// MK6.5 — character sheet: the game's numbers, readable in-game. Alpha §12.1:
-// names, costs, and bindings come from the RESOLVED DATA.
+// ---- character sheets (§10 — per side, opened from the avatar boxes) ----
+
 const COLOR_NAMES: Record<Color, string> = {
   [Color.Red]: 'Red', [Color.Yellow]: 'Yellow', [Color.Magenta]: 'Magenta',
   [Color.Green]: 'Green', [Color.Cyan]: 'Cyan', [Color.Blue]: 'Blue',
@@ -458,7 +466,10 @@ const SHAPE_NAMES: Record<Shape, string> = {
   [Shape.Diamond]: 'Diamond', [Shape.Star]: 'Star', [Shape.Cross]: 'Cross',
 };
 
-function characterSheet(cfg: BattleConfig): HTMLElement {
+// §10.2: strong/weak colors and shapes (weak = recognized complement), plus
+// the pre-existing per-Program and general reference rows (designer ruling:
+// keep extras while they fit; trim later if crowded).
+function characterSheetSide(cfg: BattleConfig, side: Side): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'config readonly';
   const row = (text: string, head = false): void => {
@@ -467,45 +478,129 @@ function characterSheet(cfg: BattleConfig): HTMLElement {
     d.textContent = text;
     wrap.appendChild(d);
   };
-  row('CHARACTER SHEET', true);
-  // MK9.5: player and enemy statistics visibly separated; each side shows its
-  // OWN strong color/shape. Charge & neutral explanations stay at the bottom.
-  const sides: Array<[string, Side]> = [
-    ['YOU', 'player'],
-    ['ENEMY', 'enemy'],
-  ];
-  for (const [label, side] of sides) {
-    row(label, true);
-    const sc = cfg.strongColors[side];
-    const ss = cfg.strongShapes[side];
-    row(`Strong colors (${DAMAGE_PER_TILE_HIGH_COLOR} dmg): ${sc.length ? sc.map((c) => COLOR_NAMES[c]).join(', ') : 'none'}`);
-    row(`Strong shapes (${DAMAGE_PER_TILE_HIGH_SHAPE} dmg): ${ss.length ? ss.map((s) => SHAPE_NAMES[s]).join(', ') : 'none'}`);
-    row(`Weak (all other) colors/shapes: ${DAMAGE_PER_TILE_LOW_COLOR}/${DAMAGE_PER_TILE_LOW_SHAPE} dmg`);
-    for (const p of programsFor(side)) {
-      const colors = p.colors.map((c) => COLOR_NAMES[c]).join('/');
-      const shapes = p.shapes.map((s) => SHAPE_NAMES[s]).join('/');
-      row(`${p.name} [${p.id}] — cost ${p.cost} — ${colors} + ${shapes} — ${p.fn.name}`);
-    }
+  const strongC = cfg.strongColors[side];
+  const strongS = cfg.strongShapes[side];
+  const weakC = Array.from({ length: COLOR_COUNT }, (_, i) => i as Color).filter((c) => !strongC.includes(c));
+  const weakS = Array.from({ length: SHAPE_COUNT }, (_, i) => i as Shape).filter((s) => !strongS.includes(s));
+  row(side === 'player' ? 'HACKER' : 'SYSTEM', true);
+  row(`Strong colors (${DAMAGE_PER_TILE_HIGH_COLOR} dmg): ${strongC.length ? strongC.map((c) => COLOR_NAMES[c]).join(', ') : 'none'}`);
+  row(`Weak colors (${DAMAGE_PER_TILE_LOW_COLOR} dmg): ${weakC.length ? weakC.map((c) => COLOR_NAMES[c]).join(', ') : 'none'}`);
+  row(`Strong shapes (${DAMAGE_PER_TILE_HIGH_SHAPE} dmg): ${strongS.length ? strongS.map((s) => SHAPE_NAMES[s]).join(', ') : 'none'}`);
+  row(`Weak shapes (${DAMAGE_PER_TILE_LOW_SHAPE} dmg): ${weakS.length ? weakS.map((s) => SHAPE_NAMES[s]).join(', ') : 'none'}`);
+  row('PROGRAMS', true);
+  for (const p of programsFor(side)) {
+    const colors = p.colors.map((c) => COLOR_NAMES[c]).join('/');
+    const shapes = p.shapes.map((s) => SHAPE_NAMES[s]).join('/');
+    row(`${p.name} [${p.id}] — cost ${p.cost} — ${colors} + ${shapes} — ${p.fn.name}`);
   }
-  // MK9.5: general charge + neutral explanations LAST, after side-specific info.
   row('GENERAL', true);
   row(`Charge: +${CHARGE_PER_TILE_COLOR_MATCH} per tile of a program's bound color, +${CHARGE_PER_TILE_SHAPE_MATCH} per bound shape`);
   row(`Neutral damage: ${DAMAGE_PER_TILE_NEUTRAL} (matches only other neutrals; refills your Shake)`);
   return wrap;
 }
 
-// MK7.10 — title screen is ACTIONS ONLY: New Game / Continue / Settings.
+function showCharacterSheet(side: Side): void {
+  if (!game) return;
+  const panels = document.createElement('div');
+  panels.className = 'panelscroll';
+  panels.appendChild(characterSheetSide(game.state.config, side));
+  showDialog(side === 'player' ? 'HACKER' : 'SYSTEM', '', [['Close', hideDialog]], panels);
+}
+
+// ---- persistence (session envelope — logic/session.ts owns the format) ----
+
+function persistSession(): void {
+  if (!game || !session) return;
+  saveBattle(serializeSession(session, game, pending), game.state.turn);
+}
+
+function appendWizard(action: WizardAction): void {
+  if (!game || !session || !pending) return;
+  appendWizardLog({
+    v: LOG_VERSION,
+    battleId: game.state.battleId,
+    mode: session.mode,
+    ...(session.mode === 'RUN' ? { runStep: session.step } : {}),
+    natural: pending.natural,
+    action,
+    at: new Date().toISOString(),
+  });
+}
+
+// After every completed action: drain and context-stamp turn logs, then
+// either persist the active battle (stable point) or conclude into a saved
+// PENDING_RESULT (§5.1 — the save is NOT cleared when the result appears;
+// only accepted terminal actions clear it, §6.4).
+function afterAction(): void {
+  if (!game || !session) return;
+  const ctx = battleContext(session);
+  const entries = game.drainTurnLogs().map((e) => ({ ...e, mode: ctx.mode, ...(ctx.runStep !== undefined ? { runStep: ctx.runStep } : {}) }));
+  appendTurnLogs(entries);
+  if (game.state.winner) {
+    if (!pending) {
+      pending = { natural: naturalOf(game.state.winner), metricsLogged: false };
+      logBattleMetrics();
+    }
+    persistSession();
+  } else if (game.state.phase === 'playerPre') {
+    persistSession();
+  }
+}
+
+function logBattleMetrics(): void {
+  if (!game || !session || !pending || pending.metricsLogged || !game.state.winner) return;
+  const ctx = battleContext(session);
+  appendMetricsLog({
+    v: LOG_VERSION,
+    battleId: game.state.battleId,
+    config: { ...game.state.config },
+    content: contentStamp(),
+    endedAt: new Date().toISOString(),
+    winner: game.state.winner,
+    natural: pending.natural,
+    mode: ctx.mode,
+    ...(ctx.runStep !== undefined ? { runStep: ctx.runStep } : {}),
+    ...(ctx.encounterSystemHp !== undefined ? { encounterSystemHp: ctx.encounterSystemHp } : {}),
+    wallClockMs: Date.now() - battleStartAt,
+    metrics: game.state.metrics,
+  });
+  pending.metricsLogged = true;
+}
+
+// ---- title flow (§3) ----
+
 function showTitle(): void {
   game = null;
-  view.clearBoard(); // MK7.11: no ghost board behind the title after Quit
-  const buttons: [string, () => void][] = [];
-  const resumable = deserializeGame(loadBattleJson());
-  if (resumable) {
-    buttons.push([`Continue (turn ${resumable.state.turn})`, () => void resumeBattle()]);
+  session = null;
+  pending = null;
+  view.clearBoard();
+  const restored = deserializeSession(loadBattleJson());
+  const buttons: ButtonSpec[] = [];
+  if (restored) {
+    buttons.push([continueLabel(restored.info), () => void resumeSession()]);
   }
-  buttons.push(['New Game', () => void startBattle()]);
+  const savedInfo = restored ? restored.info : null;
+  buttons.push(['Quick Match', () => confirmReplace(savedInfo, () => void startQuickMatch())]);
+  buttons.push(['New Run', () => confirmReplace(savedInfo, () => void startNewRun())]);
   buttons.push(['Settings', showSettings]);
-  showDialog('BREACH — alpha-0.1.0', '', buttons);
+  showDialog('BREACH — alpha-0.2.0', '', buttons);
+}
+
+// §3.6 replacement confirmation — only when a valid resident save exists.
+// Cancel leaves the save and title state unchanged.
+function confirmReplace(saved: SessionInfo | null, start: () => void): void {
+  if (!saved) {
+    start();
+    return;
+  }
+  showDialog(
+    'REPLACE SAVE?',
+    `Starting a new game will replace your resumable ${contextLabel(saved)} progress.`,
+    [
+      ['Cancel', showTitle],
+      ['Replace this save', start],
+    ],
+  );
 }
 
 function showSettings(): void {
@@ -515,12 +610,11 @@ function showSettings(): void {
   showDialog('SETTINGS', 'Applies to the next new game', [['Back', showTitle]], panels);
 }
 
-// MK5.4: `cfg` is supplied by Restart paths (a restart is the same battle —
-// its rules are part of its identity); new games use the menu's config.
-async function startBattle(cfg?: BattleConfig): Promise<void> {
-  clearBattleSave(); // MK4.2: starting fresh wipes any resident save
+// ---- battle starts (all battle construction goes through logic/session.ts) ----
+
+async function enterBattle(g: Game): Promise<void> {
   hideDialog();
-  game = new Game(cfg ?? menuConfig);
+  game = g;
   selection = null;
   targetingSlot = null;
   battleStartAt = Date.now();
@@ -533,26 +627,60 @@ async function startBattle(cfg?: BattleConfig): Promise<void> {
   maybeGameOver();
 }
 
-async function resumeBattle(): Promise<void> {
-  const g = deserializeGame(loadBattleJson());
-  if (!g) {
+async function startQuickMatch(cfg?: BattleConfig): Promise<void> {
+  clearBattleSave(); // confirmed replacement (or a result-screen restart)
+  session = { mode: 'QUICK_MATCH' };
+  pending = null;
+  await enterBattle(createQuickMatchBattle(cfg ?? menuConfig));
+}
+
+async function startNewRun(): Promise<void> {
+  clearBattleSave();
+  session = { mode: 'RUN', step: 1, config: snapshotRunConfig(menuConfig) };
+  pending = null;
+  await enterBattle(createRunBattle(session.config, session.step));
+}
+
+// Create a fresh battle for the CURRENT Run step (§4.3): new board, new RNG,
+// full Hacker HP, encounter System HP, nothing carried over.
+async function startRunStep(): Promise<void> {
+  if (!session || session.mode !== 'RUN') return;
+  pending = null;
+  await enterBattle(createRunBattle(session.config, session.step));
+}
+
+async function resumeSession(): Promise<void> {
+  const r = deserializeSession(loadBattleJson());
+  if (!r) {
     showTitle(); // save vanished/corrupted since the dialog was built
     return;
   }
   hideDialog();
-  game = g;
+  session = r.info;
+  game = r.game;
+  pending = r.pending;
   selection = null;
   targetingSlot = null;
-  battleStartAt = Date.now(); // wall-clock counts this session (MK6.6 discretion)
+  battleStartAt = Date.now();
   view.reset(gridViewOf(game.state.board));
   view.setSelection(null);
-  console.info(`[breach] state restored (turn ${game.state.turn})`);
+  console.info(`[breach] ${contextLabel(session)} restored (turn ${game.state.turn})`);
   busy = true;
-  await view.play([{ t: 'msg', text: `Battle resumed — turn ${game.state.turn}` }]);
+  await view.play([{ t: 'msg', text: `${contextLabel(session)} resumed — turn ${game.state.turn}` }]);
+  if (pending) {
+    // §5.1: restore the battle AND its pending result modal — never skip an
+    // unresolved result. Heal a crash between conclusion and metric logging.
+    logBattleMetrics();
+    persistSession();
+    showResultModal();
+    return;
+  }
   endBusy();
-  // MK5.4: the save's config is authoritative for this battle. If it differs
-  // from the current menu config, force an acknowledgment.
-  if (!configsEqual(game.state.config, menuConfig)) {
+  // MK5.4 divergence acknowledgment: the save's config is authoritative. For
+  // a Run compare the RUN SNAPSHOT (per-battle enemyHp is encounter-overridden
+  // by design and not a divergence).
+  const authoritative = session.mode === 'RUN' ? session.config : game.state.config;
+  if (!configsEqual(authoritative, menuConfig)) {
     showDialog(
       'BATTLE CONFIG',
       'This battle is using the configuration it was started with, not your current settings.',
@@ -562,51 +690,105 @@ async function resumeBattle(): Promise<void> {
   }
 }
 
-// MK4: after every completed action — drain turn logs, then autosave (stable
-// point) or, the moment the battle is over, clear the save and append the
-// Tier 1 metrics log entry (with the Alpha content-identity stamp, §13.2).
-function afterAction(): void {
-  if (!game) return;
-  appendTurnLogs(game.drainTurnLogs());
-  if (game.state.winner) {
-    clearBattleSave();
-    appendMetricsLog({
-      v: LOG_VERSION,
-      battleId: game.state.battleId,
-      config: { ...game.state.config }, // MK5.5 — config stamp (HP included)
-      content: contentStamp(), // §13.2 — loaded-content identity
-      endedAt: new Date().toISOString(),
-      winner: game.state.winner,
-      wallClockMs: Date.now() - battleStartAt, // MK6.6
-      metrics: game.state.metrics,
-    });
-  } else if (game.state.phase === 'playerPre') {
-    saveBattle(serializeGame(game.state), game.state.turn);
+// ---- results, progression, wizard actions (§4.4-4.6, §5) ----
+
+function maybeGameOver(): void {
+  if (!game?.state.winner || !pending) return;
+  showResultModal();
+}
+
+function exitToTitleClearing(): void {
+  clearBattleSave(); // §6.4 accepted terminal action
+  showTitle();
+}
+
+function advanceRun(): void {
+  if (!session || session.mode !== 'RUN') return;
+  const n = nextStep(session.step);
+  if (n === null) return; // step 4 concludes via Run Complete, not advance
+  session = { ...session, step: n };
+  void startRunStep();
+}
+
+function forceWin(): void {
+  if (!game || !session || !pending) return;
+  appendWizard('WIZARD_FORCE_WIN'); // logged distinctly even on a natural win (§5.3)
+  pending = { ...pending, forcedWin: true };
+  persistSession();
+  if (session.mode === 'RUN' && session.step < 4) {
+    advanceRun(); // battles 1-3: progress to the next fresh encounter
+  } else {
+    showResultModal(); // QM terminal / step-4 Run Complete presentation
   }
 }
 
-function maybeGameOver(): void {
-  if (!game?.state.winner) return;
-  busy = true; // lock input for good
-  const won = game.state.winner === 'player';
-  // MK5.4: Restart ALWAYS reuses the exact config of the battle just played
-  const cfg = { ...game.state.config };
-  showDialog(
-    won ? 'VICTORY' : 'DEFEAT',
-    won ? 'Enemy system breached.' : 'Your connection was severed.',
-    [
-      ['Reset', () => void startBattle(cfg)],
-      ['Quit', showTitle],
-    ],
-    metricsElement(game.state.metrics),
-  );
+function wizardRestartLostBattle(): void {
+  if (!session || session.mode !== 'RUN') return;
+  appendWizard('WIZARD_RESTART_LOST_BATTLE');
+  void startRunStep(); // same step/config/encounter HP; new board + RNG (§5.5)
+}
+
+function wizardRestartRun(): void {
+  if (!session || session.mode !== 'RUN') return;
+  appendWizard('WIZARD_RESTART_RUN');
+  session = { ...session, step: 1 };
+  void startRunStep(); // same saved Run config; fresh Battle 1 (§4.6)
+}
+
+function showResultModal(): void {
+  if (!game || !session || !pending) return;
+  busy = true; // lock board input while a result modal is up
+  const m = game.state.metrics;
+
+  // Run Complete (§4.4): step-4 win (natural or forced). No Force Win here.
+  if (session.mode === 'RUN' && isRunComplete(session, pending)) {
+    showDialog(
+      'RUN COMPLETE',
+      pending.forcedWin && pending.natural === 'NATURAL_DEFEAT' ? 'Wizard override — run completed.' : 'All four systems breached.',
+      [['Exit', exitToTitleClearing]],
+      metricsElement(m),
+    );
+    return;
+  }
+
+  const asVictory = progressesAsVictory(pending);
+  const title = pending.natural === 'NATURAL_VICTORY' ? 'VICTORY' : pending.forcedWin ? 'FORCED VICTORY' : 'DEFEAT';
+  const sub =
+    pending.natural === 'NATURAL_VICTORY'
+      ? 'Enemy system breached.'
+      : pending.forcedWin
+        ? 'Wizard override accepted.'
+        : 'Your connection was severed.';
+  const buttons: ButtonSpec[] = [];
+
+  if (session.mode === 'QUICK_MATCH') {
+    // §5.6: preserved Quick Match flow — Reset restarts under this battle's
+    // config (new save), Quit is the accepted terminal action (clears save).
+    const cfg = { ...game.state.config };
+    buttons.push(['Reset', () => void startQuickMatch(cfg)]);
+    buttons.push(['Quit', exitToTitleClearing]);
+    if (!pending.forcedWin) buttons.push(['Force Win', forceWin, 'wizard']);
+  } else if (asVictory) {
+    // Run battles 1-3 won (naturally or forced): accept to advance. Quit
+    // returns to title WITHOUT clearing — the pending result stays resumable.
+    buttons.push(['Next Battle', advanceRun]);
+    buttons.push(['Quit (resume later)', showTitle]);
+    if (!pending.forcedWin) buttons.push(['Force Win', forceWin, 'wizard']);
+  } else {
+    // Run defeat (§4.5): Restart Run, terminal end, wizard restart/force.
+    buttons.push(['Restart Run', wizardRestartRun]);
+    buttons.push(['End Run', exitToTitleClearing]);
+    buttons.push(['Restart Lost Battle', wizardRestartLostBattle, 'wizard']);
+    buttons.push(['Force Win', forceWin, 'wizard']);
+  }
+
+  showDialog(title, sub, buttons, metricsElement(m));
 }
 
 // ---- player actions ----
 
 async function doSwap(a: Pt, b: Pt): Promise<void> {
   if (!game) return;
-  // MK6.6: think-time = input-available -> this committed move
   const thinkMs = thinkStart !== null ? performance.now() - thinkStart : undefined;
   busy = true;
   view.setHint(null);
@@ -616,7 +798,7 @@ async function doSwap(a: Pt, b: Pt): Promise<void> {
     if (!game.state.winner) await view.play(game.runEnemyPhase());
     if (!game.state.winner) await view.play(game.startPlayerPhase());
     afterAction();
-    endBusy(); // move committed: next turn's think clock starts fresh
+    endBusy();
   } else {
     busy = false; // invalid swap: the think clock keeps running
   }
@@ -626,8 +808,6 @@ async function doSwap(a: Pt, b: Pt): Promise<void> {
 // ---- startup: load + validate data BEFORE any title/battle init (§10.4) ----
 
 function showDataFailure(errors: number, warnings: number, lines: string[]): void {
-  // Blocking developer-facing failure screen: concise count, details in the
-  // console, NO bypass button (§10.4).
   const list = document.createElement('div');
   list.className = 'metrics';
   for (const l of lines.slice(0, 20)) {
@@ -655,11 +835,11 @@ function boot(): void {
     onTap(p: Pt): void {
       if (!canAct()) return;
       if (targetingSlot !== null) {
-        targetingSlot = null; // tap elsewhere cancels targeting (consumes the tap)
+        targetingSlot = null;
         return;
       }
       if (selection && selection.x === p.x && selection.y === p.y) {
-        selection = null; // tap the selected tile again: deselect
+        selection = null;
       } else if (selection && Math.abs(selection.x - p.x) + Math.abs(selection.y - p.y) === 1) {
         const a = selection;
         selection = null;
@@ -667,7 +847,7 @@ function boot(): void {
         void doSwap(a, p);
         return;
       } else {
-        selection = p; // no selection, or non-adjacent tap: (move) selection
+        selection = p;
       }
       view.setSelection(selection);
     },
@@ -684,14 +864,12 @@ function boot(): void {
     onProgram(i: number): void {
       if (!canAct() || !game) return;
       if (targetingSlot !== null) {
-        targetingSlot = null; // tapping any program (incl. the armed one) cancels
+        targetingSlot = null;
         return;
       }
       const u = game.state.units.player[i];
       const prog: ResolvedProgram = programsFor('player')[i];
       if (requiresTarget(prog)) {
-        // A targeted Program (plan leads with player-choice Drain) arms
-        // targeting mode instead of firing blind; gate on the data cost.
         if (u.charge >= prog.cost) targetingSlot = i;
         return;
       }
@@ -732,25 +910,29 @@ function boot(): void {
         maybeGameOver();
       });
     },
-    onMenu(): void {
-      // Pause menu only in the make-a-match phase, never mid-resolution.
+    // §10 — avatar controls open the side's character sheet. Available only
+    // at the same stable input phase as Pause; never a combat event.
+    onAvatar(side: Side): void {
       if (!canAct() || !game) return;
+      targetingSlot = null;
+      showCharacterSheet(side);
+    },
+    onMenu(): void {
+      // Pause only in the make-a-match phase, never mid-resolution. §11: shows
+      // mode context; character sheets moved to the avatars; Reset exists in
+      // Quick Match only (approved ruling — Run restarts are wizard actions).
+      if (!canAct() || !game || !session) return;
       targetingSlot = null;
       const cfg = { ...game.state.config };
       const panels = document.createElement('div');
       panels.className = 'panelscroll';
       panels.appendChild(configSummary(cfg, 'ACTIVE BATTLE CONFIG'));
-      panels.appendChild(characterSheet(cfg)); // Alpha: built from resolved data
-      showDialog(
-        'PAUSED',
-        '',
-        [
-          ['Resume', hideDialog],
-          ['Reset', () => void startBattle(cfg)],
-          ['Quit', showTitle],
-        ],
-        panels,
-      );
+      const buttons: ButtonSpec[] = [['Resume', hideDialog]];
+      if (session.mode === 'QUICK_MATCH') {
+        buttons.push(['Reset', () => void startQuickMatch(cfg)]);
+      }
+      buttons.push(['Quit', showTitle]); // mid-battle quit keeps the save resumable
+      showDialog('PAUSED', contextLabel(session), buttons, panels);
     },
   });
 
@@ -783,7 +965,7 @@ function boot(): void {
       const mv = findBotMove(game.state.board);
       if (mv) {
         view.setHint(mv);
-        hintFiredThisTurn = true; // counts as assisted for think-time honesty
+        hintFiredThisTurn = true;
       }
     });
     document.body.appendChild(b);
@@ -814,9 +996,7 @@ function boot(): void {
   }
 }
 
-// MK4.3 console-dump helpers (sanctioned log access — no viewing UI):
-//   breachLogs()               -> { metrics: [...], turns: [...] }
-//   breachWipe({ save: true }) -> wipes logs (and optionally the battle save)
+// MK4.3 console-dump helpers (sanctioned log access — no viewing UI)
 const helpers = window as unknown as Record<string, unknown>;
 helpers.breachLogs = () => readLogs();
 helpers.breachWipe = (opts?: { save?: boolean }) => {

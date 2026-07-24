@@ -203,3 +203,15 @@ canvas {
 .dialog button:active {
   background: #505064;
 }
+
+/* Alpha 0.2.0 §5.2: wizard/dev controls must remain visually distinguishable
+   from normal player controls. */
+.dialog button.wizard {
+  background: #4a3a1a;
+  color: #ffcf6a;
+  border: 1px solid #a87a2a;
+}
+
+.dialog button.wizard:active {
+  background: #5f4a22;
+}

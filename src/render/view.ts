@@ -24,21 +24,25 @@ export interface Hud {
   shakeCharge: number;
   shakeCost: number;
   shakeReady: boolean;
+  // Alpha 0.2.0 §9.2 — side-general persistent-effect totals (Effect VALUE,
+  // not tile count), shown compactly in the avatar boxes only.
   buffPlayer: number;
   buffEnemy: number;
-  shieldEnemy: number; // MK9.3: total active enemy shield points
+  shieldPlayer: number;
+  shieldEnemy: number;
   turn: number;
   canAct: boolean;
   statusText: string;
-  targeting: boolean; // MK3.2: Disabler targeting mode — minion boxes are tap-targets
+  targeting: boolean; // targeting mode — minion boxes are tap-targets
 }
 
 export type Hit =
   | { kind: 'cell'; p: Pt }
   | { kind: 'program'; idx: number }
-  | { kind: 'minion'; idx: number } // tap-target for the player's Disabler (MK3.2)
+  | { kind: 'minion'; idx: number } // tap-target for the player's targeted Drain
   | { kind: 'shake' }
   | { kind: 'menu' }
+  | { kind: 'avatar'; side: 'player' | 'enemy' } // Alpha 0.2.0 §9/§10 — character-sheet access
   | null;
 
 const COLOR_HEX: Record<Color, string> = {
@@ -169,19 +173,20 @@ export class View {
   private cssW = 0;
   private cssH = 0;
 
-  // layout (CSS pixels)
+  // layout (CSS pixels) — Alpha 0.2.0 §8 region contract. layout() is the
+  // ONLY producer of these rectangles; rendering and hitTest() are the only
+  // consumers. Regions are disjoint by construction (§8.3).
   private pad = 8;
   private cell = 40;
   private boardX = 0;
   private boardY = 0;
-  private menuRect: Rect = { x: 0, y: 0, w: 0, h: 0 };
-  private hpPlayerRect: Rect = { x: 0, y: 0, w: 0, h: 0 };
-  private hpEnemyRect: Rect = { x: 0, y: 0, w: 0, h: 0 };
-  private programRects: Rect[] = [];
-  private shakeRect: Rect = { x: 0, y: 0, w: 0, h: 0 };
-  private minionRects: Rect[] = [];
-  private statusY = 0;
-  private buffY = 0;
+  private menuRect: Rect = { x: 0, y: 0, w: 0, h: 0 }; // Pause — top center, between avatars
+  private avatarPlayerRect: Rect = { x: 0, y: 0, w: 0, h: 0 }; // Hacker avatar — upper-left
+  private avatarEnemyRect: Rect = { x: 0, y: 0, w: 0, h: 0 }; // System avatar — upper-right
+  private programRects: Rect[] = []; // Hacker Programs — vertical stack, left column
+  private shakeRect: Rect = { x: 0, y: 0, w: 0, h: 0 }; // Board-Shake — bottom of the Hacker stack
+  private minionRects: Rect[] = []; // System Programs — vertical stack, right column
+  private statusRect: Rect = { x: 0, y: 0, w: 0, h: 0 }; // bottom status/help region (§12)
 
   constructor(private canvas: HTMLCanvasElement, private getHud: () => Hud | null) {
     this.ctx = canvas.getContext('2d')!;
@@ -203,14 +208,14 @@ export class View {
     return this.cell;
   }
 
-  // MK8.4: canvas-local anchor just below the "Buffs —" status line, where
-  // the debug find-match button docks (it used to overlap the lower-left
-  // board tile). The caller converts to page coordinates.
+  // Canvas-local anchor for the debug find-match button: right side of the
+  // bottom status region, clear of the board and status text. The caller
+  // converts to page coordinates.
   get debugAnchor(): { x: number; y: number } {
-    return { x: this.pad, y: this.buffY + 18 };
+    return { x: this.cssW - 84, y: this.statusRect.y + 2 };
   }
 
-  reset(grid: TileView[][]): void {
+  reset(grid: (TileView | null)[][]): void {
     this.queue = [];
     this.cur = null;
     this.floats = [];
@@ -223,10 +228,11 @@ export class View {
     this.setGrid(grid);
   }
 
-  private setGrid(grid: TileView[][]): void {
+  private setGrid(grid: (TileView | null)[][]): void {
     for (let y = 0; y < BOARD_HEIGHT; y++) {
       for (let x = 0; x < BOARD_WIDTH; x++) {
-        this.grid[y][x] = grid[y]?.[x] ? { view: grid[y][x], fx: x, fy: y } : null;
+        const v = grid[y]?.[x];
+        this.grid[y][x] = v ? { view: v, fx: x, fy: y } : null;
       }
     }
   }
@@ -261,21 +267,44 @@ export class View {
     return new Promise((resolve) => this.waiters.push({ target, resolve }));
   }
 
+  // §8.3 input priority (canvas channel; blocking DOM modals sit above all of
+  // this): Pause → avatars → Hacker Programs/Shake → System Programs → board.
+  // Regions are disjoint, so priority is defensive rather than load-bearing.
   hitTest(x: number, y: number): Hit {
     if (inRect(this.menuRect, x, y)) return { kind: 'menu' };
+    if (inRect(this.avatarPlayerRect, x, y)) return { kind: 'avatar', side: 'player' };
+    if (inRect(this.avatarEnemyRect, x, y)) return { kind: 'avatar', side: 'enemy' };
     for (let i = 0; i < this.programRects.length; i++) {
       if (inRect(this.programRects[i], x, y)) return { kind: 'program', idx: i };
     }
+    if (inRect(this.shakeRect, x, y)) return { kind: 'shake' };
     for (let i = 0; i < this.minionRects.length; i++) {
       if (inRect(this.minionRects[i], x, y)) return { kind: 'minion', idx: i };
     }
-    if (inRect(this.shakeRect, x, y)) return { kind: 'shake' };
     const bx = Math.floor((x - this.boardX) / this.cell);
     const by = Math.floor((y - this.boardY) / this.cell);
     if (bx >= 0 && bx < BOARD_WIDTH && by >= 0 && by < BOARD_HEIGHT && y >= this.boardY) {
       return { kind: 'cell', p: { x: bx, y: by } };
     }
     return null;
+  }
+
+  // Geometry snapshot for headless layout tests (§14.6). Read-only copies.
+  get regions(): {
+    avatarPlayer: Rect; avatarEnemy: Rect; pause: Rect; programs: Rect[]; shake: Rect;
+    minions: Rect[]; board: Rect; status: Rect; viewport: { w: number; h: number };
+  } {
+    return {
+      avatarPlayer: { ...this.avatarPlayerRect },
+      avatarEnemy: { ...this.avatarEnemyRect },
+      pause: { ...this.menuRect },
+      programs: this.programRects.map((r) => ({ ...r })),
+      shake: { ...this.shakeRect },
+      minions: this.minionRects.map((r) => ({ ...r })),
+      board: { x: this.boardX, y: this.boardY, w: this.cell * BOARD_WIDTH, h: this.cell * BOARD_HEIGHT },
+      status: { ...this.statusRect },
+      viewport: { w: this.cssW, h: this.cssH },
+    };
   }
 
   // ---- layout ----
@@ -298,40 +327,43 @@ export class View {
     this.canvas.style.height = `${h}px`;
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
+    // ---- Alpha 0.2.0 §8.1 battle layout ----
+    // Top row: Hacker avatar (upper-left), Pause (top center), System avatar
+    // (upper-right). Below: two opposing VERTICAL Program stacks — Hacker
+    // down the left column (Board-Shake as its fifth box), System down the
+    // right. Square board beneath, pushed toward the bottom (~5% lower than
+    // the pre-Alpha layout); a ~5%-height status/help region spans the very
+    // bottom (§12). All regions disjoint (§8.3).
     const pad = this.pad;
-    // MK8.4: the board sits ~10% of the window height above the bottom edge
-    // (was flush at the bottom); the cell budget shrinks by the same margin
-    // so the raised board can never overlap the HUD.
-    const bottomMargin = pad + Math.floor(h * 0.1);
-    this.cell = Math.max(24, Math.floor(Math.min((w - pad * 2) / BOARD_WIDTH, (h - 210 - Math.floor(h * 0.1)) / BOARD_HEIGHT)));
-    const boardW = this.cell * BOARD_WIDTH;
-    this.boardX = Math.floor((w - boardW) / 2);
-    this.boardY = h - this.cell * BOARD_HEIGHT - bottomMargin;
+    const avatarH = 46;
+    const avatarW = Math.floor(w * 0.34);
+    this.avatarPlayerRect = { x: pad, y: 6, w: avatarW, h: avatarH };
+    this.avatarEnemyRect = { x: w - pad - avatarW, y: 6, w: avatarW, h: avatarH };
+    const pauseW = Math.min(44, Math.max(28, w - 2 * (pad + avatarW) - 12));
+    this.menuRect = { x: Math.floor(w / 2 - pauseW / 2), y: 8, w: pauseW, h: 34 };
 
-    this.menuRect = { x: w - 42, y: 6, w: 36, h: 28 };
-    const hpW = (w - pad * 2 - 52) / 2;
-    this.hpPlayerRect = { x: pad, y: 10, w: hpW, h: 22 };
-    this.hpEnemyRect = { x: pad + hpW + 8, y: 10, w: hpW, h: 22 };
-    this.statusY = 38;
-
-    const progY = 58;
-    const progH = 54;
+    const stackTop = 6 + avatarH + 8;
     const gap = 4;
-    const bw = (w - pad * 2 - gap * 4) / 5;
+    const boxH = 40;
+    const colW = Math.floor((w - pad * 2 - 8) / 2);
+    const sysX = w - pad - colW;
     this.programRects = [];
-    for (let i = 0; i < 4; i++) {
-      this.programRects.push({ x: pad + i * (bw + gap), y: progY, w: bw, h: progH });
-    }
-    this.shakeRect = { x: pad + 4 * (bw + gap), y: progY, w: bw, h: progH };
-
-    const minY = progY + progH + 6;
-    const minH = 42;
-    const mw = (w - pad * 2 - gap * 3) / 4;
     this.minionRects = [];
     for (let i = 0; i < 4; i++) {
-      this.minionRects.push({ x: pad + i * (mw + gap), y: minY, w: mw, h: minH });
+      this.programRects.push({ x: pad, y: stackTop + i * (boxH + gap), w: colW, h: boxH });
+      this.minionRects.push({ x: sysX, y: stackTop + i * (boxH + gap), w: colW, h: boxH });
     }
-    this.buffY = minY + minH + 4;
+    this.shakeRect = { x: pad, y: stackTop + 4 * (boxH + gap), w: colW, h: boxH };
+    const stacksBottom = stackTop + 5 * boxH + 4 * gap;
+
+    const bottomH = Math.max(26, Math.floor(h * 0.05));
+    const availBoardH = h - stacksBottom - 6 - bottomH - 4;
+    this.cell = Math.max(24, Math.floor(Math.min((w - pad * 2) / BOARD_WIDTH, availBoardH / BOARD_HEIGHT)));
+    const boardW = this.cell * BOARD_WIDTH;
+    this.boardX = Math.floor((w - boardW) / 2);
+    // board sits directly above the bottom status region; never above the stacks
+    this.boardY = Math.max(stacksBottom + 6, h - bottomH - 4 - this.cell * BOARD_HEIGHT);
+    this.statusRect = { x: pad, y: h - bottomH, w: w - pad * 2, h: bottomH - 2 };
   }
 
   // ---- event playback ----
@@ -420,7 +452,7 @@ export class View {
         break;
       case 'damage': {
         dur = 340;
-        const r = ev.target === 'player' ? this.hpPlayerRect : this.hpEnemyRect;
+        const r = ev.target === 'player' ? this.avatarPlayerRect : this.avatarEnemyRect;
         this.floats.push({
           text: `-${ev.amount}`,
           cx: r.x + r.w / 2,
@@ -482,13 +514,49 @@ export class View {
     if (hud) this.drawHud(hud);
     this.drawBoard(now);
 
-    // message line just above the board
-    if (now < this.msgUntil && this.msgText) {
-      ctx.fillStyle = '#f0e070';
-      ctx.font = 'bold 18px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'alphabetic';
-      ctx.fillText(this.msgText, w / 2, this.boardY - 6);
+    // §12 bottom status/help region — one compact contextual line. Priority:
+    // an armed targeting prompt stays visible over transient messages; a live
+    // transient message supersedes the default turn/status line.
+    {
+      const r = this.statusRect;
+      const msgLive = now < this.msgUntil && this.msgText;
+      let line = '';
+      let color = '#b8b8c6';
+      if (hud?.targeting) {
+        line = hud.statusText;
+        color = '#ff9500';
+      } else if (msgLive) {
+        line = this.msgText;
+        color = '#f0e070';
+      } else if (hud) {
+        line = `Turn ${hud.turn}   ${hud.statusText}`;
+      } else if (msgLive) {
+        line = this.msgText;
+      }
+      if (line) {
+        ctx.fillStyle = color;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        // Fit the single line within the region: shrink the font first, then
+        // truncate with an ellipsis if it still doesn't fit (§12 — one
+        // compact line, never a wrapping/scrolling log).
+        const maxW = r.w - 4;
+        let fs = Math.max(13, Math.floor(r.h * 0.5));
+        ctx.font = `bold ${fs}px sans-serif`;
+        while (fs > 10 && ctx.measureText(line).width > maxW) {
+          fs--;
+          ctx.font = `bold ${fs}px sans-serif`;
+        }
+        let shown = line;
+        if (ctx.measureText(shown).width > maxW) {
+          while (shown.length > 1 && ctx.measureText(`${shown}…`).width > maxW) {
+            shown = shown.slice(0, -1);
+          }
+          shown = `${shown}…`;
+        }
+        ctx.fillText(shown, r.x, r.y + r.h / 2);
+        ctx.textBaseline = 'alphabetic';
+      }
     }
 
     // floating damage numbers — MK6.9b: transient UI can afford to be loud;
@@ -512,44 +580,57 @@ export class View {
     const ctx = this.ctx;
     ctx.textBaseline = 'middle';
 
-    // HP bars
-    this.drawHpBar(this.hpPlayerRect, 'YOU', hud.hpPlayer, hud.hpPlayerMax, '#58c06a');
-    this.drawHpBar(this.hpEnemyRect, 'ENEMY', hud.hpEnemy, hud.hpEnemyMax, '#c05858');
+    // §9 avatar boxes — side identity, HP, compact Buff/Shield totals
+    this.drawAvatarBox(this.avatarPlayerRect, 'YOU', hud.hpPlayer, hud.hpPlayerMax, '#58c06a', hud.buffPlayer, hud.shieldPlayer);
+    this.drawAvatarBox(this.avatarEnemyRect, 'ENEMY', hud.hpEnemy, hud.hpEnemyMax, '#c05858', hud.buffEnemy, hud.shieldEnemy);
 
-    // menu button
+    // Pause button — top center between avatars (§11)
     ctx.fillStyle = '#33333e';
     ctx.fillRect(this.menuRect.x, this.menuRect.y, this.menuRect.w, this.menuRect.h);
     ctx.strokeStyle = '#777';
     ctx.lineWidth = 1;
     ctx.strokeRect(this.menuRect.x + 0.5, this.menuRect.y + 0.5, this.menuRect.w - 1, this.menuRect.h - 1);
     ctx.fillStyle = '#ddd';
-    // MK3.6: fonts sized to fill their allotted area
     ctx.font = `bold ${Math.floor(this.menuRect.h * 0.64)}px sans-serif`;
     ctx.textAlign = 'center';
     ctx.fillText('≡', this.menuRect.x + this.menuRect.w / 2, this.menuRect.y + this.menuRect.h / 2 + 1);
 
-    // status line
-    ctx.fillStyle = '#b8b8c6';
-    ctx.font = '15px sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillText(`Turn ${hud.turn}   ${hud.statusText}`, this.pad, this.statusY + 6);
-
-    // player programs + shake
+    // Hacker Program stack (left, stable authored order) + Board-Shake
     for (let i = 0; i < 4; i++) {
       this.drawUnitBox(this.programRects[i], hud.programs[i], true, false);
     }
     this.drawShakeBox(this.shakeRect, hud);
 
-    // enemy minions (always-visible charge; highlighted while Disabler targeting)
+    // System Program stack (right; highlighted while targeting is armed)
     for (let i = 0; i < 4; i++) {
       this.drawUnitBox(this.minionRects[i], hud.minions[i], false, hud.targeting);
     }
+  }
 
-    // buffs (player) + shields (enemy, MK9.3)
-    ctx.fillStyle = '#b8b8c6';
-    ctx.font = '15px sans-serif';
+  // §9 avatar box: identity label, compact B/S totals (values, zero-hidden),
+  // HP bar along the bottom. Whitebox placeholders per §9.2.
+  private drawAvatarBox(r: Rect, label: string, hp: number, hpMax: number, hpColor: string, buff: number, shield: number): void {
+    const ctx = this.ctx;
+    ctx.fillStyle = '#2c2c36';
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.strokeStyle = '#777';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+    ctx.fillStyle = '#ddd';
+    ctx.font = `bold 13px sans-serif`;
     ctx.textAlign = 'left';
-    ctx.fillText(`Buff +${hud.buffPlayer}   Enemy shield ${hud.shieldEnemy}`, this.pad, this.buffY + 6);
+    ctx.fillText(label, r.x + 4, r.y + 10);
+    // compact persistent-effect totals, right-aligned; zero values hidden (§9.2)
+    const parts: string[] = [];
+    if (buff > 0) parts.push(`B +${buff}`);
+    if (shield > 0) parts.push(`S ${shield}`);
+    if (parts.length) {
+      ctx.fillStyle = '#ffe080';
+      ctx.font = `bold 12px sans-serif`;
+      ctx.textAlign = 'right';
+      ctx.fillText(parts.join('  '), r.x + r.w - 4, r.y + 10);
+    }
+    this.drawHpBar({ x: r.x + 4, y: r.y + r.h - 22, w: r.w - 8, h: 18 }, '', hp, hpMax, hpColor);
   }
 
   private drawHpBar(r: Rect, label: string, hp: number, max: number, color: string): void {
@@ -564,7 +645,7 @@ export class View {
     ctx.fillStyle = '#fff';
     ctx.font = `bold ${Math.floor(r.h * 0.64)}px sans-serif`; // MK3.6: fill the bar height
     ctx.textAlign = 'left';
-    ctx.fillText(`${label} ${hp}/${max}`, r.x + 6, r.y + r.h / 2 + 1);
+    ctx.fillText(`${label ? `${label} ` : ''}${hp}/${max}`, r.x + 6, r.y + r.h / 2 + 1);
   }
 
   private drawUnitBox(r: Rect, u: HudUnit, interactive: boolean, targetable: boolean): void {
@@ -596,18 +677,21 @@ export class View {
       ctx.font = `bold ${fs}px sans-serif`;
     }
     ctx.textAlign = 'left';
-    ctx.fillText(u.label, r.x + 4 + sw + 4, r.y + 12);
+    // Alpha 0.2.0: boxes are a fixed 40px in the vertical stack (down from
+    // 54px pre-0.2.0) — label/charge-text/bar offsets tightened so all three
+    // rows fit cleanly instead of nearly touching.
+    ctx.fillText(u.label, r.x + 4 + sw + 4, r.y + 11);
 
     ctx.fillStyle = charged ? '#ffe080' : '#aaa';
-    ctx.font = `${Math.max(12, Math.floor(r.h * 0.24))}px sans-serif`;
-    ctx.fillText(`${u.charge}/${u.cost}`, r.x + 4, r.y + r.h - 18);
+    ctx.font = `${Math.max(11, Math.floor(r.h * 0.22))}px sans-serif`;
+    ctx.fillText(`${u.charge}/${u.cost}`, r.x + 4, r.y + r.h - 15);
 
     // charge bar
     const bw = r.w - 8;
     ctx.fillStyle = '#1c1c24';
-    ctx.fillRect(r.x + 4, r.y + r.h - 10, bw, 6);
+    ctx.fillRect(r.x + 4, r.y + r.h - 8, bw, 5);
     ctx.fillStyle = charged ? '#f0c040' : '#6080c0';
-    ctx.fillRect(r.x + 4, r.y + r.h - 10, bw * Math.min(1, u.charge / u.cost), 6);
+    ctx.fillRect(r.x + 4, r.y + r.h - 8, bw * Math.min(1, u.charge / u.cost), 5);
   }
 
   private drawShakeBox(r: Rect, hud: Hud): void {
@@ -619,17 +703,17 @@ export class View {
     ctx.lineWidth = charged ? 2 : 1;
     ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
     ctx.fillStyle = '#ddd';
-    ctx.font = `bold ${Math.max(12, Math.floor(r.h * 0.28))}px sans-serif`;
+    ctx.font = `bold ${Math.max(11, Math.floor(r.h * 0.26))}px sans-serif`;
     ctx.textAlign = 'left';
-    ctx.fillText('SHAKE', r.x + 4, r.y + 12);
+    ctx.fillText('SHAKE', r.x + 4, r.y + 11);
     ctx.fillStyle = charged ? '#ffe080' : '#aaa';
-    ctx.font = `${Math.max(12, Math.floor(r.h * 0.24))}px sans-serif`;
-    ctx.fillText(`${hud.shakeCharge}/${hud.shakeCost}`, r.x + 4, r.y + r.h - 18);
+    ctx.font = `${Math.max(11, Math.floor(r.h * 0.22))}px sans-serif`;
+    ctx.fillText(`${hud.shakeCharge}/${hud.shakeCost}`, r.x + 4, r.y + r.h - 15);
     const bw = r.w - 8;
     ctx.fillStyle = '#1c1c24';
-    ctx.fillRect(r.x + 4, r.y + r.h - 10, bw, 6);
+    ctx.fillRect(r.x + 4, r.y + r.h - 8, bw, 5);
     ctx.fillStyle = charged ? '#f0c040' : '#6080c0';
-    ctx.fillRect(r.x + 4, r.y + r.h - 10, bw * Math.min(1, hud.shakeCharge / hud.shakeCost), 6);
+    ctx.fillRect(r.x + 4, r.y + r.h - 8, bw * Math.min(1, hud.shakeCharge / hud.shakeCost), 5);
   }
 
   private drawBoard(now: number): void {

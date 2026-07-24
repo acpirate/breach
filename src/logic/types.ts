@@ -10,6 +10,16 @@ export function opponentOf(s: Side): Side {
   return s === 'player' ? 'enemy' : 'player';
 }
 
+// ---- Alpha 0.2.0 session vocabulary (§3.1/§5.4) ----
+// Typed mode discriminator — mode is never inferred from screen state, Run
+// step, labels, or nullable fields.
+export type Mode = 'QUICK_MATCH' | 'RUN';
+export type RunStep = 1 | 2 | 3 | 4;
+// Natural outcomes and wizard actions are recorded SEPARATELY: a later wizard
+// decision never overwrites the battle's natural result.
+export type NaturalOutcome = 'NATURAL_VICTORY' | 'NATURAL_DEFEAT';
+export type WizardAction = 'WIZARD_FORCE_WIN' | 'WIZARD_RESTART_LOST_BATTLE' | 'WIZARD_RESTART_RUN';
+
 // Concrete whitebox identities for the 6 colors and 6 shapes (agent discretion,
 // approved): colors are six maximally-separated primary/secondary hues; shapes
 // are six simple canvas-drawable glyphs.
@@ -117,9 +127,11 @@ export function tileViewOf(t: Tile): TileView {
   return v;
 }
 
-// Only valid on a settled (fully populated) board.
-export function gridViewOf(board: Board): TileView[][] {
-  return board.map((row) => row.map((t) => tileViewOf(t!)));
+// Snapshot of the whole board. A concluded battle's board may legitimately
+// contain holes (resolution halts at game over, §5.1 saves pending results),
+// so empty cells map to null.
+export function gridViewOf(board: Board): (TileView | null)[][] {
+  return board.map((row) => row.map((t) => (t ? tileViewOf(t) : null)));
 }
 
 export type GameEvent =
@@ -129,7 +141,7 @@ export type GameEvent =
   | { t: 'destroy'; cells: Pt[] }
   | { t: 'fall'; moves: { from: Pt; to: Pt }[] }
   | { t: 'spawn'; tiles: { p: Pt; view: TileView }[] }
-  | { t: 'board'; grid: TileView[][] }
+  | { t: 'board'; grid: (TileView | null)[][] }
   | { t: 'setTile'; p: Pt; view: TileView }
   | { t: 'countdown'; p: Pt; value: number }
   // Alpha: the blast footprint comes from the bomb's own data, so the event

@@ -8,7 +8,8 @@ import { BOARD_HEIGHT, BOARD_SHAKE_COST, BOARD_WIDTH, DEFAULT_BATTLE_CONFIG } fr
 import { getContent, programsFor } from '../src/logic/data/content';
 import { Game } from '../src/logic/game';
 import { detectMatches } from '../src/logic/match';
-import { SAVE_VERSION, deserializeGame, serializeGame } from '../src/logic/save';
+import { SAVE_VERSION } from '../src/logic/save';
+import { deserializeSession, serializeSession } from '../src/logic/session';
 import { BattleConfig } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { initContentOrExit } from './dataNode';
@@ -153,7 +154,7 @@ function runBattle(label: string, config: BattleConfig, seed: number): void {
   );
 }
 
-// MK4.1/Alpha §14: save/restore round trip — headless, pure logic
+// Alpha 0.2.0 §6: session save/restore round trip — headless, pure logic
 function testSaveRoundTrip(): void {
   const cfg: BattleConfig = {
     ...DEFAULT_BATTLE_CONFIG,
@@ -176,39 +177,43 @@ function testSaveRoundTrip(): void {
   assert(!g.state.winner, 'battle still in progress at save point');
   assert(g.state.metrics.thinkTimesMs.length === 3, 'raw think-times must be recorded per move');
   assert(g.state.metrics.hintsShown === 1, 'hint-shown count must be recorded');
-  const json = serializeGame(g.state);
-  const r = deserializeGame(json);
+  const json = serializeSession({ mode: 'QUICK_MATCH' }, g, null);
+  const r = deserializeSession(json);
   assert(r, 'valid save must deserialize');
-  assert(serializeGame(r.state) === json, 'restored state must re-serialize identically');
-  assert(r.state.turn === g.state.turn && r.state.battleId === g.state.battleId, 'turn/battleId survive');
-  assert(r.state.config.playerHp === 222 && r.state.config.enemyHp === 333, 'HP config survives the round trip');
-  assert(r.state.config.hintDelaySeconds === 3, 'hint config survives');
+  assert(r.info.mode === 'QUICK_MATCH' && r.pending === null, 'mode and phase survive');
+  assert(serializeSession(r.info, r.game, r.pending) === json, 'restored session must re-serialize identically');
+  assert(r.game.state.turn === g.state.turn && r.game.state.battleId === g.state.battleId, 'turn/battleId survive');
+  assert(r.game.state.config.playerHp === 222 && r.game.state.config.enemyHp === 333, 'HP config survives the round trip');
+  assert(r.game.state.config.hintDelaySeconds === 3, 'hint config survives');
   let safety = 0;
-  while (!r.state.winner && safety++ < 600) {
-    botFireAbilities(r);
-    if (r.state.winner) break;
-    const mv = botMove(r);
+  const rg = r.game;
+  while (!rg.state.winner && safety++ < 600) {
+    botFireAbilities(rg);
+    if (rg.state.winner) break;
+    const mv = botMove(rg);
     assert(mv, 'restored game has moves');
-    r.attemptSwap(mv.a, mv.b);
-    if (!r.state.winner) r.runEnemyPhase();
-    if (!r.state.winner) r.startPlayerPhase();
+    rg.attemptSwap(mv.a, mv.b);
+    if (!rg.state.winner) rg.runEnemyPhase();
+    if (!rg.state.winner) rg.startPlayerPhase();
   }
-  assert(r.state.winner, 'restored game plays to completion');
-  // §14.1: pre-Alpha saves reject cleanly
-  const preAlpha = JSON.parse(json) as { version: string };
-  preAlpha.version = 'mk9';
-  assert(deserializeGame(JSON.stringify(preAlpha)) === null, 'pre-Alpha version -> no save');
-  // §14.3: content-fingerprint mismatch rejects
+  assert(rg.state.winner, 'restored game plays to completion');
+  // §6.1: pre-Alpha-0.2.0 saves reject cleanly (no migration, no partial load)
+  for (const old of ['mk9', 'alpha-0.1.0']) {
+    const preAlpha = JSON.parse(json) as { version: string };
+    preAlpha.version = old;
+    assert(deserializeSession(JSON.stringify(preAlpha)) === null, `${old} save -> no save`);
+  }
+  // §6.5: content-fingerprint mismatch rejects
   const fpMismatch = JSON.parse(json) as { fp: string };
   fpMismatch.fp = 'deadbeef-0';
-  assert(deserializeGame(JSON.stringify(fpMismatch)) === null, 'fingerprint mismatch -> no save');
-  assert(deserializeGame('{"not":"a save"}') === null, 'wrong shape -> no save');
-  assert(deserializeGame('garbage{{{') === null, 'corrupt JSON -> no save');
-  assert(deserializeGame(null) === null, 'missing -> no save');
+  assert(deserializeSession(JSON.stringify(fpMismatch)) === null, 'fingerprint mismatch -> no save');
+  assert(deserializeSession('{"not":"a save"}') === null, 'wrong shape -> no save');
+  assert(deserializeSession('garbage{{{') === null, 'corrupt JSON -> no save');
+  assert(deserializeSession(null) === null, 'missing -> no save');
   console.log('save round-trip OK');
 }
 
-assert(SAVE_VERSION === 'alpha-0.1.0', 'save version must be alpha-0.1.0');
+assert(SAVE_VERSION === 'alpha-0.2.0', 'save version must be alpha-0.2.0');
 console.log(`content fingerprint: ${getContent().fingerprint}`);
 
 const D = DEFAULT_BATTLE_CONFIG;
