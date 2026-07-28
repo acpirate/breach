@@ -11,15 +11,18 @@
 // The merge is deliberately naive O(n^2) over simultaneous matches — at 8x8
 // with a handful of matches this is microseconds. Do not micro-optimize.
 //
-// A merged blob's tile count sets its tier; its shape (line vs non-line) sets
-// clear/crit per the 1.4 table: line 4+ clears its row/column, 5+ crits;
-// non-line 5+ crits with no clear. (Merges always produce >=5 tiles — two
-// >=3-tile runs sharing one tile is 5 — so a non-line 4 cannot occur; it
-// would resolve as a plain 1.0x clear if it ever did.)
+// A merged blob's tile count sets its DAMAGE tier per the 1.4 table: 5+ crits
+// (line or non-line). (Merges always produce >=5 tiles — two >=3-tile runs
+// sharing one tile is 5 — so a non-line 4 cannot occur.)
+//
+// Alpha 0.3.0 §9: row/column CLEAR qualification no longer comes from a single
+// match group's own shape. It is computed per resolution wave from the combined
+// directly matched footprint — see computeLineClears() below.
 
 import {
   BOARD_HEIGHT,
   BOARD_WIDTH,
+  LINE_CLEAR_RUN_LENGTH,
   MATCH_3_MULTIPLIER,
   MATCH_4_MULTIPLIER,
   MATCH_5_LINE_MULTIPLIER,
@@ -147,7 +150,85 @@ export function matchMultiplier(m: Match): number {
   return MATCH_3_MULTIPLIER;
 }
 
-// Row/column clears require a STRAIGHT line of 4+ (non-line blobs never clear).
-export function matchClearsLine(m: Match): boolean {
-  return m.isLine && m.length >= 4;
+// ---- Alpha 0.3.0 §9 — combined direct-match line-clear qualification (B1) ----
+//
+// This is the ONE authority for row/column-clear qualification. The Alpha 0.2
+// per-group predicate (a single straight 4+ blob clears its own line) is gone
+// rather than kept alongside it, so there is no second, competing rule.
+
+// One qualifying row or column clear for a resolution wave. `index` is the row
+// y for 'h' and the column x for 'v'.
+export interface LineClear {
+  orientation: 'h' | 'v';
+  index: number;
+}
+
+const cellKey = (x: number, y: number): number => y * BOARD_WIDTH + x;
+
+// §9.1 — the approved B1 rule: within each resolution wave, UNION every tile
+// belonging directly to a detected color-axis or shape-axis Sync, then any
+// contiguous horizontal or vertical run of LINE_CLEAR_RUN_LENGTH+ cells in that
+// union triggers the corresponding row/column clear. The player-visible
+// directly matched footprint controls qualification — not hidden group
+// composition — so two adjacent internally separate match-3 groups CAN combine,
+// and overlapping color/shape Syncs CAN combine.
+//
+// Neutral Syncs are deliberately NOT folded into the color/shape union
+// (approved decision): a straight neutral run of 4+ keeps its own standalone
+// qualification, exactly as in Alpha 0.2, and neutral tiles are never pulled
+// into a color/shape union.
+//
+// Each qualifying row and column fires exactly ONCE per wave (§9.2 step 4), and
+// only DIRECT match footprints contribute — line-clear collateral, Bomb or
+// countdown destruction, Function/Skill destruction, and prior line clears are
+// all excluded (§9.3), which is what makes the rule non-recursive.
+export function computeLineClears(matches: ReadonlyArray<Match>): LineClear[] {
+  const union = new Set<number>();
+  for (const m of matches) {
+    if (m.condition === 'neutral') continue;
+    for (const c of m.cells) union.add(cellKey(c.x, c.y));
+  }
+
+  const out: LineClear[] = [];
+  const seen = new Set<string>();
+  const add = (orientation: 'h' | 'v', index: number): void => {
+    const k = `${orientation}${index}`;
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push({ orientation, index });
+  };
+
+  // maximal contiguous runs in the combined footprint, per row then per column
+  for (let y = 0; y < BOARD_HEIGHT; y++) {
+    let run = 0;
+    for (let x = 0; x <= BOARD_WIDTH; x++) {
+      const on = x < BOARD_WIDTH && union.has(cellKey(x, y));
+      if (on) run++;
+      else {
+        if (run >= LINE_CLEAR_RUN_LENGTH) add('h', y);
+        run = 0;
+      }
+    }
+  }
+  for (let x = 0; x < BOARD_WIDTH; x++) {
+    let run = 0;
+    for (let y = 0; y <= BOARD_HEIGHT; y++) {
+      const on = y < BOARD_HEIGHT && union.has(cellKey(x, y));
+      if (on) run++;
+      else {
+        if (run >= LINE_CLEAR_RUN_LENGTH) add('v', x);
+        run = 0;
+      }
+    }
+  }
+
+  // preserved Alpha 0.2 behavior: a straight neutral run of 4+ clears its own
+  // row/column independently of the color/shape union
+  for (const m of matches) {
+    if (m.condition !== 'neutral' || !m.isLine || m.length < LINE_CLEAR_RUN_LENGTH) continue;
+    if (m.orientation === 'h') add('h', m.cells[0].y);
+    else if (m.orientation === 'v') add('v', m.cells[0].x);
+  }
+
+  return out;
 }

@@ -15,15 +15,22 @@ export interface HudUnit {
 }
 
 export interface Hud {
+  // Alpha 0.3.0 §19 — these are the Hacker's LINK and the System's ICE. The
+  // field names stay technical (§19: internal code may retain hp/player/enemy);
+  // every VISIBLE label uses the player-facing glossary.
   hpPlayer: number;
   hpPlayerMax: number;
   hpEnemy: number;
   hpEnemyMax: number;
   programs: HudUnit[];
   minions: HudUnit[];
-  shakeCharge: number;
-  shakeCost: number;
-  shakeReady: boolean;
+  // Alpha 0.3.0 §7.1 — the fifth Hacker-side control is the DECK-owned Function.
+  // It may remain visually similar to the four Program controls, but it is
+  // labelled from resolved Deck content, never as a Program.
+  deckLabel: string;
+  deckCharge: number;
+  deckCost: number;
+  deckReady: boolean;
   // Alpha 0.2.0 §9.2 — side-general persistent-effect totals (Effect VALUE,
   // not tile count), shown compactly in the avatar boxes only.
   buffPlayer: number;
@@ -33,14 +40,18 @@ export interface Hud {
   turn: number;
   canAct: boolean;
   statusText: string;
-  targeting: boolean; // targeting mode — minion boxes are tap-targets
+  targeting: boolean; // targeting mode — System Program boxes are tap-targets
+  // Alpha 0.3.0 §20.2 — true exactly while Hacker input is disabled for the
+  // System turn. Drives the red viewport border and the Datastream dim; it
+  // never affects turn timing, event ordering, or deterministic state.
+  systemTurn: boolean;
 }
 
 export type Hit =
   | { kind: 'cell'; p: Pt }
   | { kind: 'program'; idx: number }
-  | { kind: 'minion'; idx: number } // tap-target for the player's targeted Drain
-  | { kind: 'shake' }
+  | { kind: 'minion'; idx: number } // tap-target for the Hacker's targeted Drain
+  | { kind: 'deck' } // Alpha 0.3.0 §7.1 — the Deck Function control
   | { kind: 'menu' }
   | { kind: 'avatar'; side: 'player' | 'enemy' } // Alpha 0.2.0 §9/§10 — character-sheet access
   | null;
@@ -184,7 +195,7 @@ export class View {
   private avatarPlayerRect: Rect = { x: 0, y: 0, w: 0, h: 0 }; // Hacker avatar — upper-left
   private avatarEnemyRect: Rect = { x: 0, y: 0, w: 0, h: 0 }; // System avatar — upper-right
   private programRects: Rect[] = []; // Hacker Programs — vertical stack, left column
-  private shakeRect: Rect = { x: 0, y: 0, w: 0, h: 0 }; // Board-Shake — bottom of the Hacker stack
+  private deckRect: Rect = { x: 0, y: 0, w: 0, h: 0 }; // Deck Function — bottom of the Hacker stack
   private minionRects: Rect[] = []; // System Programs — vertical stack, right column
   private statusRect: Rect = { x: 0, y: 0, w: 0, h: 0 }; // bottom status/help region (§12)
 
@@ -268,7 +279,7 @@ export class View {
   }
 
   // §8.3 input priority (canvas channel; blocking DOM modals sit above all of
-  // this): Pause → avatars → Hacker Programs/Shake → System Programs → board.
+  // this): Pause → avatars → Hacker Programs/Deck → System Programs → board.
   // Regions are disjoint, so priority is defensive rather than load-bearing.
   hitTest(x: number, y: number): Hit {
     if (inRect(this.menuRect, x, y)) return { kind: 'menu' };
@@ -277,7 +288,7 @@ export class View {
     for (let i = 0; i < this.programRects.length; i++) {
       if (inRect(this.programRects[i], x, y)) return { kind: 'program', idx: i };
     }
-    if (inRect(this.shakeRect, x, y)) return { kind: 'shake' };
+    if (inRect(this.deckRect, x, y)) return { kind: 'deck' };
     for (let i = 0; i < this.minionRects.length; i++) {
       if (inRect(this.minionRects[i], x, y)) return { kind: 'minion', idx: i };
     }
@@ -291,7 +302,7 @@ export class View {
 
   // Geometry snapshot for headless layout tests (§14.6). Read-only copies.
   get regions(): {
-    avatarPlayer: Rect; avatarEnemy: Rect; pause: Rect; programs: Rect[]; shake: Rect;
+    avatarPlayer: Rect; avatarEnemy: Rect; pause: Rect; programs: Rect[]; deck: Rect;
     minions: Rect[]; board: Rect; status: Rect; viewport: { w: number; h: number };
   } {
     return {
@@ -299,7 +310,7 @@ export class View {
       avatarEnemy: { ...this.avatarEnemyRect },
       pause: { ...this.menuRect },
       programs: this.programRects.map((r) => ({ ...r })),
-      shake: { ...this.shakeRect },
+      deck: { ...this.deckRect },
       minions: this.minionRects.map((r) => ({ ...r })),
       board: { x: this.boardX, y: this.boardY, w: this.cell * BOARD_WIDTH, h: this.cell * BOARD_HEIGHT },
       status: { ...this.statusRect },
@@ -327,13 +338,13 @@ export class View {
     this.canvas.style.height = `${h}px`;
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    // ---- Alpha 0.2.0 §8.1 battle layout ----
+    // ---- Alpha 0.2.0 §8.1 battle layout (preserved by Alpha 0.3.0 §20.1) ----
     // Top row: Hacker avatar (upper-left), Pause (top center), System avatar
     // (upper-right). Below: two opposing VERTICAL Program stacks — Hacker
-    // down the left column (Board-Shake as its fifth box), System down the
-    // right. Square board beneath, pushed toward the bottom (~5% lower than
-    // the pre-Alpha layout); a ~5%-height status/help region spans the very
-    // bottom (§12). All regions disjoint (§8.3).
+    // down the left column (the Deck Function as its fifth box), System down
+    // the right. Square Datastream beneath, pushed toward the bottom; a
+    // ~5%-height status/help region spans the very bottom (§12). All regions
+    // disjoint (§8.3).
     const pad = this.pad;
     const avatarH = 46;
     const avatarW = Math.floor(w * 0.34);
@@ -353,7 +364,7 @@ export class View {
       this.programRects.push({ x: pad, y: stackTop + i * (boxH + gap), w: colW, h: boxH });
       this.minionRects.push({ x: sysX, y: stackTop + i * (boxH + gap), w: colW, h: boxH });
     }
-    this.shakeRect = { x: pad, y: stackTop + 4 * (boxH + gap), w: colW, h: boxH };
+    this.deckRect = { x: pad, y: stackTop + 4 * (boxH + gap), w: colW, h: boxH };
     const stacksBottom = stackTop + 5 * boxH + 4 * gap;
 
     const bottomH = Math.max(26, Math.floor(h * 0.05));
@@ -403,7 +414,7 @@ export class View {
       }
       case 'noMatch':
         dur = 350;
-        this.msgText = 'No match — move reverted';
+        this.msgText = 'No valid Sync — move reverted';
         this.msgUntil = now + 1600;
         break;
       case 'destroy':
@@ -469,7 +480,9 @@ export class View {
         break;
       case 'over':
         dur = 320;
-        this.msgText = ev.winner === 'player' ? 'Enemy down!' : 'You are down!';
+        // §19 — required visible replacements: System ICE breached / Hacker
+        // LINK damaged.
+        this.msgText = ev.winner === 'player' ? 'System ICE breached!' : 'Hacker LINK severed!';
         this.msgUntil = now + 3000;
         break;
       // metrics/logging-only events (MK2.3/MK4.3): nothing to draw
@@ -478,9 +491,12 @@ export class View {
       case 'chargeWaste':
       case 'autoReshuffle':
       case 'cascadeDepth':
-      case 'shakeUsed':
       case 'tileStats':
       case 'thinkTime':
+      case 'deckCharge':
+      case 'lineClear':
+      case 'skill':
+      case 'shake':
         dur = 1;
         break;
     }
@@ -512,7 +528,7 @@ export class View {
 
     const hud = this.getHud();
     if (hud) this.drawHud(hud);
-    this.drawBoard(now);
+    this.drawBoard(now, !!hud?.systemTurn);
 
     // §12 bottom status/help region — one compact contextual line. Priority:
     // an armed targeting prompt stays visible over transient messages; a live
@@ -559,6 +575,18 @@ export class View {
       }
     }
 
+    // §20.2 — SYSTEM-TURN INPUT LOCK indicator: an ~3px red border around the
+    // battle viewport, drawn last so it sits above every region. The Datastream
+    // dim is applied inside drawBoard so it covers ONLY the grid — avatars,
+    // Programs, status text, and visible System actions are never dimmed. Both
+    // effects vanish the moment Hacker control resumes; neither touches turn
+    // timing, event ordering, input-lock semantics, or deterministic state.
+    if (hud?.systemTurn) {
+      ctx.strokeStyle = '#e03030';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(1.5, 1.5, w - 3, h - 3);
+    }
+
     // floating damage numbers — MK6.9b: transient UI can afford to be loud;
     // big, bright, dark-outlined so the feedback is impossible to miss
     this.floats = this.floats.filter((f) => now - f.born < 1000);
@@ -580,9 +608,11 @@ export class View {
     const ctx = this.ctx;
     ctx.textBaseline = 'middle';
 
-    // §9 avatar boxes — side identity, HP, compact Buff/Shield totals
-    this.drawAvatarBox(this.avatarPlayerRect, 'YOU', hud.hpPlayer, hud.hpPlayerMax, '#58c06a', hud.buffPlayer, hud.shieldPlayer);
-    this.drawAvatarBox(this.avatarEnemyRect, 'ENEMY', hud.hpEnemy, hud.hpEnemyMax, '#c05858', hud.buffEnemy, hud.shieldEnemy);
+    // §9 avatar boxes — side identity, LINK/ICE, compact Buff/Shield totals.
+    // §19: YOU -> HACKER, ENEMY -> SYSTEM, with `LINK 150/150`-style and
+    // `ICE 250/250`-style compact stat labels.
+    this.drawAvatarBox(this.avatarPlayerRect, 'HACKER', 'LINK', hud.hpPlayer, hud.hpPlayerMax, '#58c06a', hud.buffPlayer, hud.shieldPlayer);
+    this.drawAvatarBox(this.avatarEnemyRect, 'SYSTEM', 'ICE', hud.hpEnemy, hud.hpEnemyMax, '#c05858', hud.buffEnemy, hud.shieldEnemy);
 
     // Pause button — top center between avatars (§11)
     ctx.fillStyle = '#33333e';
@@ -595,11 +625,11 @@ export class View {
     ctx.textAlign = 'center';
     ctx.fillText('≡', this.menuRect.x + this.menuRect.w / 2, this.menuRect.y + this.menuRect.h / 2 + 1);
 
-    // Hacker Program stack (left, stable authored order) + Board-Shake
+    // Hacker Program stack (left, stable authored order) + the Deck Function
     for (let i = 0; i < 4; i++) {
       this.drawUnitBox(this.programRects[i], hud.programs[i], true, false);
     }
-    this.drawShakeBox(this.shakeRect, hud);
+    this.drawDeckBox(this.deckRect, hud);
 
     // System Program stack (right; highlighted while targeting is armed)
     for (let i = 0; i < 4; i++) {
@@ -608,8 +638,8 @@ export class View {
   }
 
   // §9 avatar box: identity label, compact B/S totals (values, zero-hidden),
-  // HP bar along the bottom. Whitebox placeholders per §9.2.
-  private drawAvatarBox(r: Rect, label: string, hp: number, hpMax: number, hpColor: string, buff: number, shield: number): void {
+  // LINK/ICE bar along the bottom. Whitebox placeholders per §9.2.
+  private drawAvatarBox(r: Rect, label: string, statLabel: string, hp: number, hpMax: number, hpColor: string, buff: number, shield: number): void {
     const ctx = this.ctx;
     ctx.fillStyle = '#2c2c36';
     ctx.fillRect(r.x, r.y, r.w, r.h);
@@ -630,7 +660,7 @@ export class View {
       ctx.textAlign = 'right';
       ctx.fillText(parts.join('  '), r.x + r.w - 4, r.y + 10);
     }
-    this.drawHpBar({ x: r.x + 4, y: r.y + r.h - 22, w: r.w - 8, h: 18 }, '', hp, hpMax, hpColor);
+    this.drawHpBar({ x: r.x + 4, y: r.y + r.h - 22, w: r.w - 8, h: 18 }, statLabel, hp, hpMax, hpColor);
   }
 
   private drawHpBar(r: Rect, label: string, hp: number, max: number, color: string): void {
@@ -643,9 +673,18 @@ export class View {
     ctx.lineWidth = 1;
     ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
     ctx.fillStyle = '#fff';
-    ctx.font = `bold ${Math.floor(r.h * 0.64)}px sans-serif`; // MK3.6: fill the bar height
+    // MK3.6: fill the bar height, but shrink to fit — the §19 stat labels
+    // ("LINK 150/150", "ICE 250/250") are longer than the pre-0.3.0 bare
+    // numbers and must never overflow the avatar box.
+    const text = `${label ? `${label} ` : ''}${hp}/${max}`;
+    let fs = Math.floor(r.h * 0.64);
+    ctx.font = `bold ${fs}px sans-serif`;
+    while (fs > 8 && ctx.measureText(text).width > r.w - 10) {
+      fs--;
+      ctx.font = `bold ${fs}px sans-serif`;
+    }
     ctx.textAlign = 'left';
-    ctx.fillText(`${label ? `${label} ` : ''}${hp}/${max}`, r.x + 6, r.y + r.h / 2 + 1);
+    ctx.fillText(text, r.x + 6, r.y + r.h / 2 + 1);
   }
 
   private drawUnitBox(r: Rect, u: HudUnit, interactive: boolean, targetable: boolean): void {
@@ -694,29 +733,37 @@ export class View {
     ctx.fillRect(r.x + 4, r.y + r.h - 8, bw * Math.min(1, u.charge / u.cost), 5);
   }
 
-  private drawShakeBox(r: Rect, hud: Hud): void {
+  // §7.1 — the Deck Function control. Visually similar to the four Program
+  // boxes (a more distinct Deck presentation is deferred), but its label comes
+  // from resolved Deck content and it carries the Deck's own charge pool.
+  private drawDeckBox(r: Rect, hud: Hud): void {
     const ctx = this.ctx;
-    const charged = hud.shakeCharge >= hud.shakeCost;
+    const charged = hud.deckCharge >= hud.deckCost;
     ctx.fillStyle = '#2c2c36';
     ctx.fillRect(r.x, r.y, r.w, r.h);
-    ctx.strokeStyle = charged ? (hud.shakeReady ? '#ffffff' : '#e0a040') : '#555';
+    ctx.strokeStyle = charged ? (hud.deckReady ? '#ffffff' : '#e0a040') : '#555';
     ctx.lineWidth = charged ? 2 : 1;
     ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
     ctx.fillStyle = '#ddd';
-    ctx.font = `bold ${Math.max(11, Math.floor(r.h * 0.26))}px sans-serif`;
+    let fs = Math.max(11, Math.floor(r.h * 0.26));
+    ctx.font = `bold ${fs}px sans-serif`;
+    while (fs > 8 && ctx.measureText(hud.deckLabel).width > r.w - 8) {
+      fs--;
+      ctx.font = `bold ${fs}px sans-serif`;
+    }
     ctx.textAlign = 'left';
-    ctx.fillText('SHAKE', r.x + 4, r.y + 11);
+    ctx.fillText(hud.deckLabel, r.x + 4, r.y + 11);
     ctx.fillStyle = charged ? '#ffe080' : '#aaa';
     ctx.font = `${Math.max(11, Math.floor(r.h * 0.22))}px sans-serif`;
-    ctx.fillText(`${hud.shakeCharge}/${hud.shakeCost}`, r.x + 4, r.y + r.h - 15);
+    ctx.fillText(`${hud.deckCharge}/${hud.deckCost}`, r.x + 4, r.y + r.h - 15);
     const bw = r.w - 8;
     ctx.fillStyle = '#1c1c24';
     ctx.fillRect(r.x + 4, r.y + r.h - 8, bw, 5);
     ctx.fillStyle = charged ? '#f0c040' : '#6080c0';
-    ctx.fillRect(r.x + 4, r.y + r.h - 8, bw * Math.min(1, hud.shakeCharge / hud.shakeCost), 5);
+    ctx.fillRect(r.x + 4, r.y + r.h - 8, bw * Math.min(1, hud.deckCharge / Math.max(1, hud.deckCost)), 5);
   }
 
-  private drawBoard(now: number): void {
+  private drawBoard(now: number, systemTurn = false): void {
     const ctx = this.ctx;
     const c = this.cell;
     const bw = c * BOARD_WIDTH;
@@ -794,6 +841,13 @@ export class View {
         const pt = this.cur.ev.p;
         ctx.strokeRect(this.boardX + pt.x * c + 1.5, this.boardY + pt.y * c + 1.5, c - 3, c - 3);
       }
+    }
+
+    // §20.2 — dim the Datastream grid by ~10% during the System-turn input
+    // lock. Inside the board clip, so nothing outside the grid is affected.
+    if (systemTurn) {
+      ctx.fillStyle = 'rgba(0,0,0,0.10)';
+      ctx.fillRect(this.boardX, this.boardY, bw, bh);
     }
 
     ctx.restore();

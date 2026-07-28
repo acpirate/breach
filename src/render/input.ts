@@ -1,6 +1,6 @@
 // Pointer input: tap-select / tap-adjacent-swap and press-and-drag swap for
-// the board, plus taps on program/shake/menu UI. Two separate channels —
-// board gestures never fire abilities and vice versa (spec 1.12).
+// the Datastream, plus taps on Program/Deck/menu UI. Two separate channels —
+// board gestures never fire Functions and vice versa (spec 1.12).
 
 import { BOARD_HEIGHT, BOARD_WIDTH } from '../logic/constants';
 import { Pt } from '../logic/types';
@@ -11,7 +11,7 @@ export interface InputHandlers {
   onDrag(a: Pt, b: Pt): void;
   onProgram(i: number): void;
   onMinion(i: number): void; // targeted-Drain target selection
-  onShake(): void;
+  onDeck(): void; // Alpha 0.3.0 §7.1 — activate the Deck-owned Function
   onMenu(): void;
   onAvatar(side: 'player' | 'enemy'): void; // Alpha 0.2.0 §10 — character sheets
 }
@@ -66,8 +66,8 @@ export function attachInput(canvas: HTMLCanvasElement, view: View, h: InputHandl
           case 'minion':
             if (downHit.kind === 'minion' && hit.idx === downHit.idx) h.onMinion(hit.idx);
             break;
-          case 'shake':
-            h.onShake();
+          case 'deck':
+            h.onDeck();
             break;
           case 'menu':
             h.onMenu();

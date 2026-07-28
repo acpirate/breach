@@ -4,15 +4,16 @@
 // shared pipeline the browser uses. Run with `npm run smoke`.
 
 import { findValidMove, swap } from '../src/logic/board';
-import { BOARD_HEIGHT, BOARD_SHAKE_COST, BOARD_WIDTH, DEFAULT_BATTLE_CONFIG } from '../src/logic/constants';
+import { BOARD_HEIGHT, BOARD_WIDTH } from '../src/logic/constants';
 import { getContent, programsFor } from '../src/logic/data/content';
 import { Game } from '../src/logic/game';
 import { detectMatches } from '../src/logic/match';
 import { SAVE_VERSION } from '../src/logic/save';
-import { deserializeSession, serializeSession } from '../src/logic/session';
-import { BattleConfig } from '../src/logic/types';
+import { defaultIdentity, deserializeSession, serializeSession } from '../src/logic/session';
+import { BattleSettings } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { initContentOrExit } from './dataNode';
+import { D, deckCost, defaultHackerLink, manualLink, newBattle } from './harness';
 
 initContentOrExit();
 
@@ -20,13 +21,15 @@ function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`SMOKE FAIL: ${msg}`);
 }
 
+const DECK_COST = deckCost();
+
 function checkInvariants(g: Game): void {
   const s = g.state;
-  // board fully populated between turns (resolution halts at game over)
+  // Datastream fully populated between turns (resolution halts at game over)
   if (!s.winner) {
     for (let y = 0; y < BOARD_HEIGHT; y++) {
       for (let x = 0; x < BOARD_WIDTH; x++) {
-        assert(s.board[y][x], `hole in settled board at ${x},${y}`);
+        assert(s.board[y][x], `hole in settled Datastream at ${x},${y}`);
       }
     }
   }
@@ -39,9 +42,10 @@ function checkInvariants(g: Game): void {
       assert(u.charge >= 0 && u.charge <= cap, `${side} ${u.programId} charge ${u.charge} out of [0,${cap}]`);
     });
   }
-  assert(s.shakeCharge >= 0 && s.shakeCharge <= BOARD_SHAKE_COST, `shake charge ${s.shakeCharge} out of range`);
-  // deadlock prevention: a settled board always has a valid move
-  if (!s.winner) assert(findValidMove(s.board), 'settled board has no valid move');
+  // §7.2 — the Deck Function's independent pool is capped at its cost
+  assert(s.deckCharge >= 0 && s.deckCharge <= DECK_COST, `deck charge ${s.deckCharge} out of range`);
+  // deadlock prevention: a settled Datastream always has a valid move
+  if (!s.winner) assert(findValidMove(s.board), 'settled Datastream has no valid move');
 }
 
 function testInvalidSwapDoesNotConsumeTurn(g: Game): void {
@@ -56,7 +60,7 @@ function testInvalidSwapDoesNotConsumeTurn(g: Game): void {
         swap(g.state.board, a, b);
         if (wouldMatch) continue;
         const r = g.attemptSwap(a, b);
-        assert(!r.matched, 'verified non-matching swap must not match');
+        assert(!r.matched, 'verified non-Syncing swap must not match');
         assert(g.state.phase === 'playerPre', 'invalid swap must not consume the turn');
         return;
       }
@@ -64,8 +68,8 @@ function testInvalidSwapDoesNotConsumeTurn(g: Game): void {
   }
 }
 
-function runBattle(label: string, config: BattleConfig, seed: number): void {
-  const g = new Game(config, seed);
+function runBattle(label: string, settings: BattleSettings, seed: number): void {
+  const g = newBattle(settings, seed);
   g.startPlayerPhase();
   testInvalidSwapDoesNotConsumeTurn(g);
 
@@ -73,99 +77,118 @@ function runBattle(label: string, config: BattleConfig, seed: number): void {
   while (!g.state.winner && safety++ < 600) {
     botFireAbilities(g);
     if (g.state.winner) break;
-    if (g.state.shakeCharge >= BOARD_SHAKE_COST && safety % 4 === 0) {
-      // MK2.2/MK7.9: shake is a pure anti-lock PERMUTATION — verify NO damage,
-      // NO charge, NO cascades, composition preserved, valid no-match board.
+    if (g.state.deckCharge >= DECK_COST && safety % 4 === 0) {
+      // Alpha 0.3.0 §8.8 — the live SCRAMBLE variant is 0:0:0:0: REARRANGE
+      // (composition preserved), RETAIN specials, PREVENT immediate Syncs, no
+      // cascades. Verify NO damage, NO Sync resolution, composition preserved,
+      // and a legal no-Sync Datastream with a valid move.
       const hpBefore = JSON.stringify(g.state.hp);
       const chargesBefore = JSON.stringify({
         p: g.state.units.player.map((u) => u.charge),
         e: g.state.units.enemy.map((u) => u.charge),
       });
-      const shakeBefore = g.state.shakeCharge;
+      const deckBefore = g.state.deckCharge;
       const compBefore = JSON.stringify(
         g.state.board.flat().map((t) => `${t!.kind}:${t!.color ?? '-'}:${t!.shape ?? '-'}`).sort(),
       );
-      const ev = g.fireShake();
+      const specialsBefore = g.state.board.flat().filter((t) => t!.special).length;
+      const ev = g.fireDeckFunction();
       assert(
         JSON.stringify(g.state.board.flat().map((t) => `${t!.kind}:${t!.color ?? '-'}:${t!.shape ?? '-'}`).sort()) === compBefore,
-        'shake must preserve board composition (permutation, not re-roll)',
+        'REARRANGE must preserve Datastream composition (permutation, not re-roll)',
       );
-      assert(ev.length > 0, 'charged shake in playerPre must fire');
-      assert(!ev.some((e) => e.t === 'damage'), 'shake must deal no damage');
-      assert(!ev.some((e) => e.t === 'destroy'), 'shake must trigger no cascades');
-      assert(JSON.stringify(g.state.hp) === hpBefore, 'shake must not change HP');
+      assert(
+        g.state.board.flat().filter((t) => t!.special).length === specialsBefore,
+        'RETAIN must preserve every special object through the Shake',
+      );
+      assert(ev.length > 0, 'a charged Deck Function in playerPre must fire');
+      assert(!ev.some((e) => e.t === 'damage'), 'a 0:0:0:0 Shake must deal no damage');
+      assert(!ev.some((e) => e.t === 'destroy'), 'a 0:0:0:0 Shake must resolve no Syncs');
+      assert(ev.some((e) => e.t === 'shake' && e.resolved), 'the Shake attempt must be recorded as resolved');
+      assert(
+        ev.some((e) => e.t === 'ability' && e.ownerKind === 'deck'),
+        'the activation must be recorded as DECK-owned, not as a Program (§7.1)',
+      );
+      assert(JSON.stringify(g.state.hp) === hpBefore, 'Shake must not change LINK/ICE');
       assert(
         JSON.stringify({ p: g.state.units.player.map((u) => u.charge), e: g.state.units.enemy.map((u) => u.charge) }) === chargesBefore,
-        'shake must not change unit charges',
+        'Shake must not change Program charges',
       );
-      assert(g.state.shakeCharge === shakeBefore - BOARD_SHAKE_COST, 'shake must spend its cost');
-      assert(detectMatches(g.state.board).length === 0, 'shake board must contain no pre-existing match');
-      assert(findValidMove(g.state.board), 'shake board must have a valid move');
-      assert(g.state.phase === 'playerPre', 'shake must not end the turn');
+      assert(g.state.deckCharge === deckBefore - DECK_COST, 'the Deck Function must spend its cost');
+      assert(detectMatches(g.state.board).length === 0, 'a PREVENT_MATCHES Shake must leave no pre-existing Sync');
+      assert(findValidMove(g.state.board), 'the Shake Datastream must have a valid move');
+      assert(g.state.phase === 'playerPre', 'the Deck Function must not end the turn');
     }
     if (g.state.winner) break;
 
     const mv = botMove(g);
     assert(mv, 'deadlock prevention guarantees a move');
     const r = g.attemptSwap(mv.a, mv.b);
-    assert(r.matched, 'bot-selected swap must produce a match');
+    assert(r.matched, 'bot-selected swap must produce a Sync');
     if (!g.state.winner) {
-      assert(g.fireProgram(0).length === 0, 'abilities must not fire after the match is committed');
-      assert(g.fireShake().length === 0, 'shake must not fire after the match is committed');
+      assert(g.fireProgram(0).length === 0, 'Functions must not fire after the Sync is committed');
+      assert(g.fireDeckFunction().length === 0, 'the Deck Function must not fire after the Sync is committed');
     }
 
     if (!g.state.winner) g.runEnemyPhase();
     if (!g.state.winner) g.startPlayerPhase();
     checkInvariants(g);
-    // under a cascade cap, resolution must never leave matches on the board
-    if (!g.state.winner && config.maxCascadeSteps !== null) {
-      assert(detectMatches(g.state.board).length === 0, 'capped battle left unresolved matches on board');
+    // under a cascade cap, resolution must never leave Syncs on the Datastream
+    if (!g.state.winner && settings.maxCascadeSteps !== null) {
+      assert(detectMatches(g.state.board).length === 0, 'capped battle left unresolved Syncs on the Datastream');
     }
   }
 
   assert(g.state.winner, `${label} (seed ${seed}) should reach game over`);
-  assert(g.state.hp[g.state.winner] > 0, 'winner must have positive HP');
+  assert(g.state.hp[g.state.winner] > 0, 'winner must have positive LINK/ICE');
   const m = g.state.metrics;
   assert(m.winner === g.state.winner, 'metrics winner must match game winner');
   assert(m.turns === g.state.turn, 'metrics turn count must match game state');
   assert(m.sides[g.state.winner].totalDamage > 0, 'winning side must have dealt damage');
-  // MK7.3/7.4: the four DISJOINT causal buckets must sum EXACTLY to total
+  // MK7.3/7.4 + §11.3: the FIVE DISJOINT causal buckets must sum EXACTLY to total
   for (const side of ['player', 'enemy'] as const) {
     const sm = m.sides[side];
-    const tallied = sm.matchDamage + sm.bombDamage + sm.attackerDamage + sm.bufferDamageAdded;
-    assert(tallied === sm.totalDamage, `${side} causal buckets (${tallied}) must sum to total (${sm.totalDamage})`);
-  }
-  if (config.enemyMatching) {
-    assert(m.sides.enemy.tilesDestroyed > 0, 'matching enemy should have destroyed tiles');
-  }
-  // MK6.2: matches deal zero damage; bombs must STILL deal detonation damage
-  if (config.noMatchDamage) {
-    assert(m.sides.player.matchDamage === 0 && m.sides.enemy.matchDamage === 0, 'NMD: match damage must be zero');
+    const tallied = sm.matchDamage + sm.bombDamage + sm.attackerDamage + sm.bufferDamageAdded + sm.skillDamage;
     assert(
-      m.sides.player.totalDamage ===
-        m.sides.player.attackerDamage + m.sides.player.bombDamage + m.sides.player.bufferDamageAdded,
-      'NMD: all damage must come from abilities (+buffer)',
+      Math.abs(tallied - sm.totalDamage) < 1e-9,
+      `${side} causal buckets (${tallied}) must sum to total (${sm.totalDamage})`,
     );
+  }
+  if (settings.enemyMatching) {
+    assert(m.sides.enemy.tilesDestroyed > 0, 'a matching System should have sliced Packets');
+  }
+  // §11.2: base Sync damage is suppressed for BOTH sides; Skill-originated
+  // damage still resolves, and bombs still deal detonation damage.
+  if (settings.reinforcedConnection) {
+    assert(
+      m.sides.player.matchDamage === 0 && m.sides.enemy.matchDamage === 0,
+      'Reinforced Connection: base Sync damage must be zero for both sides',
+    );
+    const p = m.sides.player;
+    assert(
+      Math.abs(p.totalDamage - (p.attackerDamage + p.bombDamage + p.bufferDamageAdded + p.skillDamage)) < 1e-9,
+      'Reinforced Connection: Hacker damage must come only from Functions, buffer, and Skills',
+    );
+    // the System has no Hacker identity, so it has no Skill damage at all (§6.2)
+    assert(m.sides.enemy.skillDamage === 0, 'Reinforced Connection: the System must never accrue Hacker-Skill damage');
   }
   console.log(
     `${label} seed=${seed}: winner=${g.state.winner} turns=${g.state.turn} ` +
-      `hp(player=${Math.max(0, g.state.hp.player)}, enemy=${Math.max(0, g.state.hp.enemy)})` +
-      `${config.noMatchDamage ? ` [bombDmg P:${m.sides.player.bombDamage} E:${m.sides.enemy.bombDamage}]` : ''}`,
+      `link=${Math.max(0, g.state.hp.player)} ice=${Math.max(0, g.state.hp.enemy)}` +
+      ` skillDmg=${m.sides.player.skillDamage} lineClears=${m.sides.player.lineClears}` +
+      ` deckNeutral=${m.sides.player.deck.chargeFromNeutral}` +
+      `${settings.reinforcedConnection ? ` [bombDmg H:${m.sides.player.bombDamage} S:${m.sides.enemy.bombDamage}]` : ''}`,
   );
 }
 
-// Alpha 0.2.0 §6: session save/restore round trip — headless, pure logic
+// Alpha 0.2.0 §6/Alpha 0.3.0 §17: session save/restore round trip — headless
 function testSaveRoundTrip(): void {
-  const cfg: BattleConfig = {
-    ...DEFAULT_BATTLE_CONFIG,
-    enemyMatching: true,
-    maxCascadeSteps: 4,
-    playerHp: 222,
-    enemyHp: 333,
-    hintEnabled: true,
-    hintDelaySeconds: 3,
-  };
-  const g = new Game(cfg, 42);
+  const settings: BattleSettings = manualLink(
+    { ...D, enemyMatching: true, maxCascadeSteps: 4, hintEnabled: true, hintDelaySeconds: 3 },
+    222,
+    333,
+  );
+  const g = newBattle(settings, 42);
   g.startPlayerPhase();
   for (let i = 0; i < 3 && !g.state.winner; i++) {
     const mv = botMove(g);
@@ -177,14 +200,19 @@ function testSaveRoundTrip(): void {
   assert(!g.state.winner, 'battle still in progress at save point');
   assert(g.state.metrics.thinkTimesMs.length === 3, 'raw think-times must be recorded per move');
   assert(g.state.metrics.hintsShown === 1, 'hint-shown count must be recorded');
-  const json = serializeSession({ mode: 'QUICK_MATCH' }, g, null);
+  const info = { mode: 'QUICK_MATCH' as const, identity: defaultIdentity() };
+  const json = serializeSession(info, g, null);
   const r = deserializeSession(json);
   assert(r, 'valid save must deserialize');
   assert(r.info.mode === 'QUICK_MATCH' && r.pending === null, 'mode and phase survive');
   assert(serializeSession(r.info, r.game, r.pending) === json, 'restored session must re-serialize identically');
   assert(r.game.state.turn === g.state.turn && r.game.state.battleId === g.state.battleId, 'turn/battleId survive');
-  assert(r.game.state.config.playerHp === 222 && r.game.state.config.enemyHp === 333, 'HP config survives the round trip');
+  assert(r.game.state.config.playerHp === 222 && r.game.state.config.enemyHp === 333, 'manual LINK/ICE survive the round trip');
   assert(r.game.state.config.hintDelaySeconds === 3, 'hint config survives');
+  // §17.2 — explicit identity and the Deck Function's exact charge round-trip
+  assert(r.game.state.identity.hackerId === 'HAK_01' && r.game.state.identity.deckId === 'DEK_01', 'identity survives');
+  assert(r.game.state.identity.deckFunctionId === 'FNC_010', 'Deck Function ID survives');
+  assert(r.game.state.deckCharge === g.state.deckCharge, 'Deck Function charge survives exactly');
   let safety = 0;
   const rg = r.game;
   while (!rg.state.winner && safety++ < 600) {
@@ -197,13 +225,13 @@ function testSaveRoundTrip(): void {
     if (!rg.state.winner) rg.startPlayerPhase();
   }
   assert(rg.state.winner, 'restored game plays to completion');
-  // §6.1: pre-Alpha-0.2.0 saves reject cleanly (no migration, no partial load)
-  for (const old of ['mk9', 'alpha-0.1.0']) {
+  // §17.1: pre-Alpha-0.3.0 saves reject cleanly (no migration, no partial load)
+  for (const old of ['mk9', 'alpha-0.1.0', 'alpha-0.2.0']) {
     const preAlpha = JSON.parse(json) as { version: string };
     preAlpha.version = old;
     assert(deserializeSession(JSON.stringify(preAlpha)) === null, `${old} save -> no save`);
   }
-  // §6.5: content-fingerprint mismatch rejects
+  // content-fingerprint mismatch rejects
   const fpMismatch = JSON.parse(json) as { fp: string };
   fpMismatch.fp = 'deadbeef-0';
   assert(deserializeSession(JSON.stringify(fpMismatch)) === null, 'fingerprint mismatch -> no save');
@@ -213,33 +241,37 @@ function testSaveRoundTrip(): void {
   console.log('save round-trip OK');
 }
 
-assert(SAVE_VERSION === 'alpha-0.2.0', 'save version must be alpha-0.2.0');
+assert(SAVE_VERSION === 'alpha-0.3.0', 'save version must be alpha-0.3.0');
 console.log(`content fingerprint: ${getContent().fingerprint}`);
+console.log(`default identity LINK: ${defaultHackerLink()} (deck function cost ${DECK_COST})`);
 
-const D = DEFAULT_BATTLE_CONFIG;
-// defaults (cap-0, hacker off) — standard and low-player-HP
+// defaults (cap-0, Normal LINK on) — standard and low-LINK
 for (let seed = 1; seed <= 10; seed++) {
   runBattle('default', D, seed);
-  runBattle('lowHp', { ...D, playerHp: 1 }, 1000 + seed);
+  runBattle('lowLink', manualLink(D, 1, 150), 1000 + seed);
 }
-// enemy matching on
+// System matching on
 for (let seed = 1; seed <= 5; seed++) {
-  runBattle('enemyMatch', { ...D, enemyMatching: true }, 2000 + seed);
-  runBattle('enemyMatch+lowHp', { ...D, enemyMatching: true, playerHp: 1 }, 3000 + seed);
+  runBattle('systemMatch', { ...D, enemyMatching: true }, 2000 + seed);
+  runBattle('systemMatch+lowLink', manualLink({ ...D, enemyMatching: true }, 1, 150), 3000 + seed);
 }
 // infinite cascades (old default) and single-axis still work
 for (let seed = 1; seed <= 5; seed++) {
   runBattle('capInf', { ...D, maxCascadeSteps: null }, 4000 + seed);
   runBattle('singleAxis', { ...D, singleAxisPayout: true }, 5000 + seed);
 }
-// MK6.2: no-match-damage — abilities are the only damage source, bombs intact
+// §11: Reinforced Connection — Functions and Skills are the damage sources
 for (let seed = 1; seed <= 5; seed++) {
-  runBattle('noMatchDmg', { ...D, noMatchDamage: true }, 6000 + seed);
-  runBattle('noMatchDmg+enemyMatch', { ...D, noMatchDamage: true, enemyMatching: true }, 7000 + seed);
+  runBattle('reinforced', { ...D, reinforcedConnection: true }, 6000 + seed);
+  runBattle('reinforced+systemMatch', { ...D, reinforcedConnection: true, enemyMatching: true }, 7000 + seed);
 }
-// MK7.13 addendum: sub-option off restores the classic charge-agnostic tier
+// sub-option off restores the classic charge-agnostic tier
 for (let seed = 1; seed <= 3; seed++) {
-  runBattle('noMatchDmg+classicBot', { ...D, noMatchDamage: true, enemyMatching: true, nmdChargeAwareBot: false }, 7500 + seed);
+  runBattle(
+    'reinforced+classicBot',
+    { ...D, reinforcedConnection: true, enemyMatching: true, reinforcedChargeAwareBot: false },
+    7500 + seed,
+  );
 }
 testSaveRoundTrip();
 console.log('SMOKE OK');

@@ -72,12 +72,23 @@ const arr = (a) => (Array.isArray(a) ? a : []);
 // lines. Quick Match entries carry no runStep (never fake Run values).
 const modeStr = (entry) =>
   entry.mode === 'RUN' ? `mode=RUN step=${entry.runStep ?? '?'}` : entry.mode === 'QUICK_MATCH' ? 'mode=QUICK_MATCH' : 'mode=?';
+// Alpha 0.3.0: `hb` (hardcoded Hacker bonus) is gone — that passive is now the
+// Hacker's Skill records. `nmd` is now `rc` (Reinforced Connection), `nl` is
+// Normal LINK, and the HP pair reads as effective LINK/ICE. Historical records
+// with the old field names still format (missing values show as '?') — prior
+// logs are never rewritten (§21.5).
 const cfgStr = (c) =>
   c
-    ? `cfg[em:${c.enemyMatching ? 1 : 0} hb:${c.hackerBonusEnabled ? 1 : 0} sa:${c.singleAxisPayout ? 1 : 0} nmd:${c.noMatchDamage ? 1 : 0} cap:${c.maxCascadeSteps === null ? 'inf' : c.maxCascadeSteps} hp:${c.playerHp ?? '?'}v${c.enemyHp ?? '?'}` +
+    ? `cfg[em:${c.enemyMatching ? 1 : 0} sa:${c.singleAxisPayout ? 1 : 0} rc:${(c.reinforcedConnection ?? c.noMatchDamage) ? 1 : 0}` +
+      ` nl:${c.normalLink ? 1 : 0} cap:${c.maxCascadeSteps === null ? 'inf' : c.maxCascadeSteps} link:${c.playerHp ?? '?'} ice:${c.enemyHp ?? '?'}` +
       ` strongC:P[${arr(c.strongColors && c.strongColors.player)}]E[${arr(c.strongColors && c.strongColors.enemy)}]` +
       ` strongS:P[${arr(c.strongShapes && c.strongShapes.player)}]E[${arr(c.strongShapes && c.strongShapes.enemy)}]]`
     : 'cfg[missing]';
+// Alpha 0.3.0 §21.2 — selection/build identity on battle, turn, and Run records.
+const idStr = (i) =>
+  i
+    ? `id[${i.hackerId ?? '?'}/${i.deckId ?? '?'} fn:${i.deckFunctionId ?? '?'} skills:[${arr(i.skillIds)}] src:${i.selectionSource ?? '?'}]`
+    : '';
 
 // ---- build the readable body from all raw source lines ----
 const rawParts = [];
@@ -85,6 +96,7 @@ const bodyLines = [];
 let metrics = 0;
 let turns = 0;
 let wizards = 0;
+let selections = 0;
 let bad = 0;
 
 for (const file of files) {
@@ -99,8 +111,8 @@ for (const file of files) {
         metrics++;
         const m = entry.metrics;
         bodyLines.push(
-          `[${at}] === BATTLE ${entry.battleId} v=${entry.v} ${modeStr(entry)} natural=${entry.natural ?? '?'} ${cfgStr(entry.config)} winner=${entry.winner} turns=${m.turns}` +
-            `${entry.encounterSystemHp !== undefined ? ` encounterHp=${entry.encounterSystemHp}` : ''}` +
+          `[${at}] === BATTLE ${entry.battleId} v=${entry.v} ${modeStr(entry)} natural=${entry.natural ?? '?'} ${cfgStr(entry.config)} ${idStr(entry.identity)} winner=${entry.winner} turns=${m.turns}` +
+            `${entry.encounterSystemHp !== undefined ? ` encounterIce=${entry.encounterSystemHp}` : ''}` +
             `${entry.wallClockMs !== undefined ? ` wallClock=${(entry.wallClockMs / 1000).toFixed(0)}s` : ''} ===`,
         );
         // MK9.3 — enemy Shielder (prevention is NOT damage dealt)
@@ -111,15 +123,31 @@ for (const file of files) {
           const s = m.sides[side];
           const avgRound = s.roundDamageCount ? (s.roundDamageSum / s.roundDamageCount).toFixed(1) : '0';
           bodyLines.push(
-            `  ${side}: dmg ${s.totalDamage} [match ${s.matchDamage} | bomb ${s.bombDamage} | atk ${s.attackerDamage} | buffer ${s.bufferDamageAdded ?? 0}]` +
+            // §11.3/§6.4 — five DISJOINT buckets: base Sync + bomb + atk +
+            // buffer + skill == total. `skill` is Hacker-Skill damage and is
+            // never folded into base Sync damage.
+            `  ${side}: dmg ${s.totalDamage} [sync ${s.matchDamage} | bomb ${s.bombDamage} | atk ${s.attackerDamage} | buffer ${s.bufferDamageAdded ?? 0} | skill ${s.skillDamage ?? 0}]` +
               ` cascadeDmg ${s.cascadeDamage ?? 0} axis(c/s) ${s.matchDamageColor ?? 0}/${s.matchDamageShape ?? 0}` +
               ` critExtra ${s.critExtra} contention ${s.contentionTiles ?? 0}/${s.tilesDestroyed ?? 0}` +
-              ` largestHit ${s.largestHit} biggestRound ${s.biggestRound ?? 0} avgRound ${avgRound} deepestCascade ${s.deepestCascade}`,
+              ` largestHit ${s.largestHit} biggestRound ${s.biggestRound ?? 0} avgRound ${avgRound} deepestCascade ${s.deepestCascade}` +
+              ` lineClears ${s.lineClears ?? 0}`,
           );
           for (const [t, u] of Object.entries(s.units)) {
-            // MK9.1/9.2 — bombs placed per activation surfaces on bomber
-            const placed = t === 'bomber' ? `, bombsPlaced ${u.bombsPlaced ?? 0}` : '';
+            const placed = u.bombsPlaced ? `, bombsPlaced ${u.bombsPlaced}` : '';
             bodyLines.push(`    ${t}: fires ${u.fires}, effect ${u.effect}, chargeWasted ${u.chargeWasted}${placed}`);
+          }
+          // §21.3 — the Deck-owned Function has its OWN bucket, never listed
+          // among the Programs.
+          const d = s.deck;
+          if (d) {
+            bodyLines.push(
+              `    [deck]: fires ${d.fires ?? 0}, ops ${d.ops ?? 0}, fizzles ${d.fizzles ?? 0},` +
+                ` neutralCharge ${d.chargeFromNeutral ?? 0} (wasted ${d.chargeWasted ?? 0}),` +
+                ` shake ${d.shakeSuccesses ?? 0}/${d.shakeAttempts ?? 0} (legalFizzles ${d.shakeFizzles ?? 0})`,
+            );
+          }
+          for (const [sid, k] of Object.entries(s.skills || {})) {
+            bodyLines.push(`    [skill ${sid}]: triggers ${k.triggers ?? 0}, damage ${k.damage ?? 0}, charge ${k.charge ?? 0}`);
           }
         }
         if (m.thinkTimesMs && m.thinkTimesMs.length) {
@@ -136,17 +164,28 @@ for (const file of files) {
         );
         if (entry.actions.length) bodyLines.push(`  actions: ${entry.actions.join('; ')}`);
         bodyLines.push(
-          `  dmg P:${entry.damage.player.total} E:${entry.damage.enemy.total}  hp P:${entry.hpAfter.player} E:${entry.hpAfter.enemy}  detonations:${entry.detonations} reshuffles:${entry.reshuffles}`,
+          `  dmg H:${entry.damage.player.total} S:${entry.damage.enemy.total}  link:${entry.hpAfter.player} ice:${entry.hpAfter.enemy}` +
+            `  detonations:${entry.detonations} reshuffles:${entry.reshuffles} lineClears:${entry.lineClears ?? 0}`,
         );
         bodyLines.push(
-          `  charges P:[${entry.chargesAfter.player}] E:[${entry.chargesAfter.enemy}] shake:${entry.chargesAfter.shake}`,
+          `  charges H:[${entry.chargesAfter.player}] S:[${entry.chargesAfter.enemy}] deck:${entry.chargesAfter.deck ?? entry.chargesAfter.shake ?? '?'}`,
         );
       } else if (kind === 'wizard') {
-        // Alpha 0.2.0 §5.4/§13.4 — wizard invocation, distinct from the
+        // Alpha 0.2.0 §5.4/§21.4 — wizard invocation, distinct from the
         // natural battle outcome it acted on (never overwrites it).
         wizards++;
         bodyLines.push(
           `[${at}] WIZARD ${entry.battleId} v=${entry.v} ${modeStr(entry)} natural=${entry.natural} action=${entry.action}`,
+        );
+      } else if (kind === 'selection') {
+        // Alpha 0.3.0 §21.2 — COMMITTED selection / battle-creation events only
+        // (never preselection, screen views, or Back navigation).
+        selections++;
+        bodyLines.push(
+          `[${at}] SELECT ${entry.event} v=${entry.v} ${modeStr(entry)} ${idStr(entry.identity)}` +
+            `${entry.battleId ? ` battle=${entry.battleId}` : ''}` +
+            `${entry.hackerMaxLink !== undefined ? ` link=${entry.hackerMaxLink}` : ''}` +
+            `${entry.systemMaxIce !== undefined ? ` ice=${entry.systemMaxIce}` : ''}`,
         );
       } else {
         bad++;
@@ -163,7 +202,9 @@ const existing = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : '';
 // retry-safe dedup: this exact source was already appended (the session id is
 // written into the header below, so a re-run with identical source finds it)
 if (existing.includes(`SESSION ${sessionId} `)) {
-  console.log(`session ${sessionId} already appended to ${out} — nothing to do (${metrics} battle-metrics + ${turns} turns + ${wizards} wizard entries in source)`);
+  console.log(
+    `session ${sessionId} already appended to ${out} — nothing to do (${metrics} battle-metrics + ${turns} turns + ${wizards} wizard + ${selections} selection entries in source)`,
+  );
   process.exit(0);
 }
 
@@ -177,8 +218,8 @@ if (overThreshold(dir)) {
 
 const header =
   `\n===== SESSION ${sessionId} | ${new Date().toISOString()} | files: ${files.map((f) => path.basename(f)).join(', ')} ` +
-  `| ${metrics} battle-metrics, ${turns} turns, ${wizards} wizard${bad ? `, ${bad} unparsable` : ''} =====`;
+  `| ${metrics} battle-metrics, ${turns} turns, ${wizards} wizard, ${selections} selection${bad ? `, ${bad} unparsable` : ''} =====`;
 fs.appendFileSync(out, `${header}\n${bodyLines.join('\n')}\n`);
 console.log(
-  `appended session ${sessionId}: ${metrics} battle-metrics + ${turns} turn + ${wizards} wizard entries from ${files.length} file(s)${bad ? ` (${bad} unparsable)` : ''} -> ${out}`,
+  `appended session ${sessionId}: ${metrics} battle-metrics + ${turns} turn + ${wizards} wizard + ${selections} selection entries from ${files.length} file(s)${bad ? ` (${bad} unparsable)` : ''} -> ${out}`,
 );

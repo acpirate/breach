@@ -1,9 +1,9 @@
-// MK4.1/Alpha 0.2.0 — GAME-STATE (de)serialization primitives. As of Alpha
-// 0.2.0 the persisted envelope is the SESSION envelope owned by session.ts
-// (mode, Run state, pending result); this module provides the state-level
-// pieces it composes: plain-object serialization of a GameState and validated
-// restoration of one, for both ACTIVE battles (in-progress, stable phase) and
-// CONCLUDED battles (a saved pending result, §5.1).
+// MK4.1/Alpha 0.2.0/Alpha 0.3.0 — GAME-STATE (de)serialization primitives. The
+// persisted envelope is the SESSION envelope owned by session.ts (mode, Run
+// state, pending result, selection identity); this module provides the
+// state-level pieces it composes: plain-object serialization of a GameState and
+// validated restoration of one, for both ACTIVE battles (in-progress, stable
+// phase) and CONCLUDED battles (a saved pending result, §5.1).
 //
 // Pure logic-layer JSON — no storage APIs here; the browser adapter owns
 // localStorage.
@@ -13,11 +13,11 @@ import { isAreaPatternId } from './data/areas';
 import { GAME_VERSION, getContent } from './data/content';
 import { Game } from './game';
 import { makeRNG } from './rng';
-import { GameState } from './types';
+import { BattleIdentity, BattleSettings, GameState } from './types';
 
 export const SAVE_VERSION = GAME_VERSION;
 
-// MK9.4: a strong-binding set is an array of valid Color/Shape enum ints.
+// A strong-binding set is an array of valid Color/Shape enum ints.
 function isValidEnumArray(a: unknown, max: number): boolean {
   return Array.isArray(a) && a.every((v) => Number.isInteger(v) && v >= 0 && v < max);
 }
@@ -26,25 +26,65 @@ export function isValidStrongRecord(r: unknown, max: number): boolean {
   return !!rec && isValidEnumArray(rec.player, max) && isValidEnumArray(rec.enemy, max);
 }
 
-// Shape check for a BattleConfig — used for the battle's own config AND the
-// Run configuration snapshot (§4.2), which must satisfy the same contract.
-export function isValidConfigShape(c: unknown): boolean {
-  const cfg = c as GameState['config'] | undefined;
+const isStringArray = (a: unknown): a is string[] => Array.isArray(a) && a.every((v) => typeof v === 'string');
+
+// Alpha 0.3.0 §10.2 — shape check for the player-chosen SETTINGS. Used for the
+// Run configuration snapshot and as the base of the per-battle config check.
+export function isValidSettingsShape(c: unknown): boolean {
+  const cfg = c as BattleSettings | undefined;
   return !!(
     cfg &&
     typeof cfg.enemyMatching === 'boolean' &&
-    typeof cfg.hackerBonusEnabled === 'boolean' &&
     typeof cfg.singleAxisPayout === 'boolean' &&
-    typeof cfg.noMatchDamage === 'boolean' &&
+    typeof cfg.reinforcedConnection === 'boolean' &&
+    typeof cfg.normalLink === 'boolean' &&
     (cfg.maxCascadeSteps === null || (Number.isInteger(cfg.maxCascadeSteps) && cfg.maxCascadeSteps >= 0 && cfg.maxCascadeSteps <= 9)) &&
+    Number.isInteger(cfg.manualHackerLink) && cfg.manualHackerLink >= 1 && cfg.manualHackerLink <= 9999 &&
+    Number.isInteger(cfg.manualSystemIce) && cfg.manualSystemIce >= 1 && cfg.manualSystemIce <= 9999 &&
+    typeof cfg.hintEnabled === 'boolean' &&
+    typeof cfg.reinforcedChargeAwareBot === 'boolean' &&
+    Number.isInteger(cfg.hintDelaySeconds) && cfg.hintDelaySeconds >= 1 && cfg.hintDelaySeconds <= 60
+  );
+}
+
+// Shape check for a full per-battle BattleConfig: the settings PLUS the values
+// resolved from the active Hacker/Deck identity (effective LINK/ICE maxima and
+// the per-side strong sets).
+export function isValidConfigShape(c: unknown): boolean {
+  const cfg = c as GameState['config'] | undefined;
+  return !!(
+    isValidSettingsShape(c) &&
+    cfg &&
     Number.isInteger(cfg.playerHp) && cfg.playerHp >= 1 && cfg.playerHp <= 9999 &&
     Number.isInteger(cfg.enemyHp) && cfg.enemyHp >= 1 && cfg.enemyHp <= 9999 &&
-    typeof cfg.hintEnabled === 'boolean' &&
-    typeof cfg.nmdChargeAwareBot === 'boolean' &&
-    Number.isInteger(cfg.hintDelaySeconds) && cfg.hintDelaySeconds >= 1 && cfg.hintDelaySeconds <= 60 &&
     isValidStrongRecord(cfg.strongColors, COLOR_COUNT) &&
     isValidStrongRecord(cfg.strongShapes, SHAPE_COUNT)
   );
+}
+
+// §17.3 — the saved battle identity must exist in, and AGREE with, the current
+// resolved content contract. A mismatch rejects the save rather than
+// substituting current defaults.
+export function isValidIdentity(raw: unknown): boolean {
+  const id = raw as BattleIdentity | undefined;
+  if (!id || typeof id !== 'object') return false;
+  if (typeof id.hackerId !== 'string' || typeof id.deckId !== 'string') return false;
+  if (typeof id.deckFunctionId !== 'string') return false;
+  if (!isStringArray(id.skillIds) || !isStringArray(id.hackerPrograms) || !isStringArray(id.systemPrograms)) return false;
+  if (id.selectionSource !== 'EXPLICIT_SELECTION' && id.selectionSource !== 'QUICK_MATCH_DEFAULT') return false;
+  const c = getContent();
+  const hacker = c.hackers.get(id.hackerId);
+  const deck = c.decks.get(id.deckId);
+  if (!hacker || !deck) return false;
+  // ordered Skill IDs must match the referenced Hacker exactly (§17.3)
+  if (id.skillIds.length !== hacker.skillIds.length) return false;
+  if (id.skillIds.some((s, i) => s !== hacker.skillIds[i])) return false;
+  if (id.skillIds.some((s) => !c.skills.has(s))) return false;
+  if (id.deckFunctionId !== deck.fn.id) return false;
+  // ordered Program rosters must match the resolved content contract (§5.3)
+  const orderOk = (saved: string[], programs: ReadonlyArray<{ id: string }>): boolean =>
+    saved.length === programs.length && saved.every((pid, i) => pid === programs[i].id);
+  return orderOk(id.hackerPrograms, c.hacker) && orderOk(id.systemPrograms, c.system);
 }
 
 export type PlainGameState = Omit<GameState, 'rng'> & { rngState: number };
@@ -55,7 +95,7 @@ export function plainGameState(state: GameState): PlainGameState {
 }
 
 // Validate and restore one serialized GameState against the CURRENT resolved
-// content (§14.4 restore-by-stable-IDs). `concluded` selects the phase
+// content (§17.3 restore-by-stable-IDs). `concluded` selects the phase
 // contract:
 //  - active battles: winner null, phase 'playerPre', fully populated board
 //    (in-progress stable saves only, deterministic RNG continuation);
@@ -90,6 +130,9 @@ export function restoreGameState(raw: unknown, concluded: boolean): Game | null 
         }
       }
     }
+    // §17.3 — explicit Hacker/Deck/Skill/build identity, verified against the
+    // resolved content contract before anything else is trusted.
+    if (!isValidIdentity(s.identity)) return null;
     // Restore by stable IDs against current resolved definitions — slot order
     // and IDs must match the loaded content exactly (§7.2 order round-trip).
     const content = getContent();
@@ -105,6 +148,9 @@ export function restoreGameState(raw: unknown, concluded: boolean): Game | null 
         if (!(Number.isInteger(u.charge) && u.charge >= 0 && u.charge <= programs[i].chargeCap)) return null;
       }
     }
+    // §7.2 — the Deck Function's exact current charge, capped at its cost.
+    const deckCap = content.decks.get(s.identity.deckId)!.fn.cost;
+    if (!(Number.isInteger(s.deckCharge) && s.deckCharge >= 0 && s.deckCharge <= deckCap)) return null;
     if (typeof s.hp?.player !== 'number' || typeof s.hp?.enemy !== 'number') return null;
     if (!s.metrics?.sides?.player || !s.metrics?.sides?.enemy) return null;
     if (!isValidConfigShape(s.config)) return null;

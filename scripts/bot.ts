@@ -15,9 +15,10 @@ export function botMove(g: Game): { a: Pt; b: Pt } | null {
 }
 
 // Fire every charged Program (Alpha: against the resolved data costs). A
-// targeted Program (plan leads with player-choice Drain) targets the enemy
+// targeted Program (plan leads with player-choice Drain) targets the System
 // slot with the highest current charge — a reasonable dumb policy for the
-// floor-indicator bot.
+// floor-indicator bot. §7.4: only Programs are Drain candidates; the Deck
+// Function's pool is not in state.units and is therefore never offered.
 export function botFireAbilities(g: Game): void {
   const hacker = getContent().hacker;
   for (let i = 0; i < hacker.length; i++) {

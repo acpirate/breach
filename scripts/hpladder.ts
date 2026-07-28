@@ -1,13 +1,14 @@
-// Symmetric-HP ladder (designer-requested, MK6): plays batches at mirrored
-// 100v100, 500v500, and 2000v2000 HP under the new default config, in BOTH
-// enemy modes, and reports turns-to-win distributions. The equal pools
-// isolate tempo/fairness from HP asymmetry. Run with `npm run hpladder`.
+// Symmetric LINK/ICE ladder (designer-requested, MK6): plays batches at
+// mirrored 100v100, 500v500, and 2000v2000 under the default settings, in BOTH
+// System modes, and reports turns-to-win distributions. The equal pools isolate
+// tempo/fairness from asymmetry. Alpha 0.3.0: mirrored arbitrary maxima require
+// Normal LINK OFF (§10.2), which is exactly what the manual settings are for.
+// Run with `npm run hpladder`.
 
-import { DEFAULT_BATTLE_CONFIG } from '../src/logic/constants';
-import { Game } from '../src/logic/game';
-import { BattleConfig } from '../src/logic/types';
+import { BattleSettings } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { initContentOrExit } from './dataNode';
+import { D, manualLink, newBattle } from './harness';
 
 initContentOrExit();
 
@@ -19,8 +20,8 @@ interface Result {
   turns: number;
 }
 
-function playOne(seed: number, config: BattleConfig): Result {
-  const g = new Game(config, seed);
+function playOne(seed: number, settings: BattleSettings): Result {
+  const g = newBattle(settings, seed);
   g.startPlayerPhase();
   let safety = 0;
   while (!g.state.winner && safety++ < 5000) {
@@ -45,18 +46,18 @@ const median = (xs: number[]): number => {
 };
 const f1 = (n: number): string => n.toFixed(1);
 
-console.log(`=== Symmetric-HP ladder: ${N} battles per cell, new default config (cap-0, hacker off) ===`);
+console.log(`=== Symmetric LINK/ICE ladder: ${N} battles per cell, default settings (cap-0) ===`);
 for (const matching of [false, true]) {
-  console.log(`\n--- ENEMY_MATCHING ${matching ? 'ON' : 'OFF'} ---`);
+  console.log(`\n--- SYSTEM_MATCHING ${matching ? 'ON' : 'OFF'} ---`);
   for (const hp of TIERS) {
-    const cfg: BattleConfig = { ...DEFAULT_BATTLE_CONFIG, enemyMatching: matching, playerHp: hp, enemyHp: hp };
+    const settings = manualLink({ ...D, enemyMatching: matching }, hp, hp);
     const results: Result[] = [];
-    for (let seed = 1; seed <= N; seed++) results.push(playOne(seed, cfg));
+    for (let seed = 1; seed <= N; seed++) results.push(playOne(seed, settings));
     const wins = results.filter((r) => r.winner === 'player');
     const losses = results.filter((r) => r.winner === 'enemy');
     const all = results.map((r) => r.turns);
     console.log(
-      `${hp}v${hp}: player wins ${wins.length}/${N} (${((wins.length / N) * 100).toFixed(0)}%)  ` +
+      `${hp}v${hp}: Hacker wins ${wins.length}/${N} (${((wins.length / N) * 100).toFixed(0)}%)  ` +
         `turns-to-win: avg ${f1(avg(wins.map((r) => r.turns)))} med ${median(wins.map((r) => r.turns))}  ` +
         `turns-to-loss: avg ${f1(avg(losses.map((r) => r.turns)))} med ${median(losses.map((r) => r.turns))}  ` +
         `all battles: avg ${f1(avg(all))} med ${median(all)} max ${Math.max(...all)}`,

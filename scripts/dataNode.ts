@@ -16,6 +16,9 @@ const FILES = {
   hacker: 'breach datastructures - PRG_H.csv',
   system: 'breach datastructures - PRG_S.csv',
   functions: 'breach datastructures - FNC.csv',
+  hakers: 'breach datastructures - HAK.csv',
+  skills: 'breach datastructures - SKL.csv',
+  decks: 'breach datastructures - DEK.csv',
 } as const;
 
 export function nodeDataFiles(): DataFiles {
@@ -27,6 +30,9 @@ export function nodeDataFiles(): DataFiles {
     hacker: read(FILES.hacker),
     system: read(FILES.system),
     functions: read(FILES.functions),
+    hackers: read(FILES.hakers),
+    skills: read(FILES.skills),
+    decks: read(FILES.decks),
   };
 }
 

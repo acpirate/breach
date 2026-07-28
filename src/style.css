@@ -204,8 +204,13 @@ canvas {
   background: #505064;
 }
 
-/* Alpha 0.2.0 §5.2: wizard/dev controls must remain visually distinguishable
-   from normal player controls. */
+.dialog button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Alpha 0.2.0 §5.2/§18.3: wizard/dev controls must remain visually
+   distinguishable from normal player controls. */
 .dialog button.wizard {
   background: #4a3a1a;
   color: #ffcf6a;
@@ -214,4 +219,51 @@ canvas {
 
 .dialog button.wizard:active {
   background: #5f4a22;
+}
+
+/* Alpha 0.3.0 §13/§14 — mobile-first whitebox selection lists. Deliberately
+   plain: no carousel, art, filtering, or unlock presentation (§13.2). */
+.optlist {
+  display: block;
+  text-align: left;
+}
+
+.optlist .opt {
+  display: block;
+  width: 100%;
+  margin: 6px 0;
+  padding: 10px;
+  text-align: left;
+  background: #2c2c36;
+  color: #ddd;
+  border: 1px solid #666;
+  cursor: pointer;
+  font-size: 15px;
+}
+
+/* the currently selected option (a sole option may be preselected, but
+   advancing still requires the explicit forward action) */
+.optlist .opt.sel {
+  background: #34343f;
+  border: 2px solid #e0a040;
+}
+
+.optlist .optname {
+  font-size: 18px;
+  font-weight: bold;
+  color: #fff;
+  margin-bottom: 4px;
+  letter-spacing: 1px;
+}
+
+.optlist .optline {
+  color: #b8b8c6;
+  line-height: 1.35;
+}
+
+.config .cfgnote {
+  color: #9a9aa8;
+  font-size: 13px;
+  line-height: 1.35;
+  margin: 4px 0 6px;
 }

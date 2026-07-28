@@ -1,30 +1,52 @@
-// Alpha 0.1.0 §6/§7/§10 — shared pure-TypeScript CSV parse → validate →
-// resolve pipeline. Browser and Node use different file-ACQUISITION adapters
-// but converge on this module with the same raw text (§5.3). Validation runs
-// in ordered phases, collects every safely discoverable error and warning,
-// and constructs the resolved immutable runtime model ONLY when no errors
-// exist (§10.1). There is no partial-row fallback and no hardcoded-content
-// fallback (§10.2).
+// Alpha 0.1.0 §6/§7/§10, extended by Alpha 0.3.0 §4 — shared pure-TypeScript
+// CSV parse → validate → resolve pipeline. Browser and Node use different
+// file-ACQUISITION adapters but converge on this module with the same raw text
+// (§4.1). Validation runs in ordered phases, collects every safely discoverable
+// error and warning, and constructs the resolved immutable runtime model ONLY
+// when no errors exist (§4.9). There is no partial-row fallback and no
+// hardcoded-content fallback.
 
 import { parseCsv } from './csv';
 import { AREA_PATTERNS, isAreaPatternId } from './areas';
-import { EFFECT_PARAM_NAMES, EffectParamName, effectContract, isEffectId } from './effects';
+import {
+  EFFECT_PARAM_NAMES,
+  EffectParamName,
+  EffectTupleField,
+  effectContract,
+  isEffectId,
+} from './effects';
+import { SkillEffectId, SkillParamKind, isSkillEffectId, skillContract, skillEffectIds } from './skills';
 import {
   DATA_SCHEMA_VERSION,
+  DEFAULT_DECK_ID,
+  DEFAULT_HACKER_ID,
   EffectParams,
   GAME_VERSION,
   PlanOp,
   ResolvedContent,
+  ResolvedDeck,
   ResolvedFunction,
+  ResolvedHacker,
   ResolvedProgram,
+  ResolvedSkill,
+  ShakeParams,
 } from './content';
 import { Color, Shape, Side } from '../types';
 
 // ---- diagnostics (§10.3) ----
 
+export type DatasetName =
+  | 'hacker-programs'
+  | 'system-programs'
+  | 'functions'
+  | 'hackers'
+  | 'skills'
+  | 'decks'
+  | 'content';
+
 export interface DataIssue {
   severity: 'error' | 'warning';
-  dataset: 'hacker-programs' | 'system-programs' | 'functions' | 'content';
+  dataset: DatasetName;
   file: string;
   row?: number; // 1-based source row
   id?: string; // record ID when known
@@ -59,6 +81,9 @@ export interface DataFiles {
   hacker: DataFile;
   system: DataFile;
   functions: DataFile;
+  hackers: DataFile;
+  skills: DataFile;
+  decks: DataFile;
 }
 
 export interface LoadResult {
@@ -70,9 +95,7 @@ export interface LoadResult {
 
 // ---- vocabularies ----
 
-// Engine enum vocabularies as CSV tokens (3-letter uppercase codes; the four
-// codes unused by the current datasets — MAG/CYA/DIA/CRO — follow the same
-// scheme and are documented in the post-build report).
+// Engine enum vocabularies as CSV tokens (3-letter uppercase codes).
 const COLOR_TOKENS: Record<string, Color> = {
   RED: Color.Red,
   YEL: Color.Yellow,
@@ -90,15 +113,44 @@ const SHAPE_TOKENS: Record<string, Shape> = {
   CRO: Shape.Cross,
 };
 
-const PROGRAM_HEADER = ['PRG_ID', 'name', 'colors', 'shapes', 'functions', 'notes'];
-const FUNCTION_HEADER = ['FNC_ID', 'name', 'cost', 'payload', 'notes', 'quantity', 'countdown', 'areaPattern', 'magnitude', 'damage'];
+// §5.4 — the RECOGNIZED enum vocabularies in enum order. Weak sets are
+// calculated complements over these lists, so derived sets always present in
+// recognized order regardless of authored order.
+const RECOGNIZED_COLORS: Color[] = Object.values(COLOR_TOKENS).sort((a, b) => a - b);
+const RECOGNIZED_SHAPES: Shape[] = Object.values(SHAPE_TOKENS).sort((a, b) => a - b);
 
-// §6.3/§6.4 phase-10 check: required Alpha record IDs must be present (their
-// values are validated by the schema/contract rules; per designer ruling the
-// dataset is the final authority on the values themselves).
-const REQUIRED_FNC_IDS = ['FNC_001', 'FNC_002', 'FNC_003', 'FNC_004', 'FNC_005', 'FNC_006', 'FNC_007', 'FNC_008', 'FNC_009'];
+const PROGRAM_HEADER = ['PRG_ID', 'name', 'colors', 'shapes', 'functions', 'notes'];
+// §4.6 — the existing columns are preserved and the new fields appended. The
+// parser binds by header NAME, so the authored column order is irrelevant.
+const FUNCTION_HEADER = [
+  'FNC_ID',
+  'name',
+  'cost',
+  'payload',
+  'notes',
+  'quantity',
+  'countdown',
+  'areaPattern',
+  'magnitude',
+  'damage',
+  'params',
+  'startCharged',
+];
+const HACKER_HEADER = ['HAK_ID', 'name', 'BASE_LINK', 'STRONG_COLORS', 'STRONG_SHAPES', 'SKILL', 'BIO', 'GRAPHICS'];
+const SKILL_HEADER = ['SKILL_ID', 'skill_effect', 'params', 'display'];
+const DECK_HEADER = ['DEK_ID', 'name', 'ADD_LINK', 'FUNCTIONS', 'DESCRIPT', 'GRAPHICS'];
+
+// Required Alpha record IDs (their VALUES are validated by the schema/contract
+// rules; per designer ruling the dataset is the final authority on the values).
+const REQUIRED_FNC_IDS = [
+  'FNC_001', 'FNC_002', 'FNC_003', 'FNC_004', 'FNC_005',
+  'FNC_006', 'FNC_007', 'FNC_008', 'FNC_009', 'FNC_010',
+];
 const REQUIRED_PRG_H_IDS = ['PRG_H_001', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004'];
 const REQUIRED_PRG_S_IDS = ['PRG_S_001', 'PRG_S_002', 'PRG_S_003', 'PRG_S_004'];
+const REQUIRED_HAK_IDS = ['HAK_01'];
+const REQUIRED_SKL_IDS = ['SKL_001', 'SKL_002'];
+const REQUIRED_DEK_IDS = ['DEK_01'];
 
 // ---- numeric parsing (§6.2 rules) ----
 
@@ -112,6 +164,8 @@ function parseIntField(raw: string): { present: boolean; value?: number; invalid
   if (!Number.isSafeInteger(v)) return { present: true, invalid: true };
   return { present: true, value: v };
 }
+
+const titleCase = (t: string): string => t.charAt(0).toUpperCase() + t.slice(1).toLowerCase();
 
 // ---- row models ----
 
@@ -135,7 +189,45 @@ interface FunctionRow {
   cost: number;
   payloadRaw: string;
   notes: string;
-  params: Record<EffectParamName, string>; // raw field text
+  params: Record<EffectParamName, string>; // raw discrete-column text
+  tupleRaw: string; // raw `params` column text
+  startCharged: boolean;
+}
+
+interface HackerRow {
+  file: string;
+  row: number;
+  id: string;
+  name: string;
+  baseLink: number;
+  strongColors: Color[];
+  strongShapes: Shape[];
+  skillIds: string[];
+  bio: string;
+  graphics: string;
+}
+
+interface SkillRow {
+  file: string;
+  row: number;
+  id: string;
+  effectType: SkillEffectId;
+  color: Color;
+  magnitude: number;
+  display: string;
+  displayTemplate: string;
+  paramTokens: string[];
+}
+
+interface DeckRow {
+  file: string;
+  row: number;
+  id: string;
+  name: string;
+  addLink: number;
+  functionId: string;
+  descript: string;
+  graphics: string;
 }
 
 // ---- the pipeline ----
@@ -148,7 +240,7 @@ export function loadContent(files: DataFiles): LoadResult {
   // Phase 2/3 — headers + rows, per dataset.
   const readTable = (
     file: DataFile,
-    dataset: DataIssue['dataset'],
+    dataset: DatasetName,
     expectedHeader: string[],
   ): { header: string[]; rows: { line: number; get: (col: string) => string }[] } | null => {
     const parsed = parseCsv(file.text);
@@ -181,7 +273,7 @@ export function loadContent(files: DataFiles): LoadResult {
       }
     }
     if (!headerOk) return null;
-    // bind by header name, not position (§6.2)
+    // bind by header name, not position (§4.2)
     const idx = new Map(header.map((h, i) => [h, i] as const));
     const rows = parsed.rows.slice(1).map((r) => ({
       line: r.line,
@@ -195,11 +287,19 @@ export function loadContent(files: DataFiles): LoadResult {
     return { header, rows };
   };
 
-  // §6.1 list parsing for colors/shapes.
+  interface Ctx {
+    dataset: DatasetName;
+    file: string;
+    row: number;
+    id: string;
+  }
+
+  // §4.2 list parsing for enum token lists (colors/shapes): duplicates have no
+  // defined meaning here, so they are rejected.
   const parseTokenList = <T>(
     raw: string,
     vocab: Record<string, T>,
-    ctx: { dataset: DataIssue['dataset']; file: string; row: number; id: string; field: string },
+    ctx: Ctx & { field: string },
   ): T[] | null => {
     const tokens = raw.split(':').map((t) => t.trim());
     const out: T[] = [];
@@ -231,10 +331,46 @@ export function loadContent(files: DataFiles): LoadResult {
     return ok ? out : null;
   };
 
-  const checkName = (
+  // §4.2 list parsing for stable-ID REFERENCE lists. `allowDuplicates` is true
+  // where repeats carry defined meaning — duplicate Hacker Skills stack
+  // additively (§6.4), so they must not be rejected.
+  const parseRefList = (
     raw: string,
-    ctx: { dataset: DataIssue['dataset']; file: string; row: number; id: string },
-  ): string | null => {
+    prefix: string,
+    ctx: Ctx & { field: string },
+    allowDuplicates: boolean,
+  ): string[] | null => {
+    if (raw.trim() === '') {
+      err({ ...ctx, value: raw, reason: 'at least one entry is required' });
+      return null;
+    }
+    const tokens = raw.split(':').map((t) => t.trim());
+    const out: string[] = [];
+    const seen = new Set<string>();
+    let ok = true;
+    for (const t of tokens) {
+      if (t === '') {
+        err({ ...ctx, value: raw, reason: 'blank token in list' });
+        ok = false;
+        continue;
+      }
+      if (!allowDuplicates && seen.has(t)) {
+        err({ ...ctx, value: t, reason: 'duplicate token in list' });
+        ok = false;
+        continue;
+      }
+      seen.add(t);
+      if (!t.startsWith(prefix)) {
+        err({ ...ctx, value: t, expected: `${prefix}*`, reason: 'wrong ID prefix for this reference' });
+        ok = false;
+        continue;
+      }
+      out.push(t);
+    }
+    return ok ? out : null;
+  };
+
+  const checkName = (raw: string, ctx: Ctx): string | null => {
     const name = raw.trim();
     if (!name) {
       err({ ...ctx, field: 'name', value: raw, reason: 'name must be nonempty' });
@@ -247,6 +383,72 @@ export function loadContent(files: DataFiles): LoadResult {
     return name;
   };
 
+  // Bounded integer field with an explicit accepted range.
+  const readInt = (
+    raw: string,
+    ctx: Ctx & { field: string },
+    min: number,
+    max: number,
+  ): number | null => {
+    const p = parseIntField(raw);
+    if (!p.present || p.invalid || p.value === undefined) {
+      err({ ...ctx, value: raw.trim() || undefined, expected: `integer ${min}-${max}`, reason: `${ctx.field} must be an integer` });
+      return null;
+    }
+    if (p.value < min || p.value > max) {
+      err({ ...ctx, value: raw.trim(), expected: `${min}-${max}`, reason: `${ctx.field} is out of range` });
+      return null;
+    }
+    return p.value;
+  };
+
+  // §4.6 — Y / N / blank. Blank is interpreted as N.
+  const readStartCharged = (raw: string, ctx: Ctx): boolean | null => {
+    const t = raw.trim();
+    if (t === '' || t === 'N') return false;
+    if (t === 'Y') return true;
+    err({ ...ctx, field: 'startCharged', value: t, expected: 'Y|N|blank', reason: 'invalid startCharged token' });
+    return null;
+  };
+
+  // §4.6/§8.2 — a compound colon-delimited integer-enum tuple. `0` is a
+  // supplied value, not absence. Exact length, token type, and allowed values
+  // are validated here so runtime never parses the raw string.
+  const readTuple = (
+    raw: string,
+    fields: ReadonlyArray<EffectTupleField>,
+    ctx: Ctx & { field: string },
+  ): number[] | null => {
+    const tokens = raw.split(':').map((t) => t.trim());
+    if (tokens.length !== fields.length) {
+      err({
+        ...ctx,
+        value: raw.trim(),
+        expected: fields.map((f) => f.name).join(':'),
+        reason: `tuple must have exactly ${fields.length} colon-delimited values`,
+      });
+      return null;
+    }
+    const out: number[] = [];
+    let ok = true;
+    tokens.forEach((tok, i) => {
+      const f = fields[i];
+      const p = parseIntField(tok);
+      if (!p.present || p.invalid || p.value === undefined) {
+        err({ ...ctx, value: tok, expected: `${f.name} ${f.min}-${f.max}`, reason: `malformed tuple value for ${f.name}` });
+        ok = false;
+        return;
+      }
+      if (p.value < f.min || p.value > f.max) {
+        err({ ...ctx, value: tok, expected: `${f.name} ${f.min}-${f.max}`, reason: `tuple value out of range for ${f.name}` });
+        ok = false;
+        return;
+      }
+      out.push(p.value);
+    });
+    return ok ? out : null;
+  };
+
   // ---- Phase 3/4 — parse Program datasets ----
 
   const programRows: ProgramRow[] = [];
@@ -255,7 +457,7 @@ export function loadContent(files: DataFiles): LoadResult {
     if (!table) return;
     for (const r of table.rows) {
       const id = r.get('PRG_ID').trim();
-      const ctx = { dataset, file: file.name, row: r.line, id };
+      const ctx: Ctx = { dataset, file: file.name, row: r.line, id };
       if (!id) {
         err({ ...ctx, field: 'PRG_ID', reason: 'PRG_ID is required' });
         continue;
@@ -269,12 +471,12 @@ export function loadContent(files: DataFiles): LoadResult {
       const colors = parseTokenList(r.get('colors'), COLOR_TOKENS, { ...ctx, field: 'colors' });
       const shapes = parseTokenList(r.get('shapes'), SHAPE_TOKENS, { ...ctx, field: 'shapes' });
       const fnRaw = r.get('functions').trim();
-      // Alpha 0.1.0: exactly one FNC reference per Program (§6.1)
+      // exactly one FNC reference per Program (§6.1)
       let functionId: string | null = null;
       if (!fnRaw) {
         err({ ...ctx, field: 'functions', reason: 'exactly one FNC_* reference is required' });
       } else if (fnRaw.includes(':')) {
-        err({ ...ctx, field: 'functions', value: fnRaw, reason: 'Alpha 0.1.0 permits exactly one Function per Program' });
+        err({ ...ctx, field: 'functions', value: fnRaw, reason: 'exactly one Function per Program is permitted' });
       } else if (!fnRaw.startsWith('FNC_')) {
         err({ ...ctx, field: 'functions', value: fnRaw, expected: 'FNC_*', reason: 'not a Function ID' });
       } else {
@@ -295,7 +497,7 @@ export function loadContent(files: DataFiles): LoadResult {
     if (table) {
       for (const r of table.rows) {
         const id = r.get('FNC_ID').trim();
-        const ctx = { dataset: 'functions' as const, file: files.functions.name, row: r.line, id };
+        const ctx: Ctx = { dataset: 'functions', file: files.functions.name, row: r.line, id };
         if (!id) {
           err({ ...ctx, field: 'FNC_ID', reason: 'FNC_ID is required' });
           continue;
@@ -305,29 +507,225 @@ export function loadContent(files: DataFiles): LoadResult {
           continue;
         }
         const name = checkName(r.get('name'), ctx);
-        const costP = parseIntField(r.get('cost'));
-        let cost: number | null = null;
-        if (!costP.present || costP.invalid || costP.value === undefined) {
-          err({ ...ctx, field: 'cost', value: r.get('cost'), expected: 'integer 1-9999', reason: 'cost must be a positive integer' });
-        } else if (costP.value < 1 || costP.value > 9999) {
-          err({ ...ctx, field: 'cost', value: r.get('cost'), expected: '1-9999', reason: 'cost out of range' });
-        } else {
-          cost = costP.value;
-        }
+        const cost = readInt(r.get('cost'), { ...ctx, field: 'cost' }, 1, 9999);
         const payloadRaw = r.get('payload').trim();
         if (!payloadRaw) err({ ...ctx, field: 'payload', reason: 'payload is required' });
-        if (name === null || cost === null || !payloadRaw) continue;
+        const startCharged = readStartCharged(r.get('startCharged'), ctx);
+        if (name === null || cost === null || !payloadRaw || startCharged === null) continue;
         const params = {} as Record<EffectParamName, string>;
         for (const p of EFFECT_PARAM_NAMES) params[p] = r.get(p);
-        functionRows.push({ file: files.functions.name, row: r.line, id, name, cost, payloadRaw, notes: r.get('notes').trim(), params });
+        functionRows.push({
+          file: files.functions.name,
+          row: r.line,
+          id,
+          name,
+          cost,
+          payloadRaw,
+          notes: r.get('notes').trim(),
+          params,
+          tupleRaw: r.get('params').trim(),
+          startCharged,
+        });
+      }
+    }
+  }
+
+  // ---- Phase 3/4 — parse Skill dataset (§4.4) ----
+
+  const skillRows: SkillRow[] = [];
+  {
+    const table = readTable(files.skills, 'skills', SKILL_HEADER);
+    if (table) {
+      for (const r of table.rows) {
+        const id = r.get('SKILL_ID').trim();
+        const ctx: Ctx = { dataset: 'skills', file: files.skills.name, row: r.line, id };
+        if (!id) {
+          err({ ...ctx, field: 'SKILL_ID', reason: 'SKILL_ID is required' });
+          continue;
+        }
+        if (!id.startsWith('SKL_')) {
+          err({ ...ctx, field: 'SKILL_ID', value: id, expected: 'SKL_*', reason: 'wrong Skill ID prefix' });
+          continue;
+        }
+        const effectRaw = r.get('skill_effect').trim();
+        if (!isSkillEffectId(effectRaw)) {
+          err({ ...ctx, field: 'skill_effect', value: effectRaw, expected: skillEffectIds().join('|'), reason: 'unknown Skill effect type' });
+          continue;
+        }
+        const contract = skillContract(effectRaw)!;
+        // typed parameter tuple, validated by the selected skill_effect
+        const paramsRaw = r.get('params').trim();
+        const tokens = paramsRaw.split(':').map((t) => t.trim());
+        if (paramsRaw === '' || tokens.length !== contract.params.length) {
+          err({
+            ...ctx,
+            field: 'params',
+            value: paramsRaw,
+            expected: contract.params.join(':'),
+            reason: `Skill params must have exactly ${contract.params.length} colon-delimited values`,
+          });
+          continue;
+        }
+        let tupleOk = true;
+        let color: Color | null = null;
+        let magnitude: number | null = null;
+        contract.params.forEach((kind: SkillParamKind, i) => {
+          const tok = tokens[i];
+          if (tok === '') {
+            err({ ...ctx, field: 'params', value: paramsRaw, reason: 'blank token in Skill params' });
+            tupleOk = false;
+            return;
+          }
+          if (kind === 'color') {
+            if (!(tok in COLOR_TOKENS)) {
+              err({ ...ctx, field: 'params', value: tok, expected: Object.keys(COLOR_TOKENS).join('|'), reason: 'unknown color enum value in Skill params' });
+              tupleOk = false;
+              return;
+            }
+            color = COLOR_TOKENS[tok];
+          } else {
+            const p = parseIntField(tok);
+            if (!p.present || p.invalid || p.value === undefined || p.value < 1 || p.value > 999999) {
+              err({ ...ctx, field: 'params', value: tok, expected: 'positive integer', reason: 'invalid magnitude in Skill params' });
+              tupleOk = false;
+              return;
+            }
+            magnitude = p.value;
+          }
+        });
+        // §4.4 display: presentation ONLY, never gameplay authority. %N refers
+        // to the zero-based ordered parsed parameter tokens; unsupported or
+        // out-of-range placeholders are startup errors.
+        const template = r.get('display').trim();
+        let displayOk = true;
+        if (!template) {
+          err({ ...ctx, field: 'display', reason: 'display is required' });
+          displayOk = false;
+        } else {
+          for (const m of template.matchAll(/%(\d*)/g)) {
+            if (m[1] === '') {
+              err({ ...ctx, field: 'display', value: m[0], reason: 'unsupported Skill display placeholder (expected %N)' });
+              displayOk = false;
+              continue;
+            }
+            const n = Number(m[1]);
+            if (n >= contract.params.length) {
+              err({ ...ctx, field: 'display', value: m[0], expected: `%0-%${contract.params.length - 1}`, reason: 'Skill display placeholder out of range' });
+              displayOk = false;
+            }
+          }
+        }
+        if (!tupleOk || !displayOk || color === null || magnitude === null) continue;
+        // Current enum tokens render in normal player-facing title case
+        // (RED -> Red); numeric tokens render as authored. Deliberately NOT a
+        // generalized localization or expression engine (§4.4).
+        const shown = contract.params.map((kind, i) => (kind === 'color' ? titleCase(tokens[i]) : tokens[i]));
+        const display = template.replace(/%(\d+)/g, (_all, d: string) => shown[Number(d)]);
+        skillRows.push({
+          file: files.skills.name,
+          row: r.line,
+          id,
+          effectType: effectRaw,
+          color,
+          magnitude,
+          display,
+          displayTemplate: template,
+          paramTokens: tokens,
+        });
+      }
+    }
+  }
+
+  // ---- Phase 3/4 — parse Hacker dataset (§4.3) ----
+
+  const hackerRows: HackerRow[] = [];
+  {
+    const table = readTable(files.hackers, 'hackers', HACKER_HEADER);
+    if (table) {
+      for (const r of table.rows) {
+        const id = r.get('HAK_ID').trim();
+        const ctx: Ctx = { dataset: 'hackers', file: files.hackers.name, row: r.line, id };
+        if (!id) {
+          err({ ...ctx, field: 'HAK_ID', reason: 'HAK_ID is required' });
+          continue;
+        }
+        if (!id.startsWith('HAK_')) {
+          err({ ...ctx, field: 'HAK_ID', value: id, expected: 'HAK_*', reason: 'wrong Hacker ID prefix' });
+          continue;
+        }
+        const name = checkName(r.get('name'), ctx);
+        const baseLink = readInt(r.get('BASE_LINK'), { ...ctx, field: 'BASE_LINK' }, 1, 9999);
+        const strongColors = parseTokenList(r.get('STRONG_COLORS'), COLOR_TOKENS, { ...ctx, field: 'STRONG_COLORS' });
+        const strongShapes = parseTokenList(r.get('STRONG_SHAPES'), SHAPE_TOKENS, { ...ctx, field: 'STRONG_SHAPES' });
+        // duplicates permitted: repeated qualifying Skills stack additively
+        const skillIds = parseRefList(r.get('SKILL'), 'SKL_', { ...ctx, field: 'SKILL' }, true);
+        if (name === null || baseLink === null || strongColors === null || strongShapes === null || skillIds === null) continue;
+        hackerRows.push({
+          file: files.hackers.name,
+          row: r.line,
+          id,
+          name,
+          baseLink,
+          strongColors,
+          strongShapes,
+          skillIds,
+          // §2.12 placeholders: retained verbatim, never interpreted
+          bio: r.get('BIO').trim(),
+          graphics: r.get('GRAPHICS').trim(),
+        });
+      }
+    }
+  }
+
+  // ---- Phase 3/4 — parse Deck dataset (§4.5) ----
+
+  const deckRows: DeckRow[] = [];
+  {
+    const table = readTable(files.decks, 'decks', DECK_HEADER);
+    if (table) {
+      for (const r of table.rows) {
+        const id = r.get('DEK_ID').trim();
+        const ctx: Ctx = { dataset: 'decks', file: files.decks.name, row: r.line, id };
+        if (!id) {
+          err({ ...ctx, field: 'DEK_ID', reason: 'DEK_ID is required' });
+          continue;
+        }
+        // A HAK_* value in this field is invalid (§4.5 — the corrected typo).
+        if (!id.startsWith('DEK_')) {
+          err({ ...ctx, field: 'DEK_ID', value: id, expected: 'DEK_*', reason: 'wrong Deck ID prefix' });
+          continue;
+        }
+        const name = checkName(r.get('name'), ctx);
+        const addLink = readInt(r.get('ADD_LINK'), { ...ctx, field: 'ADD_LINK' }, 0, 9999);
+        // §4.5 — Alpha 0.3 requires EXACTLY one Function; more than one is an error
+        const fnRefs = parseRefList(r.get('FUNCTIONS'), 'FNC_', { ...ctx, field: 'FUNCTIONS' }, false);
+        let functionId: string | null = null;
+        if (fnRefs !== null) {
+          if (fnRefs.length !== 1) {
+            err({ ...ctx, field: 'FUNCTIONS', value: r.get('FUNCTIONS').trim(), expected: 'exactly one FNC_* reference', reason: 'Alpha 0.3 permits exactly one Deck Function' });
+          } else {
+            functionId = fnRefs[0];
+          }
+        }
+        if (name === null || addLink === null || functionId === null) continue;
+        deckRows.push({
+          file: files.decks.name,
+          row: r.line,
+          id,
+          name,
+          addLink,
+          functionId,
+          descript: r.get('DESCRIPT').trim(),
+          graphics: r.get('GRAPHICS').trim(),
+        });
       }
     }
   }
 
   // ---- Phase 5 — global ID uniqueness + duplicate-name warnings ----
 
-  const idHome = new Map<string, { dataset: DataIssue['dataset']; file: string; row: number }>();
-  const claimId = (id: string, ctx: { dataset: DataIssue['dataset']; file: string; row: number }): boolean => {
+  const idHome = new Map<string, { dataset: DatasetName; file: string; row: number }>();
+  const claimId = (id: string, ctx: { dataset: DatasetName; file: string; row: number }): boolean => {
     const prev = idHome.get(id);
     if (prev) {
       err({ ...ctx, id, field: 'ID', value: id, reason: `duplicate ID (already defined in ${prev.dataset} ${prev.file}:${prev.row})` });
@@ -338,12 +736,18 @@ export function loadContent(files: DataFiles): LoadResult {
   };
   const uniquePrograms = programRows.filter((p) => claimId(p.id, { dataset: p.dataset, file: p.file, row: p.row }));
   const uniqueFunctions = functionRows.filter((f) => claimId(f.id, { dataset: 'functions', file: f.file, row: f.row }));
+  const uniqueSkills = skillRows.filter((s) => claimId(s.id, { dataset: 'skills', file: s.file, row: s.row }));
+  const uniqueHackers = hackerRows.filter((h) => claimId(h.id, { dataset: 'hackers', file: h.file, row: h.row }));
+  const uniqueDecks = deckRows.filter((d) => claimId(d.id, { dataset: 'decks', file: d.file, row: d.row }));
 
   {
-    const names = new Map<string, { dataset: DataIssue['dataset']; file: string; row: number; id: string }>();
+    // §4.2 — duplicate display names are valid but produce a startup warning.
+    const names = new Map<string, { dataset: DatasetName; file: string; row: number; id: string }>();
     for (const rec of [
       ...uniquePrograms.map((p) => ({ name: p.name, dataset: p.dataset, file: p.file, row: p.row, id: p.id })),
       ...uniqueFunctions.map((f) => ({ name: f.name, dataset: 'functions' as const, file: f.file, row: f.row, id: f.id })),
+      ...uniqueHackers.map((h) => ({ name: h.name, dataset: 'hackers' as const, file: h.file, row: h.row, id: h.id })),
+      ...uniqueDecks.map((d) => ({ name: d.name, dataset: 'decks' as const, file: d.file, row: d.row, id: d.id })),
     ]) {
       const prev = names.get(rec.name);
       if (prev) {
@@ -355,6 +759,7 @@ export function loadContent(files: DataFiles): LoadResult {
   }
 
   const fnById = new Map(uniqueFunctions.map((f) => [f.id, f] as const));
+  const sklById = new Map(uniqueSkills.map((s) => [s.id, s] as const));
 
   // ---- Phase 7/8 — payload grammar, references, nesting/cycles ----
 
@@ -424,7 +829,7 @@ export function loadContent(files: DataFiles): LoadResult {
     if (!ok) payloads.delete(f.id);
   }
 
-  // ---- Phase 4 (cont.) — Effect parameter contracts (§9) ----
+  // ---- Phase 4 (cont.) — Effect parameter contracts (§9/§4.6) ----
 
   const fnParams = new Map<string, EffectParams>(); // leaf functions only
   for (const f of uniqueFunctions) {
@@ -437,11 +842,14 @@ export function loadContent(files: DataFiles): LoadResult {
             warn({ dataset: 'functions', file: f.file, row: f.row, id: f.id, field: col, value: f.params[col], reason: 'populated parameter is unused by a composite Function' });
           }
         }
+        if (f.tupleRaw !== '') {
+          warn({ dataset: 'functions', file: f.file, row: f.row, id: f.id, field: 'params', value: f.tupleRaw, reason: 'populated parameter is unused by a composite Function' });
+        }
       }
       continue;
     }
     const contract = effectContract(p.effectId!)!;
-    const ctx = { dataset: 'functions' as const, file: f.file, row: f.row, id: f.id };
+    const ctx: Ctx = { dataset: 'functions', file: f.file, row: f.row, id: f.id };
     const out: EffectParams = {};
     let ok = true;
     const required = new Set<EffectParamName>(contract.required);
@@ -486,14 +894,54 @@ export function loadContent(files: DataFiles): LoadResult {
         warn({ ...ctx, field: col, value: raw.trim(), reason: `populated parameter is unused by ${p.effectId}` });
       }
     }
+    // §4.6 — the compound `params` tuple, when the Effect contract declares one
+    if (contract.tuple) {
+      if (f.tupleRaw === '') {
+        err({ ...ctx, field: 'params', expected: contract.tuple.map((t) => t.name).join(':'), reason: `missing required params tuple for ${p.effectId}` });
+        ok = false;
+      } else {
+        const vals = readTuple(f.tupleRaw, contract.tuple, { ...ctx, field: 'params' });
+        if (!vals) ok = false;
+        else if (p.effectId === 'EFFECT_SHAKE') {
+          const shake: ShakeParams = {
+            boardComposition: vals[0] as ShakeParams['boardComposition'],
+            specialGems: vals[1] as ShakeParams['specialGems'],
+            matches: vals[2] as ShakeParams['matches'],
+            cascades: vals[3] as ShakeParams['cascades'],
+          };
+          out.shake = shake;
+          // §4.9 semantic warnings: valid data whose combination is inert.
+          if (shake.boardComposition === 1 && shake.specialGems === 0) {
+            warn({ ...ctx, field: 'params', value: f.tupleRaw, reason: 'EFFECT_SHAKE Replace mode combined with Retain-specials mode — Retain is ineffective because Replace removes prior tile state' });
+          }
+          if (shake.matches === 0 && shake.cascades !== 0) {
+            warn({ ...ctx, field: 'params', value: f.tupleRaw, reason: 'EFFECT_SHAKE matches are disabled while a nonzero cascade mode is supplied — the cascade mode is currently ignored' });
+          }
+        }
+      }
+    } else if (f.tupleRaw !== '') {
+      warn({ ...ctx, field: 'params', value: f.tupleRaw, reason: `populated parameter is unused by ${p.effectId}` });
+    }
     if (ok) fnParams.set(f.id, out);
   }
 
-  // ---- Phase 6 — Program → Function references ----
+  // ---- Phase 6 — cross-dataset references ----
 
   for (const p of uniquePrograms) {
     if (!fnById.has(p.functionId)) {
       err({ dataset: p.dataset, file: p.file, row: p.row, id: p.id, field: 'functions', value: p.functionId, reason: 'reference to unknown Function ID' });
+    }
+  }
+  for (const d of uniqueDecks) {
+    if (!fnById.has(d.functionId)) {
+      err({ dataset: 'decks', file: d.file, row: d.row, id: d.id, field: 'FUNCTIONS', value: d.functionId, reason: 'reference to unknown Function ID' });
+    }
+  }
+  for (const h of uniqueHackers) {
+    for (const sid of h.skillIds) {
+      if (!sklById.has(sid)) {
+        err({ dataset: 'hackers', file: h.file, row: h.row, id: h.id, field: 'SKILL', value: sid, reason: 'reference to unknown Skill ID' });
+      }
     }
   }
 
@@ -540,17 +988,57 @@ export function loadContent(files: DataFiles): LoadResult {
     if (ok) plans.set(f.id, plan);
   }
 
-  // ---- Phase 10 — required Alpha records present ----
+  // ---- Phase 10 — required Alpha records and explicit defaults present ----
 
-  const requireIds = (ids: string[], have: (id: string) => boolean, dataset: DataIssue['dataset'], file: string): void => {
+  const requireIds = (ids: string[], have: (id: string) => boolean, dataset: DatasetName, file: string): void => {
     for (const id of ids) {
-      if (!have(id)) err({ dataset, file, id, reason: 'required Alpha 0.1.0 record is missing' });
+      if (!have(id)) err({ dataset, file, id, reason: 'required Alpha record is missing' });
     }
   };
   requireIds(REQUIRED_FNC_IDS, (id) => fnById.has(id), 'functions', files.functions.name);
   const prgIds = new Set(uniquePrograms.map((p) => p.id));
   requireIds(REQUIRED_PRG_H_IDS, (id) => prgIds.has(id), 'hacker-programs', files.hacker.name);
   requireIds(REQUIRED_PRG_S_IDS, (id) => prgIds.has(id), 'system-programs', files.system.name);
+  const hakIds = new Set(uniqueHackers.map((h) => h.id));
+  const dekIds = new Set(uniqueDecks.map((d) => d.id));
+  requireIds(REQUIRED_HAK_IDS, (id) => hakIds.has(id), 'hackers', files.hackers.name);
+  requireIds(REQUIRED_SKL_IDS, (id) => sklById.has(id), 'skills', files.skills.name);
+  requireIds(REQUIRED_DEK_IDS, (id) => dekIds.has(id), 'decks', files.decks.name);
+
+  // §5.2 — a missing or invalid explicit default BLOCKS startup. There is no
+  // fallback to another row.
+  if (!hakIds.has(DEFAULT_HACKER_ID)) {
+    err({ dataset: 'content', file: files.hackers.name, id: DEFAULT_HACKER_ID, reason: `DEFAULT_HACKER_ID ${DEFAULT_HACKER_ID} is not a valid loaded Hacker` });
+  }
+  if (!dekIds.has(DEFAULT_DECK_ID)) {
+    err({ dataset: 'content', file: files.decks.name, id: DEFAULT_DECK_ID, reason: `DEFAULT_DECK_ID ${DEFAULT_DECK_ID} is not a valid loaded Deck` });
+  }
+
+  // §4.9 — valid but currently unreferenced content rows WARN (never fail).
+  {
+    const referencedFns = new Set<string>();
+    for (const p of uniquePrograms) referencedFns.add(p.functionId);
+    for (const d of uniqueDecks) referencedFns.add(d.functionId);
+    for (const [id, payload] of payloads) {
+      if (payload.kind === 'composite' && referencedFns.has(id)) {
+        for (const child of payload.children!) referencedFns.add(child);
+      }
+    }
+    // A composite that is itself referenced propagates to its children above;
+    // children of an unreferenced composite stay unreferenced with it.
+    for (const f of uniqueFunctions) {
+      if (!referencedFns.has(f.id)) {
+        warn({ dataset: 'functions', file: f.file, row: f.row, id: f.id, reason: 'valid Function row is not referenced by any Program, Deck, or composite payload' });
+      }
+    }
+    const referencedSkills = new Set<string>();
+    for (const h of uniqueHackers) for (const sid of h.skillIds) referencedSkills.add(sid);
+    for (const s of uniqueSkills) {
+      if (!referencedSkills.has(s.id)) {
+        warn({ dataset: 'skills', file: s.file, row: s.row, id: s.id, reason: 'valid Skill row is not referenced by any Hacker' });
+      }
+    }
+  }
 
   // ---- Phase 11 — construct the resolved model (errors block it) ----
 
@@ -577,6 +1065,7 @@ export function loadContent(files: DataFiles): LoadResult {
       composite: payloads.get(f.id)!.kind === 'composite',
       plan,
       notes: f.notes,
+      startCharged: f.startCharged,
     });
   }
 
@@ -602,7 +1091,53 @@ export function loadContent(files: DataFiles): LoadResult {
   const system = resolveSide('enemy', uniquePrograms.filter((p) => p.dataset === 'system-programs'));
   const programsById = new Map([...hacker, ...system].map((p) => [p.id, p] as const));
 
-  const fingerprint = computeFingerprint(hacker, system, functions);
+  const skills = new Map<string, ResolvedSkill>();
+  for (const s of uniqueSkills) {
+    skills.set(s.id, {
+      id: s.id,
+      effectType: s.effectType,
+      color: s.color,
+      magnitude: s.magnitude,
+      display: s.display,
+      displayTemplate: s.displayTemplate,
+      paramTokens: s.paramTokens,
+    });
+  }
+
+  const hackers = new Map<string, ResolvedHacker>();
+  for (const h of uniqueHackers) {
+    // §5.4 — weak sets are calculated complements in recognized enum order
+    const weakColors = RECOGNIZED_COLORS.filter((c) => !h.strongColors.includes(c));
+    const weakShapes = RECOGNIZED_SHAPES.filter((s) => !h.strongShapes.includes(s));
+    hackers.set(h.id, {
+      id: h.id,
+      name: h.name,
+      baseLink: h.baseLink,
+      strongColors: h.strongColors,
+      weakColors,
+      strongShapes: h.strongShapes,
+      weakShapes,
+      skillIds: h.skillIds,
+      skills: h.skillIds.map((sid) => skills.get(sid)!),
+      bio: h.bio,
+      graphics: h.graphics,
+    });
+  }
+
+  const decks = new Map<string, ResolvedDeck>();
+  for (const d of uniqueDecks) {
+    decks.set(d.id, {
+      id: d.id,
+      name: d.name,
+      addLink: d.addLink,
+      functionId: d.functionId,
+      fn: functions.get(d.functionId)!,
+      descript: d.descript,
+      graphics: d.graphics,
+    });
+  }
+
+  const fingerprint = computeFingerprint(hacker, system, functions, hackers, skills, decks);
   const content: ResolvedContent = {
     gameVersion: GAME_VERSION,
     schemaVersion: DATA_SCHEMA_VERSION,
@@ -611,42 +1146,75 @@ export function loadContent(files: DataFiles): LoadResult {
     system,
     functions,
     programsById,
+    hackers,
+    skills,
+    decks,
+    hackerOrder: uniqueHackers.map((h) => h.id),
+    deckOrder: uniqueDecks.map((d) => d.id),
   };
   return { content, issues, errors, warnings };
 }
 
-// §14.3 — normalized gameplay-content fingerprint. Includes program IDs/side/
-// bindings/function refs, function IDs/costs/ordered payload plans/validated
-// parameters, and the area-pattern definitions the content uses. Excludes
-// notes, display names, and CSV formatting.
+// §4.10 — normalized gameplay-content fingerprint. Includes gameplay-affecting
+// values from ALL required datasets: program IDs/side/bindings/function refs,
+// function IDs/costs/ordered payload plans/validated parameters/startCharged,
+// the area-pattern definitions the content uses, Hacker LINK and strong sets
+// and ordered Skill IDs, Skill effect types and typed parameters, and Deck
+// added LINK and Function references. EXCLUDES notes, display names, BIO,
+// GRAPHICS, DESCRIPT, presentational Skill display text, and CSV formatting.
 function computeFingerprint(
   hacker: ResolvedProgram[],
   system: ResolvedProgram[],
   functions: Map<string, ResolvedFunction>,
+  hackers: Map<string, ResolvedHacker>,
+  skills: Map<string, ResolvedSkill>,
+  decks: Map<string, ResolvedDeck>,
 ): string {
   const usedAreas = new Set<string>();
-  const fnNorm = [...functions.values()]
-    .sort((a, b) => (a.id < b.id ? -1 : 1))
-    .map((f) => ({
-      id: f.id,
-      cost: f.cost,
-      plan: f.plan.map((op) => {
-        if (op.params.areaPattern) usedAreas.add(op.params.areaPattern);
-        return {
-          fn: op.fnId,
-          effect: op.effectId,
-          q: op.params.quantity ?? null,
-          cd: op.params.countdown ?? null,
-          ap: op.params.areaPattern ?? null,
-          mag: op.params.magnitude ?? null,
-          dmg: op.params.damage ?? null,
-        };
-      }),
-    }));
+  const byId = <T extends { id: string }>(m: Map<string, T>): T[] =>
+    [...m.values()].sort((a, b) => (a.id < b.id ? -1 : 1));
+  const fnNorm = byId(functions).map((f) => ({
+    id: f.id,
+    cost: f.cost,
+    sc: f.startCharged,
+    plan: f.plan.map((op) => {
+      if (op.params.areaPattern) usedAreas.add(op.params.areaPattern);
+      return {
+        fn: op.fnId,
+        effect: op.effectId,
+        q: op.params.quantity ?? null,
+        cd: op.params.countdown ?? null,
+        ap: op.params.areaPattern ?? null,
+        mag: op.params.magnitude ?? null,
+        dmg: op.params.damage ?? null,
+        shake: op.params.shake
+          ? [op.params.shake.boardComposition, op.params.shake.specialGems, op.params.shake.matches, op.params.shake.cascades]
+          : null,
+      };
+    }),
+  }));
   const progNorm = (list: ResolvedProgram[]): unknown =>
     list.map((p) => ({ id: p.id, side: p.side, colors: [...p.colors], shapes: [...p.shapes], fn: p.functionId }));
+  const hakNorm = byId(hackers).map((h) => ({
+    id: h.id,
+    link: h.baseLink,
+    sc: [...h.strongColors],
+    ss: [...h.strongShapes],
+    skills: [...h.skillIds],
+  }));
+  const sklNorm = byId(skills).map((s) => ({ id: s.id, effect: s.effectType, color: s.color, mag: s.magnitude }));
+  const dekNorm = byId(decks).map((d) => ({ id: d.id, add: d.addLink, fn: d.functionId }));
   const areas = [...usedAreas].sort().map((id) => ({ id, cells: AREA_PATTERNS[id as keyof typeof AREA_PATTERNS] }));
-  const canonical = JSON.stringify({ schema: DATA_SCHEMA_VERSION, hacker: progNorm(hacker), system: progNorm(system), functions: fnNorm, areas });
+  const canonical = JSON.stringify({
+    schema: DATA_SCHEMA_VERSION,
+    hacker: progNorm(hacker),
+    system: progNorm(system),
+    functions: fnNorm,
+    areas,
+    hackers: hakNorm,
+    skills: sklNorm,
+    decks: dekNorm,
+  });
   let h = 5381;
   for (let i = 0; i < canonical.length; i++) h = ((h << 5) + h + canonical.charCodeAt(i)) >>> 0;
   return `${h.toString(16).padStart(8, '0')}-${canonical.length.toString(36)}`;

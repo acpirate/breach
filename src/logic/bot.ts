@@ -9,7 +9,7 @@ import { BOARD_HEIGHT, BOARD_WIDTH } from './constants';
 import { programsFor } from './data/content';
 import { swap } from './board';
 import { detectMatches } from './match';
-import { BattleConfig, Board, Pt, Side } from './types';
+import { BattleSettings, Board, Pt, Side } from './types';
 
 export function findBotMove(board: Board): { a: Pt; b: Pt } | null {
   const dirs = [{ dx: 1, dy: 0 }, { dx: 0, dy: 1 }];
@@ -34,13 +34,13 @@ export function findBotMove(board: Board): { a: Pt; b: Pt } | null {
   return firstValid;
 }
 
-// MK7.13 — charge-aware tier for NO_MATCH_DAMAGE: prefer-4 is a DAMAGE
-// heuristic and under NMD it optimizes for a quantity that no longer exists.
-// This tier scores each valid move by how many matched tiles feed the mover's
-// unit bindings (color or shape), i.e. it matches for CHARGE. Still one dumb
-// selection rule — the bot remains a floor indicator.
-// MK9.4: bindings may differ per side, so the scorer uses the ACTING side's
-// resolved Program bindings (Alpha: from the loaded content, not tables).
+// MK7.13 — charge-aware tier for REINFORCED CONNECTION: prefer-4 is a DAMAGE
+// heuristic and under suppressed base Sync damage it optimizes for a quantity
+// that barely exists. This tier scores each valid move by how many synced
+// Packets feed the mover's Program bindings (color or shape), i.e. it matches
+// for CHARGE. Still one dumb selection rule — the bot remains a floor
+// indicator. Bindings may differ per side, so the scorer uses the ACTING side's
+// resolved Program bindings (from the loaded content, not tables).
 export function findChargeMove(board: Board, side: Side = 'player'): { a: Pt; b: Pt } | null {
   const boundColors = new Set<number>();
   const boundShapes = new Set<number>();
@@ -88,11 +88,11 @@ export function findChargeMove(board: Board, side: Side = 'player'): { a: Pt; b:
   return bestScore >= 0 ? best : null;
 }
 
-// Config-aware selection: the NMD charge-aware tier applies only when
-// noMatchDamage is on AND the nmdChargeAwareBot sub-option (designer
+// Config-aware selection: the charge-aware tier applies only when Reinforced
+// Connection is on AND the reinforcedChargeAwareBot sub-option (designer
 // addendum, default on) hasn't been switched back to the classic heuristic.
-export function pickBotMove(board: Board, config: BattleConfig, side: Side = 'player'): { a: Pt; b: Pt } | null {
-  if (config.noMatchDamage && config.nmdChargeAwareBot) return findChargeMove(board, side);
+export function pickBotMove(board: Board, config: BattleSettings, side: Side = 'player'): { a: Pt; b: Pt } | null {
+  if (config.reinforcedConnection && config.reinforcedChargeAwareBot) return findChargeMove(board, side);
   return findBotMove(board);
 }
 

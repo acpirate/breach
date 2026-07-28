@@ -1,25 +1,30 @@
 // Orchestrator: wires the pure logic layer to the canvas view and DOM dialogs.
-// Owns the interaction flow (data load → title → battle → pause/result) but
-// no game rules: mode/Run/result/save semantics live in logic/session.ts and
-// this file only composes dialogs and routes actions through that API.
+// Owns the interaction flow (data load → title → setup → battle → pause/result)
+// but no game rules: mode/Run/result/save/identity/LINK semantics live in
+// logic/session.ts and this file only composes screens and routes actions
+// through that API.
 
 import {
-  BOARD_SHAKE_COST,
   CHARGE_PER_TILE_COLOR_MATCH,
   CHARGE_PER_TILE_SHAPE_MATCH,
-  COLOR_COUNT,
   DAMAGE_PER_TILE_HIGH_COLOR,
   DAMAGE_PER_TILE_HIGH_SHAPE,
   DAMAGE_PER_TILE_LOW_COLOR,
   DAMAGE_PER_TILE_LOW_SHAPE,
   DAMAGE_PER_TILE_NEUTRAL,
-  DEFAULT_BATTLE_CONFIG,
-  SHAPE_COUNT,
+  DECK_CHARGE_PER_NEUTRAL_TILE,
+  DEFAULT_BATTLE_SETTINGS,
 } from './logic/constants';
 import {
+  ResolvedDeck,
+  ResolvedHacker,
   ResolvedProgram,
+  allDecks,
+  allHackers,
   contentStamp,
+  deckById,
   getContent,
+  hackerById,
   programsFor,
   requiresTarget,
   setActiveContent,
@@ -27,39 +32,59 @@ import {
 import { formatIssue, loadContent } from './logic/data/load';
 import { findBotMove, findHintMove } from './logic/bot';
 import { Game } from './logic/game';
-import { LOG_VERSION } from './logic/logger';
+import { LOG_VERSION, SelectionLogEntry, identityStamp } from './logic/logger';
 import { BattleMetrics } from './logic/metrics';
 import {
   PendingResultInfo,
+  PendingSetup,
   SessionInfo,
   battleContext,
+  beginSetup,
+  chooseDeck,
+  chooseHacker,
   contextLabel,
   continueLabel,
   createQuickMatchBattle,
   createRunBattle,
+  defaultIdentity,
   deserializeSession,
-  encounterFor,
+  forceWinAvailable,
   isRunComplete,
   naturalOf,
   nextStep,
   progressesAsVictory,
+  recreateBattleFromConfig,
+  resolveHackerMaxLink,
   serializeSession,
-  snapshotRunConfig,
+  setupBack,
+  setupComplete,
+  snapshotRunSettings,
 } from './logic/session';
-import { BattleConfig, Color, Pt, Shape, Side, WizardAction, gridViewOf } from './logic/types';
+import {
+  BattleConfig,
+  BattleIdentity,
+  BattleSettings,
+  Color,
+  Pt,
+  Shape,
+  Side,
+  WizardAction,
+  gridViewOf,
+} from './logic/types';
 import { browserDataFiles } from './dataBrowser';
 import { attachInput } from './render/input';
 import { Hud, View } from './render/view';
 import {
   appendMetricsLog,
+  appendSelectionLog,
   appendTurnLogs,
   appendWizardLog,
   clearBattleSave,
   loadBattleJson,
-  loadMenuConfig,
+  loadMenuSettings,
   readLogs,
   saveBattle,
-  saveMenuConfig,
+  saveMenuSettings,
   wipeLogs,
 } from './storage';
 
@@ -70,8 +95,11 @@ const overlay = document.getElementById('overlay') as HTMLDivElement;
 let session: SessionInfo | null = null;
 let pending: PendingResultInfo | null = null;
 let game: Game | null = null;
+// §12 — ephemeral pending New Run setup. NEVER a save: entering setup does not
+// touch the resident save, and there is no resumable half-configured Run.
+let setup: PendingSetup | null = null;
 
-let busy = false; // true while animations / enemy phase are in flight
+let busy = false; // true while animations / System phase are in flight
 let selection: Pt | null = null;
 // MK6.6 — think-time clock
 let thinkStart: number | null = null;
@@ -79,31 +107,34 @@ let battleStartAt = 0; // wall-clock anchor for this session's battle
 // MK7.7 — hint state
 let hintFiredThisTurn = false;
 let lastInputAt = performance.now();
-// Targeting mode: which player slot is armed and awaiting an enemy target.
+// Targeting mode: which Hacker slot is armed and awaiting a System target.
 let targetingSlot: number | null = null;
-// MK5.4: the menu's battle config — persisted, never implicitly reset.
-let menuConfig: BattleConfig = DEFAULT_BATTLE_CONFIG;
+// §20.2 — true exactly while Hacker input is locked for the System turn.
+let systemTurnActive = false;
+// MK5.4: the menu's chosen settings — persisted, never implicitly reset.
+let menuSettings: BattleSettings = DEFAULT_BATTLE_SETTINGS;
 
-// canonical value list — safer than field-by-field as the config grows
-function configKey(c: BattleConfig): string {
+// Canonical value list over the CHOSEN settings only (the resolved per-battle
+// LINK/ICE and strong sets are derived, so they are not divergence signals).
+function settingsKey(c: BattleSettings): string {
   return JSON.stringify([
     c.enemyMatching,
-    c.hackerBonusEnabled,
     c.singleAxisPayout,
     c.maxCascadeSteps,
-    c.noMatchDamage,
-    c.nmdChargeAwareBot,
-    c.playerHp,
-    c.enemyHp,
+    c.reinforcedConnection,
+    c.reinforcedChargeAwareBot,
+    c.normalLink,
+    // manual values matter only while Normal LINK is OFF (§10.3 — they are
+    // retained but unused when it is ON)
+    c.normalLink ? 0 : c.manualHackerLink,
+    c.normalLink ? 0 : c.manualSystemIce,
     c.hintEnabled,
     c.hintDelaySeconds,
-    c.strongColors,
-    c.strongShapes,
   ]);
 }
 
-function configsEqual(a: BattleConfig, b: BattleConfig): boolean {
-  return configKey(a) === configKey(b);
+function settingsEqual(a: BattleSettings, b: BattleSettings): boolean {
+  return settingsKey(a) === settingsKey(b);
 }
 
 function endBusy(): void {
@@ -136,6 +167,9 @@ function getHud(): Hud | null {
   const act = canAct();
   const hacker = programsFor('player');
   const system = programsFor('enemy');
+  // §7.1 — the fifth Hacker-side control is Deck-owned; its label and cost come
+  // from resolved Deck content, never from a Program.
+  const deck = deckById(s.identity.deckId);
   return {
     hpPlayer: Math.max(0, s.hp.player),
     hpPlayerMax: s.config.playerHp,
@@ -149,9 +183,10 @@ function getHud(): Hud | null {
       const p = system[i];
       return { label: p.name, cost: p.cost, charge: u.charge, ready: false, color: p.colors[0], shape: p.shapes[0] };
     }),
-    shakeCharge: s.shakeCharge,
-    shakeCost: BOARD_SHAKE_COST,
-    shakeReady: act && s.shakeCharge >= BOARD_SHAKE_COST,
+    deckLabel: deck.fn.name,
+    deckCharge: s.deckCharge,
+    deckCost: deck.fn.cost,
+    deckReady: act && s.deckCharge >= deck.fn.cost,
     buffPlayer: specialMagnitude('buff', 'player'),
     buffEnemy: specialMagnitude('buff', 'enemy'),
     shieldPlayer: specialMagnitude('shield', 'player'),
@@ -161,11 +196,12 @@ function getHud(): Hud | null {
     statusText: s.winner
       ? ''
       : targetingSlot !== null
-        ? 'Tap an enemy program to drain it'
+        ? 'Tap a System Program to drain it'
         : act
-          ? 'Fire abilities, then swap to match'
+          ? 'Fire Functions, then swap to Sync'
           : '…',
     targeting: targetingSlot !== null,
+    systemTurn: systemTurnActive,
   };
 }
 
@@ -174,11 +210,15 @@ const view = new View(canvas, getHud);
 // ---- dialogs (DOM) ----
 
 // A button spec's optional third element is a CSS class — used to mark
-// wizard/dev controls as visually distinct (§5.2) without changing which
-// handler fires.
-type ButtonSpec = [string, () => void, string?];
+// wizard/dev controls as visually distinct (§18.3) without changing which
+// handler fires. `disabled` gates the explicit forward actions on the setup
+// screens until a choice exists.
+type ButtonSpec = [string, () => void, string?, boolean?];
 
-function showDialog(title: string, sub: string, buttons: ButtonSpec[], extra?: HTMLElement): void {
+// `extraFirst` puts the supplied panel ABOVE the action buttons — used by the
+// setup screens so the player reads the options before the forward action on a
+// narrow screen (§13.2 mobile-first presentation).
+function showDialog(title: string, sub: string, buttons: ButtonSpec[], extra?: HTMLElement, extraFirst = false): void {
   overlay.innerHTML = '';
   const box = document.createElement('div');
   box.className = 'dialog';
@@ -190,19 +230,21 @@ function showDialog(title: string, sub: string, buttons: ButtonSpec[], extra?: H
     p.textContent = sub;
     box.appendChild(p);
   }
-  for (const [label, cb, cls] of buttons) {
+  if (extra && extraFirst) box.appendChild(extra);
+  for (const [label, cb, cls, disabled] of buttons) {
     const b = document.createElement('button');
     b.textContent = label;
     if (cls) b.className = cls;
+    if (disabled) b.disabled = true;
     b.addEventListener('click', cb);
     box.appendChild(b);
   }
-  if (extra) box.appendChild(extra);
+  if (extra && !extraFirst) box.appendChild(extra);
   overlay.appendChild(box);
   overlay.classList.remove('hidden');
 }
 
-// MK2.3 game-over metrics panel (unchanged content).
+// MK2.3 game-over metrics panel.
 function metricsElement(m: BattleMetrics): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'metrics';
@@ -216,34 +258,50 @@ function metricsElement(m: BattleMetrics): HTMLElement {
 
   row('BATTLE', true);
   row(`Turns to resolution: ${m.turns}`);
-  row(`Match-locks (auto-reshuffles): ${m.autoReshuffles}`);
-  row(`Enemy shields — created ${m.enemyShieldCreated}, removed ${m.enemyShieldRemoved}`);
+  row(`Sync-locks (auto-reshuffles): ${m.autoReshuffles}`);
+  row(`System shields — created ${m.enemyShieldCreated}, sliced ${m.enemyShieldRemoved}`);
   row(`Shielded hits: ${m.enemyShieldInstances}, damage prevented: ${fmt(m.enemyShieldPrevented)}`);
 
   for (const side of ['player', 'enemy'] as const) {
     const sm = m.sides[side];
-    row(side === 'player' ? 'YOUR SIDE' : 'ENEMY SIDE', true);
+    row(side === 'player' ? 'HACKER' : 'SYSTEM', true);
     row(`Total damage dealt: ${fmt(sm.totalDamage)}`);
-    row(`  match-caused (incl. its cascades): ${fmt(sm.matchDamage)}`);
+    row(`  Sync-caused (incl. its cascades): ${fmt(sm.matchDamage)}`);
     row(`  bomb-caused (incl. its cascades): ${fmt(sm.bombDamage)}`);
     row(`  Attack: ${fmt(sm.attackerDamage)}`);
     row(`  Buffer added: ${fmt(sm.bufferDamageAdded)}`);
+    row(`  Skill damage: ${fmt(sm.skillDamage)}`);
     row(`Cascade (RNG-refill) damage, any cause: ${fmt(sm.cascadeDamage)}`);
-    row(`Match damage by axis: color ${fmt(sm.matchDamageColor)} / shape ${fmt(sm.matchDamageShape)}`);
+    row(`Sync damage by axis: color ${fmt(sm.matchDamageColor)} / shape ${fmt(sm.matchDamageShape)}`);
     const critPct = sm.matchDamage > 0 ? ((sm.critExtra / sm.matchDamage) * 100).toFixed(1) : '0.0';
-    row(`Crit bonus damage (1.5x extra): ${fmt(sm.critExtra)} (${critPct}% of match damage)`);
+    row(`Crit bonus damage (1.5x extra): ${fmt(sm.critExtra)} (${critPct}% of Sync damage)`);
     row(`Largest single hit: ${fmt(sm.largestHit)}`);
     row(`Biggest round: ${fmt(sm.biggestRound)}`);
     row(`Avg round damage (nonzero rounds): ${sm.roundDamageCount ? fmt(sm.roundDamageSum / sm.roundDamageCount) : '0'}`);
     row(`Deepest cascade: ${sm.deepestCascade} RNG round${sm.deepestCascade === 1 ? '' : 's'}`);
+    // §9.5 — line-clear frequency, so B1 board churn is observable in play
+    row(`Line clears: ${sm.lineClears}`);
     const contPct = sm.tilesDestroyed > 0 ? ((sm.contentionTiles / sm.tilesDestroyed) * 100).toFixed(1) : '0.0';
-    row(`Opponent-bound tiles destroyed: ${sm.contentionTiles} of ${sm.tilesDestroyed} (${contPct}%)`);
+    row(`Opponent-bound Packets sliced: ${sm.contentionTiles} of ${sm.tilesDestroyed} (${contPct}%)`);
     for (const p of programsFor(side)) {
       const u = sm.units[p.id];
       if (!u) continue;
       const placed = u.bombsPlaced > 0 ? `, bombs placed ${u.bombsPlaced}` : '';
       const fizz = u.fizzles > 0 ? `, fizzles ${u.fizzles}` : '';
       row(`${p.name} [${p.id}]: fired ${u.fires}, effect ${fmt(u.effect)}, charge wasted ${fmt(u.chargeWasted)}${placed}${fizz}`);
+    }
+    // §21.3 — Deck-owned metrics stay separate from the Program rows
+    if (side === 'player' && game) {
+      const d = sm.deck;
+      const deck = deckById(game.state.identity.deckId);
+      row(`${deck.fn.name} [${deck.id} deck]: fired ${d.fires}, neutral charge ${d.chargeFromNeutral} (wasted ${d.chargeWasted})`);
+      if (d.shakeAttempts > 0) {
+        row(`  Shake: ${d.shakeSuccesses}/${d.shakeAttempts} resolved, ${d.shakeFizzles} legal fizzle${d.shakeFizzles === 1 ? '' : 's'}`);
+      }
+      for (const [sid, k] of Object.entries(sm.skills)) {
+        const skill = getContent().skills.get(sid);
+        row(`Skill ${sid}${skill ? ` (${skill.display})` : ''}: ${k.triggers} trigger${k.triggers === 1 ? '' : 's'}, +${fmt(k.damage)} dmg, +${k.charge} charge`);
+      }
     }
   }
 
@@ -266,7 +324,7 @@ function hideDialog(): void {
   overlay.classList.add('hidden');
 }
 
-// MK5.3/MK7.10 — battle config panel (Settings modal). Unchanged by 0.2.0.
+// MK5.3/MK7.10 — battle settings panel (Settings modal).
 function configPanel(rerender: () => void): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'config';
@@ -286,54 +344,73 @@ function configPanel(rerender: () => void): HTMLElement {
   };
 
   const modes = section('Game modes');
-  const health = section('Starting HP');
+  const health = section('LINK and ICE');
   const hints = section('Hints');
   const cascades = section('Cascades');
 
-  const check = (parent: HTMLElement, label: string, key: 'enemyMatching' | 'hackerBonusEnabled' | 'singleAxisPayout' | 'noMatchDamage'): void => {
+  const check = (parent: HTMLElement, label: string, key: 'enemyMatching' | 'singleAxisPayout'): void => {
     const l = document.createElement('label');
     const cb = document.createElement('input');
     cb.type = 'checkbox';
-    cb.checked = menuConfig[key];
+    cb.checked = menuSettings[key];
     cb.addEventListener('change', () => {
-      menuConfig = { ...menuConfig, [key]: cb.checked };
-      saveMenuConfig(menuConfig);
+      menuSettings = { ...menuSettings, [key]: cb.checked };
+      saveMenuSettings(menuSettings);
     });
     l.appendChild(cb);
     l.appendChild(document.createTextNode(` ${label}`));
     parent.appendChild(l);
   };
-  check(modes, 'Enemy matching', 'enemyMatching');
-  check(modes, 'Hacker color bonus', 'hackerBonusEnabled');
+  check(modes, 'System matching', 'enemyMatching');
   check(modes, 'Single-axis payout', 'singleAxisPayout');
 
-  const nmdRow = document.createElement('label');
-  const nmdCb = document.createElement('input');
-  nmdCb.type = 'checkbox';
-  nmdCb.checked = menuConfig.noMatchDamage;
-  nmdRow.appendChild(nmdCb);
-  nmdRow.appendChild(document.createTextNode(' No match damage'));
-  modes.appendChild(nmdRow);
+  // §11.1 — the former "No match damage" setting, renamed. Same underlying
+  // setting path; no second toggle.
+  const rcRow = document.createElement('label');
+  const rcCb = document.createElement('input');
+  rcCb.type = 'checkbox';
+  rcCb.checked = menuSettings.reinforcedConnection;
+  rcRow.appendChild(rcCb);
+  rcRow.appendChild(document.createTextNode(' Reinforced Connection'));
+  modes.appendChild(rcRow);
   const subRow = document.createElement('label');
   subRow.className = 'suboption';
   const subCb = document.createElement('input');
   subCb.type = 'checkbox';
-  subCb.checked = menuConfig.nmdChargeAwareBot;
-  subCb.disabled = !menuConfig.noMatchDamage;
+  subCb.checked = menuSettings.reinforcedChargeAwareBot;
+  subCb.disabled = !menuSettings.reinforcedConnection;
   subRow.appendChild(subCb);
-  subRow.appendChild(document.createTextNode(' Charge-aware bot (NMD)'));
+  subRow.appendChild(document.createTextNode(' Charge-aware bot'));
   modes.appendChild(subRow);
-  nmdCb.addEventListener('change', () => {
-    menuConfig = { ...menuConfig, noMatchDamage: nmdCb.checked };
-    subCb.disabled = !nmdCb.checked;
-    saveMenuConfig(menuConfig);
+  rcCb.addEventListener('change', () => {
+    menuSettings = { ...menuSettings, reinforcedConnection: rcCb.checked };
+    subCb.disabled = !rcCb.checked;
+    saveMenuSettings(menuSettings);
   });
   subCb.addEventListener('change', () => {
-    menuConfig = { ...menuConfig, nmdChargeAwareBot: subCb.checked };
-    saveMenuConfig(menuConfig);
+    menuSettings = { ...menuSettings, reinforcedChargeAwareBot: subCb.checked };
+    saveMenuSettings(menuSettings);
   });
 
-  const hpInput = (label: string, key: 'playerHp' | 'enemyHp'): void => {
+  // §10.2/§10.3 — Normal LINK. When ON, the manual controls are HIDDEN (their
+  // stored values are retained, just unused) and maxima derive from the selected
+  // Hacker, Deck, and encounter table.
+  const nlRow = document.createElement('label');
+  const nlCb = document.createElement('input');
+  nlCb.type = 'checkbox';
+  nlCb.checked = menuSettings.normalLink;
+  nlRow.appendChild(nlCb);
+  nlRow.appendChild(document.createTextNode(' Normal LINK'));
+  health.appendChild(nlRow);
+
+  const note = document.createElement('div');
+  note.className = 'cfgnote';
+  note.textContent = menuSettings.normalLink
+    ? 'Hacker LINK = Hacker BASE_LINK + Deck ADD_LINK. Quick Match System ICE mirrors it; a Run uses 100/150/200/250.'
+    : 'Manual values below are used for the Hacker and for every Run encounter.';
+  health.appendChild(note);
+
+  const manualRow = (label: string, key: 'manualHackerLink' | 'manualSystemIce'): void => {
     const l = document.createElement('label');
     l.appendChild(document.createTextNode(`${label} `));
     const n = document.createElement('input');
@@ -341,26 +418,34 @@ function configPanel(rerender: () => void): HTMLElement {
     n.min = '1';
     n.max = '9999';
     n.step = '1';
-    n.value = String(menuConfig[key]);
+    n.value = String(menuSettings[key]);
     n.addEventListener('change', () => {
       const v = Math.max(1, Math.min(9999, Math.floor(Number(n.value) || 1)));
       n.value = String(v);
-      menuConfig = { ...menuConfig, [key]: v };
-      saveMenuConfig(menuConfig);
+      menuSettings = { ...menuSettings, [key]: v };
+      saveMenuSettings(menuSettings);
     });
     l.appendChild(n);
+    // hidden (not removed) while Normal LINK is ON — the values persist
+    if (menuSettings.normalLink) l.style.display = 'none';
     health.appendChild(l);
   };
-  hpInput('Player HP', 'playerHp');
-  hpInput('Enemy HP', 'enemyHp');
+  manualRow('Hacker LINK', 'manualHackerLink');
+  manualRow('System ICE', 'manualSystemIce');
+
+  nlCb.addEventListener('change', () => {
+    menuSettings = { ...menuSettings, normalLink: nlCb.checked };
+    saveMenuSettings(menuSettings);
+    rerender(); // re-open so the manual controls appear/disappear
+  });
 
   const hintRow = document.createElement('label');
   const hintCb = document.createElement('input');
   hintCb.type = 'checkbox';
-  hintCb.checked = menuConfig.hintEnabled;
+  hintCb.checked = menuSettings.hintEnabled;
   hintCb.addEventListener('change', () => {
-    menuConfig = { ...menuConfig, hintEnabled: hintCb.checked };
-    saveMenuConfig(menuConfig);
+    menuSettings = { ...menuSettings, hintEnabled: hintCb.checked };
+    saveMenuSettings(menuSettings);
   });
   hintRow.appendChild(hintCb);
   hintRow.appendChild(document.createTextNode(' Show hints'));
@@ -372,12 +457,12 @@ function configPanel(rerender: () => void): HTMLElement {
   delayN.min = '1';
   delayN.max = '60';
   delayN.step = '1';
-  delayN.value = String(menuConfig.hintDelaySeconds);
+  delayN.value = String(menuSettings.hintDelaySeconds);
   delayN.addEventListener('change', () => {
     const v = Math.max(1, Math.min(60, Math.floor(Number(delayN.value) || 7)));
     delayN.value = String(v);
-    menuConfig = { ...menuConfig, hintDelaySeconds: v };
-    saveMenuConfig(menuConfig);
+    menuSettings = { ...menuSettings, hintDelaySeconds: v };
+    saveMenuSettings(menuSettings);
   });
   delayRow.appendChild(delayN);
   hints.appendChild(delayRow);
@@ -385,7 +470,7 @@ function configPanel(rerender: () => void): HTMLElement {
   const capRow = document.createElement('label');
   const inf = document.createElement('input');
   inf.type = 'checkbox';
-  inf.checked = menuConfig.maxCascadeSteps === null;
+  inf.checked = menuSettings.maxCascadeSteps === null;
   capRow.appendChild(inf);
   capRow.appendChild(document.createTextNode(' Infinite cascades'));
   cascades.appendChild(capRow);
@@ -397,7 +482,7 @@ function configPanel(rerender: () => void): HTMLElement {
   num.min = '0';
   num.max = '9';
   num.step = '1';
-  num.value = String(menuConfig.maxCascadeSteps ?? 0);
+  num.value = String(menuSettings.maxCascadeSteps ?? 0);
   num.disabled = inf.checked;
   numRow.appendChild(num);
   numRow.style.display = inf.checked ? 'none' : '';
@@ -407,14 +492,14 @@ function configPanel(rerender: () => void): HTMLElement {
   inf.addEventListener('change', () => {
     num.disabled = inf.checked;
     numRow.style.display = inf.checked ? 'none' : '';
-    menuConfig = { ...menuConfig, maxCascadeSteps: inf.checked ? null : readCap() };
-    saveMenuConfig(menuConfig);
+    menuSettings = { ...menuSettings, maxCascadeSteps: inf.checked ? null : readCap() };
+    saveMenuSettings(menuSettings);
   });
   num.addEventListener('change', () => {
     num.value = String(readCap());
     if (!inf.checked) {
-      menuConfig = { ...menuConfig, maxCascadeSteps: readCap() };
-      saveMenuConfig(menuConfig);
+      menuSettings = { ...menuSettings, maxCascadeSteps: readCap() };
+      saveMenuSettings(menuSettings);
     }
   });
 
@@ -422,8 +507,8 @@ function configPanel(rerender: () => void): HTMLElement {
   reset.className = 'cfgreset';
   reset.textContent = 'Reset to Defaults';
   reset.addEventListener('click', () => {
-    menuConfig = { ...DEFAULT_BATTLE_CONFIG };
-    saveMenuConfig(menuConfig);
+    menuSettings = { ...DEFAULT_BATTLE_SETTINGS };
+    saveMenuSettings(menuSettings);
     rerender();
   });
   wrap.appendChild(reset);
@@ -439,12 +524,12 @@ function configSummary(c: BattleConfig, heading: string): HTMLElement {
   head.textContent = heading;
   wrap.appendChild(head);
   const rows = [
-    `Enemy matching: ${c.enemyMatching ? 'ON' : 'OFF'}`,
-    `Hacker color bonus: ${c.hackerBonusEnabled ? 'ON' : 'OFF'}`,
+    `System matching: ${c.enemyMatching ? 'ON' : 'OFF'}`,
     `Single-axis payout: ${c.singleAxisPayout ? 'ON' : 'OFF'}`,
-    `No match damage: ${c.noMatchDamage ? `ON (${c.nmdChargeAwareBot ? 'charge-aware' : 'classic'} bot)` : 'OFF'}`,
+    `Reinforced Connection: ${c.reinforcedConnection ? `ON (${c.reinforcedChargeAwareBot ? 'charge-aware' : 'classic'} bot)` : 'OFF'}`,
+    `Normal LINK: ${c.normalLink ? 'ON' : 'OFF'}`,
     `Cascade cap: ${c.maxCascadeSteps === null ? 'Infinite' : c.maxCascadeSteps}`,
-    `Starting HP: you ${c.playerHp} / enemy ${c.enemyHp}`,
+    `Hacker LINK ${c.playerHp} / System ICE ${c.enemyHp}`,
     `Hints: ${c.hintEnabled ? `ON (${c.hintDelaySeconds}s)` : 'OFF'}`,
   ];
   for (const r of rows) {
@@ -455,7 +540,7 @@ function configSummary(c: BattleConfig, heading: string): HTMLElement {
   return wrap;
 }
 
-// ---- character sheets (§10 — per side, opened from the avatar boxes) ----
+// ---- shared display helpers (resolved content only — never hardcoded) ----
 
 const COLOR_NAMES: Record<Color, string> = {
   [Color.Red]: 'Red', [Color.Yellow]: 'Yellow', [Color.Magenta]: 'Magenta',
@@ -466,10 +551,22 @@ const SHAPE_NAMES: Record<Shape, string> = {
   [Shape.Diamond]: 'Diamond', [Shape.Star]: 'Star', [Shape.Cross]: 'Cross',
 };
 
-// §10.2: strong/weak colors and shapes (weak = recognized complement), plus
-// the pre-existing per-Program and general reference rows (designer ruling:
-// keep extras while they fit; trim later if crowded).
-function characterSheetSide(cfg: BattleConfig, side: Side): HTMLElement {
+const colorList = (cs: ReadonlyArray<Color>): string => (cs.length ? cs.map((c) => COLOR_NAMES[c]).join(', ') : 'none');
+const shapeList = (ss: ReadonlyArray<Shape>): string => (ss.length ? ss.map((s) => SHAPE_NAMES[s]).join(', ') : 'none');
+// §4.6 — starting-charge state, shown where it aids review (§14.1/§15.2).
+const startChargeText = (startCharged: boolean, cost: number): string =>
+  startCharged ? `starts charged (${cost}/${cost})` : `starts empty (0/${cost})`;
+
+function programLine(p: ResolvedProgram): string {
+  return (
+    `${p.name} [${p.id}] — ${colorList(p.colors)} + ${shapeList(p.shapes)} — ` +
+    `${p.fn.name} costs ${p.cost}, ${startChargeText(p.fn.startCharged, p.cost)}`
+  );
+}
+
+// ---- character sheets (§20.3 — per side, opened from the avatar boxes) ----
+
+function characterSheetSide(cfg: BattleConfig, side: Side, identity: BattleIdentity): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'config readonly';
   const row = (text: string, head = false): void => {
@@ -478,24 +575,40 @@ function characterSheetSide(cfg: BattleConfig, side: Side): HTMLElement {
     d.textContent = text;
     wrap.appendChild(d);
   };
+  // §20.3 — strong/weak sets come from RESOLVED state (the selected Hacker's
+  // authored sets, complemented for the System), never from prose or constants.
   const strongC = cfg.strongColors[side];
   const strongS = cfg.strongShapes[side];
-  const weakC = Array.from({ length: COLOR_COUNT }, (_, i) => i as Color).filter((c) => !strongC.includes(c));
-  const weakS = Array.from({ length: SHAPE_COUNT }, (_, i) => i as Shape).filter((s) => !strongS.includes(s));
-  row(side === 'player' ? 'HACKER' : 'SYSTEM', true);
-  row(`Strong colors (${DAMAGE_PER_TILE_HIGH_COLOR} dmg): ${strongC.length ? strongC.map((c) => COLOR_NAMES[c]).join(', ') : 'none'}`);
-  row(`Weak colors (${DAMAGE_PER_TILE_LOW_COLOR} dmg): ${weakC.length ? weakC.map((c) => COLOR_NAMES[c]).join(', ') : 'none'}`);
-  row(`Strong shapes (${DAMAGE_PER_TILE_HIGH_SHAPE} dmg): ${strongS.length ? strongS.map((s) => SHAPE_NAMES[s]).join(', ') : 'none'}`);
-  row(`Weak shapes (${DAMAGE_PER_TILE_LOW_SHAPE} dmg): ${weakS.length ? weakS.map((s) => SHAPE_NAMES[s]).join(', ') : 'none'}`);
-  row('PROGRAMS', true);
-  for (const p of programsFor(side)) {
-    const colors = p.colors.map((c) => COLOR_NAMES[c]).join('/');
-    const shapes = p.shapes.map((s) => SHAPE_NAMES[s]).join('/');
-    row(`${p.name} [${p.id}] — cost ${p.cost} — ${colors} + ${shapes} — ${p.fn.name}`);
+  const weakC = ([0, 1, 2, 3, 4, 5] as Color[]).filter((c) => !strongC.includes(c));
+  const weakS = ([0, 1, 2, 3, 4, 5] as Shape[]).filter((s) => !strongS.includes(s));
+  const hacker = hackerById(identity.hackerId);
+  if (side === 'player') {
+    row(`HACKER — ${hacker.name}`, true);
+    row(`LINK ${cfg.playerHp}`);
+  } else {
+    row('SYSTEM', true);
+    row(`ICE ${cfg.enemyHp}`);
   }
+  row(`Strong colors (${DAMAGE_PER_TILE_HIGH_COLOR} dmg): ${colorList(strongC)}`);
+  row(`Weak colors (${DAMAGE_PER_TILE_LOW_COLOR} dmg): ${colorList(weakC)}`);
+  row(`Strong shapes (${DAMAGE_PER_TILE_HIGH_SHAPE} dmg): ${shapeList(strongS)}`);
+  row(`Weak shapes (${DAMAGE_PER_TILE_LOW_SHAPE} dmg): ${shapeList(weakS)}`);
+  if (side === 'player') {
+    // §20.3 — Hacker Skill descriptions for the selected Hacker
+    row('SKILLS', true);
+    if (!hacker.skills.length) row('none');
+    for (const sk of hacker.skills) row(`${sk.display} [${sk.id}]`);
+    // §20.3 — Deck name and Deck Function summary on the Hacker side
+    const deck = deckById(identity.deckId);
+    row('DECK', true);
+    row(`${deck.name} [${deck.id}] — +${deck.addLink} LINK`);
+    row(`${deck.fn.name} costs ${deck.fn.cost}, ${startChargeText(deck.fn.startCharged, deck.fn.cost)}`);
+  }
+  row('PROGRAMS', true);
+  for (const p of programsFor(side)) row(programLine(p));
   row('GENERAL', true);
-  row(`Charge: +${CHARGE_PER_TILE_COLOR_MATCH} per tile of a program's bound color, +${CHARGE_PER_TILE_SHAPE_MATCH} per bound shape`);
-  row(`Neutral damage: ${DAMAGE_PER_TILE_NEUTRAL} (matches only other neutrals; refills your Shake)`);
+  row(`Charge: +${CHARGE_PER_TILE_COLOR_MATCH} per Packet of a Program's bound color, +${CHARGE_PER_TILE_SHAPE_MATCH} per bound shape`);
+  row(`Neutral Packets: ${DAMAGE_PER_TILE_NEUTRAL} damage (Sync only with other neutrals); each one sliced in your Sync gives your Deck +${DECK_CHARGE_PER_NEUTRAL_TILE} charge`);
   return wrap;
 }
 
@@ -503,7 +616,7 @@ function showCharacterSheet(side: Side): void {
   if (!game) return;
   const panels = document.createElement('div');
   panels.className = 'panelscroll';
-  panels.appendChild(characterSheetSide(game.state.config, side));
+  panels.appendChild(characterSheetSide(game.state.config, side, game.state.identity));
   showDialog(side === 'player' ? 'HACKER' : 'SYSTEM', '', [['Close', hideDialog]], panels);
 }
 
@@ -527,10 +640,29 @@ function appendWizard(action: WizardAction): void {
   });
 }
 
+// §21.2 — COMMITTED selection events and battle creation. Preselection, screen
+// views, and Back navigation are deliberately never logged as committed choices.
+function logSelection(
+  event: SelectionLogEntry['event'],
+  opts: { g?: Game; identity?: Partial<SelectionLogEntry['identity']> },
+): void {
+  const entry: SelectionLogEntry = {
+    v: LOG_VERSION,
+    at: new Date().toISOString(),
+    event,
+    fp: getContent().fingerprint,
+    identity: opts.g ? identityStamp(opts.g.state.identity) : (opts.identity ?? {}),
+    ...(session ? { mode: session.mode } : {}),
+    ...(session?.mode === 'RUN' ? { runStep: session.step } : {}),
+    ...(opts.g ? { battleId: opts.g.state.battleId, hackerMaxLink: opts.g.state.config.playerHp, systemMaxIce: opts.g.state.config.enemyHp } : {}),
+  };
+  appendSelectionLog(entry);
+}
+
 // After every completed action: drain and context-stamp turn logs, then
 // either persist the active battle (stable point) or conclude into a saved
-// PENDING_RESULT (§5.1 — the save is NOT cleared when the result appears;
-// only accepted terminal actions clear it, §6.4).
+// PENDING_RESULT (§17.5 — the save is NOT cleared when the result appears;
+// only accepted terminal actions clear it).
 function afterAction(): void {
   if (!game || !session) return;
   const ctx = battleContext(session);
@@ -561,6 +693,7 @@ function logBattleMetrics(): void {
     mode: ctx.mode,
     ...(ctx.runStep !== undefined ? { runStep: ctx.runStep } : {}),
     ...(ctx.encounterSystemHp !== undefined ? { encounterSystemHp: ctx.encounterSystemHp } : {}),
+    identity: identityStamp(game.state.identity),
     wallClockMs: Date.now() - battleStartAt,
     metrics: game.state.metrics,
   });
@@ -573,6 +706,8 @@ function showTitle(): void {
   game = null;
   session = null;
   pending = null;
+  setup = null; // §12.2 — returning to Title discards pending setup ONLY
+  systemTurnActive = false;
   view.clearBoard();
   const restored = deserializeSession(loadBattleJson());
   const buttons: ButtonSpec[] = [];
@@ -581,14 +716,17 @@ function showTitle(): void {
   }
   const savedInfo = restored ? restored.info : null;
   buttons.push(['Quick Match', () => confirmReplace(savedInfo, () => void startQuickMatch())]);
-  buttons.push(['New Run', () => confirmReplace(savedInfo, () => void startNewRun())]);
+  // §12.1/§12.3 — New Run enters SETUP. The resident save is preserved
+  // throughout Hacker Selection, Deck Selection, and Build Review; only the
+  // final Start Run action replaces it.
+  buttons.push(['New Run', () => showHackerSelection(beginSetup())]);
   buttons.push(['Settings', showSettings]);
-  showDialog('BREACH — alpha-0.2.0', '', buttons);
+  showDialog('BREACH — alpha-0.3.0', '', buttons);
 }
 
-// §3.6 replacement confirmation — only when a valid resident save exists.
+// §12.3 replacement confirmation — only when a valid resident save exists.
 // Cancel leaves the save and title state unchanged.
-function confirmReplace(saved: SessionInfo | null, start: () => void): void {
+function confirmReplace(saved: SessionInfo | null, start: () => void, onCancel: () => void = showTitle): void {
   if (!saved) {
     start();
     return;
@@ -597,7 +735,7 @@ function confirmReplace(saved: SessionInfo | null, start: () => void): void {
     'REPLACE SAVE?',
     `Starting a new game will replace your resumable ${contextLabel(saved)} progress.`,
     [
-      ['Cancel', showTitle],
+      ['Cancel', onCancel],
       ['Replace this save', start],
     ],
   );
@@ -610,6 +748,210 @@ function showSettings(): void {
   showDialog('SETTINGS', 'Applies to the next new game', [['Back', showTitle]], panels);
 }
 
+// ---- §12-§15 New Run setup screens ----
+
+// A selectable option list. The sole option MAY be preselected, but advancing
+// always requires the explicit forward action below the list (§13.2/§14.2).
+function optionList(
+  items: { id: string; title: string; lines: string[] }[],
+  selectedId: string | null,
+  onPick: (id: string) => void,
+): HTMLElement {
+  const wrap = document.createElement('div');
+  wrap.className = 'optlist';
+  for (const item of items) {
+    const el = document.createElement('button');
+    el.className = item.id === selectedId ? 'opt sel' : 'opt';
+    const t = document.createElement('div');
+    t.className = 'optname';
+    t.textContent = item.title;
+    el.appendChild(t);
+    for (const line of item.lines) {
+      const d = document.createElement('div');
+      d.className = 'optline';
+      d.textContent = line;
+      el.appendChild(d);
+    }
+    el.addEventListener('click', () => onPick(item.id));
+    wrap.appendChild(el);
+  }
+  return wrap;
+}
+
+// §13 — Hacker Selection. Displays every loaded Hacker: name, base LINK, strong
+// colors, strong shapes, and separately rendered Skill descriptions. BIO and
+// GRAPHICS are never displayed or loaded (§13.1).
+function showHackerSelection(s: PendingSetup): void {
+  setup = s;
+  const hackers = allHackers();
+  const preselect = s.hackerId ?? (hackers.length === 1 ? hackers[0].id : null);
+  const list = optionList(
+    hackers.map((h: ResolvedHacker) => ({
+      id: h.id,
+      title: `${h.name} [${h.id}]`,
+      lines: [
+        `Base LINK ${h.baseLink}`,
+        `Strong colors: ${colorList(h.strongColors)}`,
+        `Strong shapes: ${shapeList(h.strongShapes)}`,
+        ...h.skills.map((sk) => `Skill: ${sk.display}`),
+      ],
+    })),
+    preselect,
+    (id) => showHackerSelection({ ...s, hackerId: id }),
+  );
+  const panels = document.createElement('div');
+  panels.className = 'panelscroll';
+  panels.appendChild(list);
+  showDialog(
+    'SELECT HACKER',
+    'Step 1 of 3',
+    [
+      // explicit forward action; no modal confirmation follows it (§13.2)
+      ['Choose', () => {
+        if (!preselect) return;
+        logSelection('HACKER_SELECTED', { identity: { hackerId: preselect } });
+        showDeckSelection(chooseHacker({ ...s, hackerId: preselect }, preselect));
+      }, undefined, !preselect],
+      ['Back to Title', showTitle],
+    ],
+    panels,
+    true,
+  );
+}
+
+// §14 — Deck Selection. Displays every loaded Deck: name, added LINK, Deck
+// Function name, cost, and starting-charge state. All Decks are compatible with
+// the selected Hacker; there is no filtering (§2.8). DESCRIPT and GRAPHICS are
+// never displayed or loaded.
+function showDeckSelection(s: PendingSetup): void {
+  setup = s;
+  const decks = allDecks();
+  const preselect = s.deckId ?? (decks.length === 1 ? decks[0].id : null);
+  const list = optionList(
+    decks.map((d: ResolvedDeck) => ({
+      id: d.id,
+      title: `${d.name} [${d.id}]`,
+      lines: [
+        `+${d.addLink} LINK`,
+        `Function: ${d.fn.name} — cost ${d.fn.cost}`,
+        startChargeText(d.fn.startCharged, d.fn.cost),
+      ],
+    })),
+    preselect,
+    (id) => showDeckSelection({ ...s, deckId: id }),
+  );
+  const panels = document.createElement('div');
+  panels.className = 'panelscroll';
+  panels.appendChild(list);
+  showDialog(
+    'SELECT DECK',
+    'Step 2 of 3',
+    [
+      ['Choose', () => {
+        if (!preselect) return;
+        logSelection('DECK_SELECTED', { identity: { hackerId: s.hackerId ?? undefined, deckId: preselect } });
+        showBuildReview(chooseDeck({ ...s, deckId: preselect }, preselect));
+      }, undefined, !preselect],
+      // Back RETAINS the pending choices (§12.2)
+      ['Back', () => {
+        const prev = setupBack(s);
+        if (prev) showHackerSelection(prev);
+        else showTitle();
+      }],
+    ],
+    panels,
+    true,
+  );
+}
+
+// §15 — Fixed Build Review. Confirms the selected identity and the fixed combat
+// build before persistent Run creation. NOT a build editor: no replacement,
+// reordering, inventory, ownership, targeting, or activation controls (§15.3).
+function showBuildReview(s: PendingSetup): void {
+  setup = s;
+  if (!s.hackerId || !s.deckId) {
+    showHackerSelection(s);
+    return;
+  }
+  const hacker = hackerById(s.hackerId);
+  const deck = deckById(s.deckId);
+  // §15.2 — resolved total Hacker LINK under the CURRENT pending Normal LINK
+  // configuration (not committed until Start Run).
+  const totalLink = resolveHackerMaxLink(menuSettings, s.hackerId, s.deckId);
+  const wrap = document.createElement('div');
+  wrap.className = 'config readonly';
+  const row = (text: string, head = false): void => {
+    const d = document.createElement('div');
+    if (head) d.className = 'cfghead';
+    d.textContent = text;
+    wrap.appendChild(d);
+  };
+  row('HACKER', true);
+  row(`${hacker.name} [${hacker.id}]`);
+  row(
+    menuSettings.normalLink
+      ? `Total LINK ${totalLink} (base ${hacker.baseLink} + deck ${deck.addLink})`
+      : `Total LINK ${totalLink} (manual — Normal LINK is OFF)`,
+  );
+  row(`Strong colors: ${colorList(hacker.strongColors)}`);
+  row(`Strong shapes: ${shapeList(hacker.strongShapes)}`);
+  row('SKILLS', true);
+  if (!hacker.skills.length) row('none');
+  for (const sk of hacker.skills) row(`${sk.display} [${sk.id}]`);
+  row('DECK', true);
+  row(`${deck.name} [${deck.id}] — +${deck.addLink} LINK`);
+  row(`${deck.fn.name} costs ${deck.fn.cost}, ${startChargeText(deck.fn.startCharged, deck.fn.cost)}`);
+  // §5.3 — the four fixed Programs in EXACT battle order; reviewable, not editable
+  row('PROGRAMS (fixed order)', true);
+  programsFor('player').forEach((p, i) => row(`${i + 1}. ${programLine(p)}`));
+  const panels = document.createElement('div');
+  panels.className = 'panelscroll';
+  panels.appendChild(wrap);
+
+  const restored = deserializeSession(loadBattleJson());
+  showDialog(
+    'BUILD REVIEW',
+    'Step 3 of 3 — this build is fixed for Alpha 0.3',
+    [
+      // §12.3 — the ONLY setup action that replaces/creates a save. Cancel
+      // leaves the old save and this pending Build Review unchanged.
+      ['Start Run', () => confirmReplace(restored ? restored.info : null, () => void commitRun(), () => showBuildReview(s))],
+      ['Back', () => {
+        const prev = setupBack(s);
+        if (prev) showDeckSelection(prev);
+        else showTitle();
+      }],
+    ],
+    panels,
+    true,
+  );
+}
+
+// §12.3 — atomic commitment: replace the save, commit the selected identity,
+// construct the Run, save Battle 1, and enter battle.
+async function commitRun(): Promise<void> {
+  if (!setup || !setupComplete(setup) || !setup.hackerId || !setup.deckId) return;
+  const hackerId = setup.hackerId;
+  const deckId = setup.deckId;
+  // §10.4 — snapshot the settings (including Normal LINK) and resolve the
+  // effective Hacker maximum LINK now; the whole Run uses these saved values.
+  const settings = snapshotRunSettings(menuSettings);
+  const hackerMaxLink = resolveHackerMaxLink(settings, hackerId, deckId);
+  clearBattleSave();
+  session = {
+    mode: 'RUN',
+    step: 1,
+    settings,
+    identity: { hackerId, deckId, selectionSource: 'EXPLICIT_SELECTION' },
+    hackerMaxLink,
+  };
+  pending = null;
+  setup = null;
+  const g = createRunBattle(session, 1);
+  logSelection('RUN_CREATED', { g });
+  await enterBattle(g);
+}
+
 // ---- battle starts (all battle construction goes through logic/session.ts) ----
 
 async function enterBattle(g: Game): Promise<void> {
@@ -617,6 +959,7 @@ async function enterBattle(g: Game): Promise<void> {
   game = g;
   selection = null;
   targetingSlot = null;
+  systemTurnActive = false;
   battleStartAt = Date.now();
   view.reset(gridViewOf(game.state.board));
   view.setSelection(null);
@@ -627,26 +970,40 @@ async function enterBattle(g: Game): Promise<void> {
   maybeGameOver();
 }
 
-async function startQuickMatch(cfg?: BattleConfig): Promise<void> {
-  clearBattleSave(); // confirmed replacement (or a result-screen restart)
-  session = { mode: 'QUICK_MATCH' };
+// §16 — Quick Match stays a direct single-battle title flow: it resolves the
+// explicit default Hacker and Deck IDs, records them as DEFAULTED rather than
+// explicitly chosen, and never shows the selection screens.
+async function startQuickMatch(): Promise<void> {
+  clearBattleSave(); // confirmed replacement
+  const ids = defaultIdentity();
+  session = { mode: 'QUICK_MATCH', identity: ids };
   pending = null;
-  await enterBattle(createQuickMatchBattle(cfg ?? menuConfig));
+  setup = null;
+  const g = createQuickMatchBattle(menuSettings, ids);
+  logSelection('QUICK_MATCH_CREATED', { g });
+  await enterBattle(g);
 }
 
-async function startNewRun(): Promise<void> {
+// §18.3 — Quick Match Reset restarts under the concluded battle's OWN config
+// and identity, not under current menu settings.
+async function resetQuickMatch(config: BattleConfig, identity: BattleIdentity): Promise<void> {
   clearBattleSave();
-  session = { mode: 'RUN', step: 1, config: snapshotRunConfig(menuConfig) };
+  session = {
+    mode: 'QUICK_MATCH',
+    identity: { hackerId: identity.hackerId, deckId: identity.deckId, selectionSource: identity.selectionSource },
+  };
   pending = null;
-  await enterBattle(createRunBattle(session.config, session.step));
+  const g = recreateBattleFromConfig(config, identity);
+  logSelection('QUICK_MATCH_CREATED', { g });
+  await enterBattle(g);
 }
 
-// Create a fresh battle for the CURRENT Run step (§4.3): new board, new RNG,
-// full Hacker HP, encounter System HP, nothing carried over.
+// Create a fresh battle for the CURRENT Run step (§10.5): new Datastream, new
+// RNG, full saved maximum LINK, encounter ICE, nothing carried over.
 async function startRunStep(): Promise<void> {
   if (!session || session.mode !== 'RUN') return;
   pending = null;
-  await enterBattle(createRunBattle(session.config, session.step));
+  await enterBattle(createRunBattle(session, session.step));
 }
 
 async function resumeSession(): Promise<void> {
@@ -661,14 +1018,20 @@ async function resumeSession(): Promise<void> {
   pending = r.pending;
   selection = null;
   targetingSlot = null;
+  systemTurnActive = false;
   battleStartAt = Date.now();
   view.reset(gridViewOf(game.state.board));
   view.setSelection(null);
-  console.info(`[breach] ${contextLabel(session)} restored (turn ${game.state.turn})`);
+  // §21.2 — resume logs identify the restored Hacker, Deck, fixed build, and step
+  const id = game.state.identity;
+  console.info(
+    `[breach] ${contextLabel(session)} restored (turn ${game.state.turn}) — ${id.hackerId}/${id.deckId} ` +
+      `skills=[${id.skillIds.join(',')}] deckFn=${id.deckFunctionId} build=[${id.hackerPrograms.join(',')}]`,
+  );
   busy = true;
   await view.play([{ t: 'msg', text: `${contextLabel(session)} resumed — turn ${game.state.turn}` }]);
   if (pending) {
-    // §5.1: restore the battle AND its pending result modal — never skip an
+    // §17.5: restore the battle AND its pending result modal — never skip an
     // unresolved result. Heal a crash between conclusion and metric logging.
     logBattleMetrics();
     persistSession();
@@ -676,11 +1039,11 @@ async function resumeSession(): Promise<void> {
     return;
   }
   endBusy();
-  // MK5.4 divergence acknowledgment: the save's config is authoritative. For
-  // a Run compare the RUN SNAPSHOT (per-battle enemyHp is encounter-overridden
-  // by design and not a divergence).
-  const authoritative = session.mode === 'RUN' ? session.config : game.state.config;
-  if (!configsEqual(authoritative, menuConfig)) {
+  // MK5.4 divergence acknowledgment: the save's settings are authoritative. For
+  // a Run compare the RUN SNAPSHOT (per-encounter ICE is rule-derived by design
+  // and not a divergence).
+  const authoritative: BattleSettings = session.mode === 'RUN' ? session.settings : game.state.config;
+  if (!settingsEqual(authoritative, menuSettings)) {
     showDialog(
       'BATTLE CONFIG',
       'This battle is using the configuration it was started with, not your current settings.',
@@ -690,7 +1053,7 @@ async function resumeSession(): Promise<void> {
   }
 }
 
-// ---- results, progression, wizard actions (§4.4-4.6, §5) ----
+// ---- results, progression, wizard actions (§18) ----
 
 function maybeGameOver(): void {
   if (!game?.state.winner || !pending) return;
@@ -698,7 +1061,7 @@ function maybeGameOver(): void {
 }
 
 function exitToTitleClearing(): void {
-  clearBattleSave(); // §6.4 accepted terminal action
+  clearBattleSave(); // §17.5 accepted terminal action
   showTitle();
 }
 
@@ -710,13 +1073,18 @@ function advanceRun(): void {
   void startRunStep();
 }
 
+// §18.2 — Force Win. On a natural DEFEAT it overrides the result while
+// preserving the natural outcome (the combat record is never rewritten as a
+// natural victory). On an already-natural Run victory it records the explicit
+// wizard invocation and applies NORMAL progression only — it never skips an
+// encounter or creates an extra one.
 function forceWin(): void {
   if (!game || !session || !pending) return;
-  appendWizard('WIZARD_FORCE_WIN'); // logged distinctly even on a natural win (§5.3)
+  appendWizard('WIZARD_FORCE_WIN');
   pending = { ...pending, forcedWin: true };
   persistSession();
   if (session.mode === 'RUN' && session.step < 4) {
-    advanceRun(); // battles 1-3: progress to the next fresh encounter
+    advanceRun(); // battles 1-3: normal progression to the next fresh encounter
   } else {
     showResultModal(); // QM terminal / step-4 Run Complete presentation
   }
@@ -725,27 +1093,29 @@ function forceWin(): void {
 function wizardRestartLostBattle(): void {
   if (!session || session.mode !== 'RUN') return;
   appendWizard('WIZARD_RESTART_LOST_BATTLE');
-  void startRunStep(); // same step/config/encounter HP; new board + RNG (§5.5)
+  void startRunStep(); // same step/settings/encounter ICE; new board + RNG
 }
 
 function wizardRestartRun(): void {
   if (!session || session.mode !== 'RUN') return;
   appendWizard('WIZARD_RESTART_RUN');
   session = { ...session, step: 1 };
-  void startRunStep(); // same saved Run config; fresh Battle 1 (§4.6)
+  void startRunStep(); // same saved Run snapshot; fresh Battle 1
 }
 
 function showResultModal(): void {
   if (!game || !session || !pending) return;
-  busy = true; // lock board input while a result modal is up
+  busy = true; // lock Datastream input while a result modal is up
   const m = game.state.metrics;
+  // §18.1 — the availability matrix is owned by the session layer.
+  const canForce = forceWinAvailable(session, pending);
 
   // Run Complete (§4.4): step-4 win (natural or forced). No Force Win here.
   if (session.mode === 'RUN' && isRunComplete(session, pending)) {
     showDialog(
       'RUN COMPLETE',
-      pending.forcedWin && pending.natural === 'NATURAL_DEFEAT' ? 'Wizard override — run completed.' : 'All four systems breached.',
-      [['Exit', exitToTitleClearing]],
+      pending.forcedWin && pending.natural === 'NATURAL_DEFEAT' ? 'Wizard override — run completed.' : 'All four Systems breached.',
+      [['Back to Title', exitToTitleClearing]],
       metricsElement(m),
     );
     return;
@@ -755,32 +1125,31 @@ function showResultModal(): void {
   const title = pending.natural === 'NATURAL_VICTORY' ? 'VICTORY' : pending.forcedWin ? 'FORCED VICTORY' : 'DEFEAT';
   const sub =
     pending.natural === 'NATURAL_VICTORY'
-      ? 'Enemy system breached.'
+      ? 'System ICE breached.'
       : pending.forcedWin
         ? 'Wizard override accepted.'
-        : 'Your connection was severed.';
+        : 'Your LINK was severed.';
   const buttons: ButtonSpec[] = [];
 
   if (session.mode === 'QUICK_MATCH') {
-    // §5.6: preserved Quick Match flow — Reset restarts under this battle's
-    // config (new save), Quit is the accepted terminal action (clears save).
+    // §18.3/§18.4: Reset restarts under this battle's own config and identity;
+    // Back to Title is the accepted terminal action (clears the save).
     const cfg = { ...game.state.config };
-    buttons.push(['Reset', () => void startQuickMatch(cfg)]);
-    buttons.push(['Quit', exitToTitleClearing]);
-    if (!pending.forcedWin) buttons.push(['Force Win', forceWin, 'wizard']);
+    const id = { ...game.state.identity };
+    buttons.push(['Reset', () => void resetQuickMatch(cfg, id)]);
+    buttons.push(['Back to Title', exitToTitleClearing]);
   } else if (asVictory) {
-    // Run battles 1-3 won (naturally or forced): accept to advance. Quit
-    // returns to title WITHOUT clearing — the pending result stays resumable.
+    // Run battles 1-3 won (naturally or forced): accept to advance. Save and
+    // Quit returns to title WITHOUT clearing — the result stays resumable.
     buttons.push(['Next Battle', advanceRun]);
-    buttons.push(['Quit (resume later)', showTitle]);
-    if (!pending.forcedWin) buttons.push(['Force Win', forceWin, 'wizard']);
+    buttons.push(['Save and Quit', showTitle]);
   } else {
-    // Run defeat (§4.5): Restart Run, terminal end, wizard restart/force.
+    // Run defeat: Restart Run, terminal end, wizard restart.
     buttons.push(['Restart Run', wizardRestartRun]);
-    buttons.push(['End Run', exitToTitleClearing]);
+    buttons.push(['Back to Title', exitToTitleClearing]);
     buttons.push(['Restart Lost Battle', wizardRestartLostBattle, 'wizard']);
-    buttons.push(['Force Win', forceWin, 'wizard']);
   }
+  if (canForce) buttons.push(['Force Win', forceWin, 'wizard']);
 
   showDialog(title, sub, buttons, metricsElement(m));
 }
@@ -795,7 +1164,15 @@ async function doSwap(a: Pt, b: Pt): Promise<void> {
   const r = game.attemptSwap(a, b, thinkMs, hintFiredThisTurn);
   await view.play(r.events);
   if (r.matched) {
-    if (!game.state.winner) await view.play(game.runEnemyPhase());
+    if (!game.state.winner) {
+      // §20.2 — the input-lock indicator is on for exactly the System turn.
+      systemTurnActive = true;
+      try {
+        await view.play(game.runEnemyPhase());
+      } finally {
+        systemTurnActive = false;
+      }
+    }
     if (!game.state.winner) await view.play(game.startPlayerPhase());
     afterAction();
     endBusy();
@@ -805,7 +1182,7 @@ async function doSwap(a: Pt, b: Pt): Promise<void> {
   maybeGameOver();
 }
 
-// ---- startup: load + validate data BEFORE any title/battle init (§10.4) ----
+// ---- startup: load + validate data BEFORE any title/battle init (§4.9) ----
 
 function showDataFailure(errors: number, warnings: number, lines: string[]): void {
   const list = document.createElement('div');
@@ -829,7 +1206,7 @@ function showDataFailure(errors: number, warnings: number, lines: string[]): voi
 }
 
 function boot(): void {
-  menuConfig = loadMenuConfig();
+  menuSettings = loadMenuSettings();
 
   attachInput(canvas, view, {
     onTap(p: Pt): void {
@@ -882,6 +1259,8 @@ function boot(): void {
         maybeGameOver();
       });
     },
+    // §7.4 — the Drain target list is Programs only. The Deck Function is not a
+    // Program and is structurally absent from this channel.
     onMinion(i: number): void {
       if (!canAct() || !game || targetingSlot === null) return;
       const slot = targetingSlot;
@@ -895,13 +1274,13 @@ function boot(): void {
         maybeGameOver();
       });
     },
-    onShake(): void {
+    onDeck(): void {
       if (!canAct() || !game) return;
       if (targetingSlot !== null) {
         targetingSlot = null;
         return;
       }
-      const events = game.fireShake();
+      const events = game.fireDeckFunction();
       if (!events.length) return;
       busy = true;
       void view.play(events).then(() => {
@@ -910,7 +1289,7 @@ function boot(): void {
         maybeGameOver();
       });
     },
-    // §10 — avatar controls open the side's character sheet. Available only
+    // §20.3 — avatar controls open the side's character sheet. Available only
     // at the same stable input phase as Pause; never a combat event.
     onAvatar(side: Side): void {
       if (!canAct() || !game) return;
@@ -918,20 +1297,22 @@ function boot(): void {
       showCharacterSheet(side);
     },
     onMenu(): void {
-      // Pause only in the make-a-match phase, never mid-resolution. §11: shows
-      // mode context; character sheets moved to the avatars; Reset exists in
-      // Quick Match only (approved ruling — Run restarts are wizard actions).
+      // Pause only in the make-a-Sync phase, never mid-resolution. §18.3:
+      // Quick Match keeps Reset; a Run does NOT show it (Run restarts are
+      // result-screen wizard controls).
       if (!canAct() || !game || !session) return;
       targetingSlot = null;
       const cfg = { ...game.state.config };
+      const id = { ...game.state.identity };
       const panels = document.createElement('div');
       panels.className = 'panelscroll';
       panels.appendChild(configSummary(cfg, 'ACTIVE BATTLE CONFIG'));
       const buttons: ButtonSpec[] = [['Resume', hideDialog]];
       if (session.mode === 'QUICK_MATCH') {
-        buttons.push(['Reset', () => void startQuickMatch(cfg)]);
+        buttons.push(['Reset', () => void resetQuickMatch(cfg, id)]);
       }
-      buttons.push(['Quit', showTitle]); // mid-battle quit keeps the save resumable
+      // §18.4 — a resumable exit: the save is preserved, not cleared.
+      buttons.push(['Save and Quit', showTitle]);
       showDialog('PAUSED', contextLabel(session), buttons, panels);
     },
   });
@@ -955,11 +1336,11 @@ function boot(): void {
     }
   }, 400);
 
-  // MK7.8 — debug-only find-match button (dev builds only)
+  // MK7.8 — debug-only find-Sync button (dev builds only)
   if (import.meta.env.DEV) {
     const b = document.createElement('button');
     b.id = 'dbgfind';
-    b.textContent = 'find match';
+    b.textContent = 'find sync';
     b.addEventListener('click', () => {
       if (!game || !canAct()) return;
       const mv = findBotMove(game.state.board);

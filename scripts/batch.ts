@@ -4,20 +4,20 @@
 // from the same CSV datasets as the browser; the summary header stamps the
 // content identity (§13.2). Run with `npm run batch`.
 
-import { DEFAULT_BATTLE_CONFIG } from '../src/logic/constants';
-import { contentStamp, getContent, programsFor } from '../src/logic/data/content';
-import { Game } from '../src/logic/game';
+import { contentStamp, deckById, getContent, programsFor } from '../src/logic/data/content';
 import { BattleMetrics } from '../src/logic/metrics';
-import { BattleConfig } from '../src/logic/types';
+import { defaultIdentity } from '../src/logic/session';
+import { BattleSettings } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { initContentOrExit } from './dataNode';
+import { D, newBattle } from './harness';
 
 initContentOrExit();
 
 const N = 100;
 
-function playOne(seed: number, config: BattleConfig): BattleMetrics {
-  const g = new Game(config, seed);
+function playOne(seed: number, settings: BattleSettings): BattleMetrics {
+  const g = newBattle(settings, seed);
   g.startPlayerPhase();
   let safety = 0;
   while (!g.state.winner && safety++ < 2000) {
@@ -46,10 +46,13 @@ function report(label: string, group: BattleMetrics[]): void {
     const s = group.map((m) => m.sides[side]);
     console.log(`--- ${side.toUpperCase()} (averages per battle) ---`);
     const abilityPcts = s.map((x) => (x.totalDamage > 0 ? ((x.attackerDamage + x.bombDamage) / x.totalDamage) * 100 : 0));
-    // MK7.3/7.4: four DISJOINT causal buckets (match+bomb+atk+buffer = total)
-    console.log(`  Total damage: ${f1(avg(s.map((x) => x.totalDamage)))}  [match ${f1(avg(s.map((x) => x.matchDamage)))} | bomb ${f1(avg(s.map((x) => x.bombDamage)))} | atk ${f1(avg(s.map((x) => x.attackerDamage)))} | buffer ${f1(avg(s.map((x) => x.bufferDamageAdded)))}]  ability share ${f1(avg(abilityPcts))}%`);
+    // MK7.3/7.4 + §11.3: five DISJOINT causal buckets
+    // (sync + bomb + atk + buffer + skill = total)
+    console.log(`  Total damage: ${f1(avg(s.map((x) => x.totalDamage)))}  [sync ${f1(avg(s.map((x) => x.matchDamage)))} | bomb ${f1(avg(s.map((x) => x.bombDamage)))} | atk ${f1(avg(s.map((x) => x.attackerDamage)))} | buffer ${f1(avg(s.map((x) => x.bufferDamageAdded)))} | skill ${f1(avg(s.map((x) => x.skillDamage)))}]  Function share ${f1(avg(abilityPcts))}%`);
     console.log(`  Cascade (RNG-refill) damage, any cause: ${f1(avg(s.map((x) => x.cascadeDamage)))}`);
-    console.log(`  Match dmg by axis: color ${f1(avg(s.map((x) => x.matchDamageColor)))} / shape ${f1(avg(s.map((x) => x.matchDamageShape)))}`);
+    console.log(`  Sync dmg by axis: color ${f1(avg(s.map((x) => x.matchDamageColor)))} / shape ${f1(avg(s.map((x) => x.matchDamageShape)))}`);
+    // §9.5 — line-clear frequency, so B1 board churn is observable
+    console.log(`  Line clears: avg ${f1(avg(s.map((x) => x.lineClears)))}, max ${max(s.map((x) => x.lineClears))}`);
     console.log(`  Biggest round: avg ${f1(avg(s.map((x) => x.biggestRound)))}, max ${max(s.map((x) => x.biggestRound))}   Avg nonzero round: ${f1(avg(s.map((x) => (x.roundDamageCount ? x.roundDamageSum / x.roundDamageCount : 0))))}`);
     const critPcts = s.map((x) => (x.matchDamage > 0 ? (x.critExtra / x.matchDamage) * 100 : 0));
     console.log(`  Crit bonus damage: ${f1(avg(s.map((x) => x.critExtra)))} (avg ${f1(avg(critPcts))}% of match damage)`);
@@ -57,7 +60,7 @@ function report(label: string, group: BattleMetrics[]): void {
     console.log(`  Deepest cascade: avg ${f1(avg(s.map((x) => x.deepestCascade)))}, max ${max(s.map((x) => x.deepestCascade))}`);
     const contPcts = s.map((x) => (x.tilesDestroyed > 0 ? (x.contentionTiles / x.tilesDestroyed) * 100 : 0));
     console.log(`  Contention: ${f1(avg(s.map((x) => x.contentionTiles)))} opp-bound tiles of ${f1(avg(s.map((x) => x.tilesDestroyed)))} destroyed (avg ${f1(avg(contPcts))}%)`);
-    // Alpha §13.4: per-Program rows by stable ID, display name joined here
+    // Alpha §21.3: per-Program rows by stable ID, display name joined here
     for (const p of programsFor(side)) {
       const fires = avg(s.map((x) => x.units[p.id]?.fires ?? 0));
       const effect = avg(s.map((x) => x.units[p.id]?.effect ?? 0));
@@ -65,34 +68,58 @@ function report(label: string, group: BattleMetrics[]): void {
       const fizzles = avg(s.map((x) => x.units[p.id]?.fizzles ?? 0));
       console.log(`  ${p.name} [${p.id}]: fires ${f1(fires)}, effect ${f1(effect)}, charge wasted ${f1(wasted)}, fizzles ${f1(fizzles)}`);
     }
+    // §21.3 — the Deck-owned Function and Hacker Skills report separately from
+    // the Programs; only the Hacker side carries them.
+    if (side === 'player') {
+      const deck = deckById(defaultIdentity().deckId);
+      console.log(
+        `  ${deck.fn.name} [${deck.id} deck]: fires ${f1(avg(s.map((x) => x.deck.fires)))},` +
+          ` neutral charge ${f1(avg(s.map((x) => x.deck.chargeFromNeutral)))} (wasted ${f1(avg(s.map((x) => x.deck.chargeWasted)))}),` +
+          ` shake ${f1(avg(s.map((x) => x.deck.shakeSuccesses)))}/${f1(avg(s.map((x) => x.deck.shakeAttempts)))}` +
+          ` (legal fizzles ${f1(avg(s.map((x) => x.deck.shakeFizzles)))})`,
+      );
+      for (const sid of Object.keys(getContent().skills)) void sid; // (skills map, iterated below)
+      const skillIds = new Set<string>();
+      for (const x of s) for (const k of Object.keys(x.skills)) skillIds.add(k);
+      for (const sid of [...skillIds].sort()) {
+        console.log(
+          `  Skill ${sid}: triggers ${f1(avg(s.map((x) => x.skills[sid]?.triggers ?? 0)))},` +
+            ` damage ${f1(avg(s.map((x) => x.skills[sid]?.damage ?? 0)))},` +
+            ` charge ${f1(avg(s.map((x) => x.skills[sid]?.charge ?? 0)))}`,
+        );
+      }
+    }
   }
 }
 
-function runMode(label: string, config: BattleConfig): void {
+function runMode(label: string, settings: BattleSettings): void {
   const results: BattleMetrics[] = [];
-  for (let seed = 1; seed <= N; seed++) results.push(playOne(seed, config));
+  for (let seed = 1; seed <= N; seed++) results.push(playOne(seed, settings));
   const won = results.filter((m) => m.winner === 'player');
   const lost = results.filter((m) => m.winner === 'enemy');
+  const probe = newBattle(settings, 1);
   console.log(`\n############################################################`);
   console.log(`#  ${label}`);
   console.log(`#  BOT WIN RATE: ${won.length}/${N} won, ${lost.length}/${N} lost (${((won.length / N) * 100).toFixed(1)}% wins)`);
-  console.log(`#  player ${config.playerHp} HP vs enemy ${config.enemyHp} HP, seeds 1-${N}`);
+  console.log(`#  Hacker LINK ${probe.state.config.playerHp} vs System ICE ${probe.state.config.enemyHp}, seeds 1-${N}`);
   console.log(`############################################################`);
-  report('BATTLES THE PLAYER WON', won);
-  report('BATTLES THE PLAYER LOST', lost);
+  report('BATTLES THE HACKER WON', won);
+  report('BATTLES THE HACKER LOST', lost);
 }
 
-// §13.2 — simulation records are attributable to the loaded content
+// §21.2 — simulation records are attributable to the loaded content and to the
+// explicit Hacker/Deck identity the harness used.
 const stamp = contentStamp();
+const ids = defaultIdentity();
 console.log(`build ${stamp.gameVersion} | schema ${stamp.schemaVersion} | content ${stamp.fingerprint}`);
-console.log(`hacker: ${stamp.hackerPrograms.join(', ')}`);
-console.log(`system: ${stamp.systemPrograms.join(', ')}`);
+console.log(`hacker programs: ${stamp.hackerPrograms.join(', ')}`);
+console.log(`system programs: ${stamp.systemPrograms.join(', ')}`);
 console.log(`functions: ${stamp.functions.map((f) => `${f.id}=${f.cost}`).join(', ')}`);
+console.log(`identity: ${ids.hackerId}/${ids.deckId} (${ids.selectionSource}) skills=[${stamp.skills.join(', ')}]`);
 console.log(`fingerprint: ${getContent().fingerprint}`);
 
-const D = DEFAULT_BATTLE_CONFIG;
 // Alpha matrix: data-driven costs (7/8/10/9) across the main modes
-runMode('DEFAULT (cap-0, data costs)', { ...D });
-runMode('ENEMY_MATCHING ON', { ...D, enemyMatching: true });
-runMode('NO_MATCH_DAMAGE ON (charge-aware bot)', { ...D, noMatchDamage: true });
-runMode('NO_MATCH_DAMAGE + ENEMY_MATCHING (charge-aware bot)', { ...D, noMatchDamage: true, enemyMatching: true });
+runMode('DEFAULT (cap-0, data costs, Normal LINK)', { ...D });
+runMode('SYSTEM_MATCHING ON', { ...D, enemyMatching: true });
+runMode('REINFORCED_CONNECTION ON (charge-aware bot)', { ...D, reinforcedConnection: true });
+runMode('REINFORCED_CONNECTION + SYSTEM_MATCHING (charge-aware bot)', { ...D, reinforcedConnection: true, enemyMatching: true });

@@ -3,6 +3,12 @@
 // yield >=1 valid move and no pre-existing match). Pure logic, no rendering.
 
 import { BOARD_HEIGHT, BOARD_WIDTH, COLOR_COUNT, NEUTRAL_TILE_DROP_RATE, SHAPE_COUNT } from './constants';
+import {
+  SHAKE_PREVENT_MATCHES,
+  SHAKE_REMOVE_SPECIALS,
+  SHAKE_REPLACE,
+  ShakeParams,
+} from './data/content';
 import { detectMatches } from './match';
 import { Board, Cell, Pt, Tile } from './types';
 import type { RNG } from './rng';
@@ -94,13 +100,93 @@ export function hasAnyValidMove(board: Board): boolean {
   return findValidMove(board) !== null;
 }
 
-// Shared reshuffle core (spec 1.7, MK2.2 unification, revised by MK7.9):
-// both the player-paid board-shake AND the automatic deadlock reshuffle are
-// now PERMUTATIONS — the board's composition (which tiles exist) is preserved
-// exactly; only positions change. No shaking your way to more of a color you
-// need, no free composition reroll on deadlock, and a future tile-converting
-// ability's investment survives the shake. Special tiles persist with all
-// their data (they're the same Tile objects, just relocated).
+// Alpha 0.3.0 §8 — EFFECT_SHAKE. ONE authoritative Shake implementation, driven
+// entirely by the typed parameters resolved from Function data; there is no
+// competing hardcoded cost, ownership, parameter, or charge path (§8.1).
+//
+// Returns true when a valid final Datastream was produced and committed, false
+// for the LEGAL FIZZLE (§8.7): the Datastream is left completely unchanged, the
+// caller keeps the paid activation cost, and nothing about RNG ownership, turn
+// state, or input state is corrupted. All work happens on a scratch arrangement
+// and is committed only on success.
+export function shakeBoard(
+  state: { board: Board; rng: RNG; nextId: number },
+  params: ShakeParams,
+): boolean {
+  const cells: Pt[] = [];
+  for (let y = 0; y < BOARD_HEIGHT; y++) for (let x = 0; x < BOARD_WIDTH; x++) cells.push({ x, y });
+
+  // §8.3 REPLACE is destructive: the prior underlying Packet AND any special
+  // state on the tile are removed regardless of the specialGems parameter, so
+  // fresh ordinary Packets are generated. REARRANGE permutes the existing tile
+  // OBJECTS, preserving board membership and overall composition — positions
+  // change, which is the whole point ("preserve the underlying tile" never
+  // meant preserving its coordinate).
+  const replace = params.boardComposition === SHAKE_REPLACE;
+  const stripSpecials = params.specialGems === SHAKE_REMOVE_SPECIALS;
+  const preventMatches = params.matches === SHAKE_PREVENT_MATCHES;
+
+  const existing: Tile[] = [];
+  for (const row of state.board) for (const t of row) if (t) existing.push(t);
+  // A Shake over a board with holes is not a legal starting point (Shake is
+  // only reachable from a settled Datastream); fizzle rather than corrupt.
+  if (existing.length !== BOARD_WIDTH * BOARD_HEIGHT) return false;
+
+  for (let attempt = 0; attempt < 1000; attempt++) {
+    // Draft the arrangement without touching state.board.
+    const draft = emptyBoard();
+    let draftNextId = state.nextId;
+    if (replace) {
+      const gen = { rng: state.rng, nextId: draftNextId };
+      for (const p of cells) {
+        // ordinary Packets only — replacement never carries special state
+        draft[p.y][p.x] = randomTile(gen);
+      }
+      draftNextId = gen.nextId;
+    } else {
+      const order = existing.slice();
+      state.rng.shuffle(order);
+      let i = 0;
+      for (const p of cells) draft[p.y][p.x] = order[i++];
+    }
+
+    // §8.4 under REARRANGE: RETAIN moves each special object with its
+    // underlying Packet (automatic — same Tile objects, relocated), while
+    // REMOVE strips the overlay/state and keeps the ordinary Packet. Under
+    // REPLACE there is no prior state left to retain or strip.
+    if (stripSpecials && !replace) {
+      for (const p of cells) {
+        const t = draft[p.y][p.x];
+        if (t?.special) delete t.special;
+      }
+    }
+
+    // §8.5: when matches are PREVENTED the completed Shake must satisfy the
+    // normal post-generation invariants (no pre-existing Sync, at least one
+    // legal move) so no wave begins. When matches are ALLOWED the resulting
+    // Syncs are meant to resolve, so a pre-existing match is the desired state;
+    // playability is re-established by the post-resolution settle.
+    const ok = preventMatches
+      ? detectMatches(draft).length === 0 && hasAnyValidMove(draft)
+      : true;
+    if (ok) {
+      state.board = draft;
+      state.nextId = draftNextId;
+      return true;
+    }
+    // REPLACE burns fresh ids per attempt; keep the counter monotonic so tile
+    // identity never repeats across attempts.
+    state.nextId = draftNextId;
+  }
+  return false; // §8.7 legal fizzle — board untouched
+}
+
+// Shared reshuffle core (spec 1.7, MK2.2 unification, revised by MK7.9): the
+// automatic deadlock reshuffle is a PERMUTATION — the board's composition
+// (which tiles exist) is preserved exactly; only positions change. No free
+// composition reroll on deadlock, and a future tile-converting ability's
+// investment survives it. Special tiles persist with all their data (they're
+// the same Tile objects, just relocated).
 // Validity contract unchanged: >=1 valid move, NO pre-existing match, so the
 // re-permute-until-valid loop remains. Safeguard: if no valid permutation is
 // found within the attempt budget (pathologically skewed composition —

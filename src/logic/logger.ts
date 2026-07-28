@@ -11,7 +11,19 @@
 
 import { ContentStamp, GAME_VERSION, getContent } from './data/content';
 import { BattleMetrics } from './metrics';
-import { BattleConfig, GameEvent, GameState, Mode, NaturalOutcome, RunStep, Side, WizardAction, opponentOf } from './types';
+import {
+  BattleConfig,
+  BattleIdentity,
+  GameEvent,
+  GameState,
+  Mode,
+  NaturalOutcome,
+  RunStep,
+  SelectionSource,
+  Side,
+  WizardAction,
+  opponentOf,
+} from './types';
 
 // Version tag stamped on every log entry. Alpha 0.1.0: no active output path
 // may continue to emit a stale MK tag (§13.1).
@@ -30,6 +42,31 @@ interface SideDamage {
   total: number;
 }
 
+// Alpha 0.3.0 §21.2 — the selection/build identity every relevant record
+// carries. Derived from the battle's own BattleIdentity so a log entry can
+// never disagree with the battle it describes.
+export interface IdentityStamp {
+  hackerId: string;
+  deckId: string;
+  skillIds: string[];
+  deckFunctionId: string;
+  hackerPrograms: string[];
+  systemPrograms: string[];
+  selectionSource: SelectionSource;
+}
+
+export function identityStamp(id: BattleIdentity): IdentityStamp {
+  return {
+    hackerId: id.hackerId,
+    deckId: id.deckId,
+    skillIds: [...id.skillIds],
+    deckFunctionId: id.deckFunctionId,
+    hackerPrograms: [...id.hackerPrograms],
+    systemPrograms: [...id.systemPrograms],
+    selectionSource: id.selectionSource,
+  };
+}
+
 export interface TurnLogEntry {
   v: string; // LOG_VERSION
   fp: string; // content fingerprint (§13.2 attribution, compact form)
@@ -40,13 +77,15 @@ export interface TurnLogEntry {
   runStep?: RunStep;
   battleId: string;
   config: BattleConfig; // MK5.5 — active config; entries are uninterpretable without it
+  identity: IdentityStamp; // §21.2 — Hacker/Deck/Skill/build identity
   turn: number;
-  actions: string[]; // committed swaps, shakes, abilities fired (both sides)
+  actions: string[]; // committed swaps, Functions fired (both sides)
   damage: Record<Side, SideDamage>; // dealt BY each side this turn
   detonations: number;
   reshuffles: number;
+  lineClears: number; // §9.5 — observable board churn under the B1 rule
   hpAfter: Record<Side, number>;
-  chargesAfter: { player: number[]; enemy: number[]; shake: number };
+  chargesAfter: { player: number[]; enemy: number[]; deck: number };
   thinkMs?: number; // MK6.6 — RAW think-time for this turn's committed move
   hintShown?: boolean; // MK7.7
   result?: Side; // present on a battle's final entry: who won
@@ -66,8 +105,25 @@ export interface MetricLogEntry {
   mode: Mode;
   runStep?: RunStep; // RUN only
   encounterSystemHp?: number; // RUN only
+  identity: IdentityStamp; // §21.2
   wallClockMs?: number; // MK6.6 — total battle wall-clock (this session)
   metrics: BattleMetrics;
+}
+
+// Alpha 0.3.0 §21.2 — one record per COMMITTED selection event. Mere
+// preselection, screen viewing, and Back navigation are deliberately NOT
+// logged as committed choices.
+export interface SelectionLogEntry {
+  v: string; // LOG_VERSION
+  at: string; // ISO timestamp
+  event: 'HACKER_SELECTED' | 'DECK_SELECTED' | 'RUN_CREATED' | 'QUICK_MATCH_CREATED';
+  mode?: Mode;
+  runStep?: RunStep;
+  battleId?: string; // present once a battle exists
+  fp: string; // content fingerprint
+  identity: Partial<IdentityStamp>;
+  hackerMaxLink?: number;
+  systemMaxIce?: number;
 }
 
 // Alpha 0.2.0 §5.4/§13.4 — one record per explicit wizard invocation, kept
@@ -99,13 +155,15 @@ export class TurnLogger {
       fp: getContent().fingerprint,
       battleId: this.battleId,
       config: { ...state.config },
+      identity: identityStamp(state.identity),
       turn: state.turn,
       actions: [],
       damage: freshDamage(),
       detonations: 0,
       reshuffles: 0,
+      lineClears: 0,
       hpAfter: { player: 0, enemy: 0 },
-      chargesAfter: { player: [], enemy: [], shake: 0 },
+      chargesAfter: { player: [], enemy: [], deck: 0 },
     };
   }
 
@@ -118,17 +176,28 @@ export class TurnLogger {
         case 'swap':
           e.actions.push(`swap (${ev.a.x},${ev.a.y})->(${ev.b.x},${ev.b.y})`);
           break;
-        case 'shakeUsed':
-          e.actions.push('player board-shake');
-          break;
         case 'ability':
-          // Alpha: one action per parent Function activation, by display name.
-          e.actions.push(`${ev.side} fired ${ev.name} [${ev.fn}]`);
+          // One action per parent Function activation, by display name. §7.1:
+          // the Deck-owned Function is identified as Deck-owned in logs.
+          e.actions.push(`${ev.side} fired ${ev.name} [${ev.fn}]${ev.ownerKind === 'deck' ? ` (deck ${ev.programId})` : ''}`);
           break;
         case 'op':
           // §7.5: expanded ops log their outcome (drain amounts, fizzles).
           if (ev.drained !== undefined) e.actions.push(`${ev.side} ${ev.effectId} drained ${ev.drained}`);
           else if (!ev.resolved) e.actions.push(`${ev.side} ${ev.effectId} fizzled (${ev.fnId})`);
+          break;
+        case 'shake':
+          // §21.3 — Shake attempts and legal fizzles stay visible in the turn log.
+          e.actions.push(`${ev.side} EFFECT_SHAKE ${ev.resolved ? 'resolved' : 'fizzled (legal)'}`);
+          break;
+        case 'skill':
+          e.actions.push(
+            `${ev.side} skill ${ev.skillId} ${ev.effect}` +
+              `${ev.damage !== undefined ? ` +${ev.damage} dmg` : ''}${ev.charge !== undefined ? ` +${ev.charge} charge` : ''}`,
+          );
+          break;
+        case 'lineClear':
+          e.lineClears++;
           break;
         case 'placed':
           if (ev.count > 0) e.actions.push(`${ev.side} placed ${ev.count} ${ev.kind}${ev.count === 1 ? '' : 's'}`);
@@ -164,7 +233,7 @@ export class TurnLogger {
       e.chargesAfter = {
         player: state.units.player.map((u) => u.charge),
         enemy: state.units.enemy.map((u) => u.charge),
-        shake: state.shakeCharge,
+        deck: state.deckCharge,
       };
       if (state.winner) e.result = state.winner;
       done.push(e);
