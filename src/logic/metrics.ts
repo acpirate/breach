@@ -76,6 +76,11 @@ export interface SideMetrics {
   // MK5.6 — charge-source contention
   tilesDestroyed: number;
   contentionTiles: number;
+  // Alpha 0.4.1 §8.4 — total charge generated for this side that no active
+  // Program could absorb, summed across every routed stream. Replaces the old
+  // per-Program attribution of end-of-stream discard, which blamed whichever
+  // Program happened to sit at the bottom of the queue.
+  chargeDiscardedTotal: number;
   // MK6.7 — buffer damage added (disjoint bucket)
   bufferDamageAdded: number;
   // §9.5 — line-clear frequency, so board churn under the B1 rule is observable
@@ -88,6 +93,12 @@ export interface SideMetrics {
 export interface BattleMetrics {
   turns: number;
   autoReshuffles: number;
+  // Alpha 0.4.1 (designer ruling, 2026-08-01) — bomb detonations are an
+  // AGGREGATE counter here rather than a per-turn count or a discrete event
+  // stream, so BASIC can still answer "did this materially appear?" without
+  // retaining any per-turn records. Reshuffles and B1 line clears were already
+  // aggregated this way (autoReshuffles above, sides[].lineClears below).
+  detonations: number;
   winner: Side | null;
   thinkTimesMs: number[];
   hintsShown: number;
@@ -139,6 +150,7 @@ function emptySide(programIds: readonly string[]): SideMetrics {
     deepestCascade: 0,
     tilesDestroyed: 0,
     contentionTiles: 0,
+    chargeDiscardedTotal: 0,
     bufferDamageAdded: 0,
     lineClears: 0,
     units,
@@ -154,6 +166,7 @@ export function createBattleMetrics(
   return {
     turns: 0,
     autoReshuffles: 0,
+    detonations: 0,
     winner: null,
     thinkTimesMs: [],
     hintsShown: 0,
@@ -269,12 +282,22 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
       case 'lineClear':
         m.sides[ev.side].lineClears++;
         break;
+      // Alpha 0.4.1 §8.4 — routing discard no longer arrives here. What
+      // remains is GENUINE per-owner waste: the System's flat timer charge
+      // overflowing a Program's pool, and Deck charge overflowing its own.
       case 'chargeWaste': {
         const sm = m.sides[ev.side];
         if (ev.ownerKind === 'deck') sm.deck.chargeWasted += ev.amount;
         else unitOf(sm, ev.programId).chargeWasted += ev.amount;
         break;
       }
+      // §8.4 — one battle-level total, read straight off each routed stream.
+      case 'chargeRoute':
+        m.sides[ev.side].chargeDiscardedTotal += ev.discarded;
+        break;
+      case 'detonate':
+        m.detonations++;
+        break;
       case 'placed':
         if (ev.kind === 'bomb') {
           if (ev.ownerKind !== 'deck') unitOf(m.sides[ev.side], ev.programId).bombsPlaced += ev.count;

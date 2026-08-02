@@ -30,7 +30,19 @@ import {
 import { DataFiles, loadContent } from '../src/logic/data/load';
 import { DEFAULT_BATTLE_SETTINGS } from '../src/logic/constants';
 import { Game, nextBattleId } from '../src/logic/game';
-import { LOG_VERSION } from '../src/logic/logger';
+import {
+  BattleEventEntry,
+  LOGGING_LEVELS,
+  LOGGING_SCHEMA_VERSION,
+  LOG_BUDGET_BYTES,
+  LOG_VERSION,
+  LoggingLevel,
+  TurnLogEntry,
+  loggingLevel,
+  routeIsInteresting,
+  setLoggingLevel,
+} from '../src/logic/logger';
+import * as storage from '../src/storage';
 import { SAVE_VERSION } from '../src/logic/save';
 import { computeLineClears, detectMatches } from '../src/logic/match';
 import { StreamMap, addStream, routeChargeStream, routeStreams } from '../src/logic/resolve';
@@ -2865,6 +2877,301 @@ test('§20.9 metrics stay disjoint and reconcile with the new line-slice bucket'
   }
   assert(g.state.metrics.sides.player.linesliceDamage > 0, 'DATACUT damage landed in its own bucket');
   assert(g.state.metrics.sides.player.units['PRG_H_005'].effect > 0, 'and is attributed to NINJA');
+});
+
+// ============================================================================
+// Alpha 0.4.1 §20 — logging levels, route filtering, and the charge-waste
+// metric correction.
+// ============================================================================
+
+// Play a battle at a given logging level and collect exactly what the logger
+// would hand to the storage adapter.
+function capture(level: LoggingLevel, seed = 12, build?: string[]): { turns: TurnLogEntry[]; events: BattleEventEntry[]; g: Game } {
+  const previous = loggingLevel();
+  setLoggingLevel(level);
+  const g = build ? newGameWithBuild(build, seed) : newGame(seed);
+  const turns: TurnLogEntry[] = [];
+  const events: BattleEventEntry[] = [];
+  let safety = 0;
+  while (!g.state.winner && safety++ < 40) {
+    botFireAbilities(g);
+    if (g.state.winner) break;
+    const mv = botMove(g);
+    if (!mv) break;
+    g.attemptSwap(mv.a, mv.b);
+    if (!g.state.winner) g.runEnemyPhase();
+    if (!g.state.winner) g.startPlayerPhase();
+    turns.push(...g.drainTurnLogs());
+    events.push(...g.drainEventLogs());
+  }
+  turns.push(...g.drainTurnLogs());
+  events.push(...g.drainEventLogs());
+  setLoggingLevel(previous);
+  return { turns, events, g };
+}
+
+test('§20.1 BASIC keeps no turn stream; VERBOSE and COMPLETE do', () => {
+  const basic = capture('BASIC');
+  assert(basic.turns.length === 0, `BASIC must persist no ordinary turn records, got ${basic.turns.length}`);
+  assert(basic.events.length > 0, 'BASIC still persists high-value battle events');
+  const verbose = capture('VERBOSE');
+  assert(verbose.turns.length > 0, 'VERBOSE persists compact turn records');
+  const complete = capture('COMPLETE');
+  assert(complete.turns.length > 0, 'COMPLETE persists turn records');
+});
+
+test('§20.1/§20.2 turn records carry join keys and NO battle-static context', () => {
+  const { turns, g } = capture('VERBOSE');
+  for (const t of turns) {
+    assert(t.battleId === g.state.battleId, 'every turn joins to its battle by battleId');
+    assert(t.ls === LOGGING_SCHEMA_VERSION && t.lvl === 'VERBOSE', 'schema version and level are stamped');
+    const raw = t as unknown as Record<string, unknown>;
+    for (const banned of ['identity', 'config', 'fp', 'inventory', 'chargeRoutes', 'targeted', 'drains']) {
+      assert(raw[banned] === undefined, `turn records must not repeat ${banned}`);
+    }
+    assert(t.actions === undefined, 'VERBOSE drops the readable action mirror');
+  }
+  // COMPLETE keeps the readable mirror, still without battle-static context
+  const complete = capture('COMPLETE');
+  assert(complete.turns.some((t) => (t.actions?.length ?? 0) > 0), 'COMPLETE retains action mirrors');
+  for (const t of complete.turns) {
+    assert((t as unknown as Record<string, unknown>).identity === undefined, 'COMPLETE still joins rather than repeating identity');
+  }
+});
+
+test('§20.3 ordinary routes are filtered below COMPLETE; interesting ones are kept', () => {
+  const routesOf = (e: BattleEventEntry[]): BattleEventEntry[] => e.filter((x) => x.kind === 'ROUTE');
+  const basic = routesOf(capture('BASIC').events);
+  const complete = routesOf(capture('COMPLETE').events);
+  assert(complete.length > basic.length, `COMPLETE must retain more routes (${complete.length}) than BASIC (${basic.length})`);
+  // every BASIC-retained route satisfies the interest predicate
+  for (const r of basic) {
+    assert(routeIsInteresting(r.route!), 'BASIC retains only interesting routes');
+    assert(r.route!.order === undefined && r.route!.eligible === undefined, 'derivable fields are dropped below COMPLETE');
+  }
+  // and COMPLETE keeps the derivable fields for diagnosis
+  assert(complete.some((r) => r.route!.order && r.route!.eligible), 'COMPLETE retains order and eligible');
+  // the predicate itself
+  const base = { side: 'player' as const, axis: 'color' as const, token: 0, amount: 3, source: 'SYNC' as const, discarded: 0 };
+  assert(!routeIsInteresting({ ...base, assignments: [{ programId: 'A', before: 0, assigned: 3, after: 3, overflowOut: 0 }] }), 'one recipient, no discard is ordinary');
+  assert(routeIsInteresting({ ...base, discarded: 2, assignments: [{ programId: 'A', before: 5, assigned: 2, after: 7, overflowOut: 0 }] }), 'a discard is interesting');
+  assert(routeIsInteresting({ ...base, assignments: [
+    { programId: 'A', before: 0, assigned: 2, after: 2, overflowOut: 1 },
+    { programId: 'B', before: 0, assigned: 1, after: 1, overflowOut: 0 },
+  ] }), 'multiple recipients are interesting');
+  assert(routeIsInteresting({ ...base, source: 'SKILL_MODIFIED_SYNC', assignments: [{ programId: 'A', before: 0, assigned: 3, after: 3, overflowOut: 0 }] }), 'Skill-modified is interesting');
+  assert(routeIsInteresting({ ...base, source: 'EFFECT_DESTRUCTION', assignments: [{ programId: 'A', before: 0, assigned: 3, after: 3, overflowOut: 0 }] }), 'Effect-generated is interesting');
+});
+
+test('§20.3 retained route assignments stay arithmetically exact', () => {
+  for (const r of capture('COMPLETE').events.filter((e) => e.kind === 'ROUTE')) {
+    const route = r.route!;
+    let running = route.amount;
+    for (const a of route.assignments) {
+      assert(a.after === a.before + a.assigned, 'before + assigned = after');
+      running -= a.assigned;
+      assert(a.overflowOut === running, 'overflow passed onward is exact');
+    }
+    assert(running === route.discarded, 'amount = assigned + discarded');
+  }
+});
+
+test('§20.4 routing discard aggregates to a battle total, not to a Program', () => {
+  // A build where BOMBER and WEASEL share RED guarantees overflow and discard.
+  const { g, events } = capture('COMPLETE', 12, ['PRG_H_001', 'PRG_H_006', 'PRG_H_002', 'PRG_H_003']);
+  const routes = events.filter((e) => e.kind === 'ROUTE').map((e) => e.route!);
+  for (const side of ['player', 'enemy'] as const) {
+    const expected = routes.filter((r) => r.side === side).reduce((n, r) => n + r.discarded, 0);
+    assert(
+      g.state.metrics.sides[side].chargeDiscardedTotal === expected,
+      `${side}: battle total ${g.state.metrics.sides[side].chargeDiscardedTotal} must equal summed route discards ${expected}`,
+    );
+  }
+  assert(g.state.metrics.sides.player.chargeDiscardedTotal > 0, 'the overlapping build actually discarded charge');
+  // §8.4 — no Hacker Program absorbs routing discard any more. (System
+  // Programs may still show genuine waste from the flat timer-charge path.)
+  for (const id of Object.keys(g.state.metrics.sides.player.units)) {
+    assert(g.state.metrics.sides.player.units[id].chargeWasted === 0, `${id} must not be blamed for routing discard`);
+  }
+});
+
+test('§20.4 detonations, line clears and reshuffles survive as battle aggregates', () => {
+  // Designer ruling: these are counters on the metrics record, so BASIC can
+  // still answer "did this materially appear?" with no turn stream at all.
+  const { g } = capture('BASIC', 23);
+  const m = g.state.metrics;
+  assert(typeof m.detonations === 'number', 'detonations is a battle-level aggregate');
+  assert(typeof m.autoReshuffles === 'number', 'reshuffles remain a battle-level aggregate');
+  assert(typeof m.sides.player.lineClears === 'number', 'line clears remain per-side aggregates');
+  assert(m.detonations > 0, 'the sampled battle detonated at least one bomb');
+});
+
+test('§20.1 targeted and Drain telemetry survive at BASIC via the event stream', () => {
+  const { events } = capture('BASIC', 33, ['PRG_H_005', 'PRG_H_004', 'PRG_H_002', 'PRG_H_003']);
+  const targeted = events.filter((e) => e.kind === 'TARGETED');
+  assert(targeted.length > 0, 'DATACUT activations are persisted at BASIC');
+  const t = targeted[0].targeted!;
+  assert(t.fnId === 'FNC_011' && t.slicedCount > 0, 'the record carries Function and outcome');
+  assert(t.sliced === undefined, 'the full coordinate list is COMPLETE-only detail');
+  assert(targeted.every((e) => e.battleId && e.lvl === 'BASIC'), 'events join by battleId and carry their level');
+  const complete = capture('COMPLETE', 33, ['PRG_H_005', 'PRG_H_004', 'PRG_H_002', 'PRG_H_003']);
+  assert(
+    complete.events.filter((e) => e.kind === 'TARGETED').some((e) => (e.targeted!.sliced?.length ?? 0) > 0),
+    'COMPLETE retains sliced coordinates',
+  );
+});
+
+test('§20.8 a level change affects future records only', () => {
+  const previous = loggingLevel();
+  setLoggingLevel('BASIC');
+  const g = newGame(41);
+  const collected: TurnLogEntry[] = [];
+  let safety = 0;
+  while (!g.state.winner && safety++ < 6) {
+    const mv = botMove(g);
+    if (!mv) break;
+    g.attemptSwap(mv.a, mv.b);
+    if (!g.state.winner) g.runEnemyPhase();
+    if (!g.state.winner) g.startPlayerPhase();
+    collected.push(...g.drainTurnLogs());
+  }
+  assert(collected.length === 0, 'BASIC wrote no turn records');
+  setLoggingLevel('VERBOSE');
+  safety = 0;
+  while (!g.state.winner && safety++ < 6) {
+    const mv = botMove(g);
+    if (!mv) break;
+    g.attemptSwap(mv.a, mv.b);
+    if (!g.state.winner) g.runEnemyPhase();
+    if (!g.state.winner) g.startPlayerPhase();
+    collected.push(...g.drainTurnLogs());
+  }
+  assert(collected.length > 0, 'records written after the change use the new level');
+  assert(collected.every((t) => t.lvl === 'VERBOSE'), 'no retroactive relabelling of earlier records');
+  setLoggingLevel(previous);
+});
+
+// ---- §20.5/§20.7/§20.8 storage adapter (instrumented, no browser) ----
+// storage.ts resolves the free identifier `localStorage` at CALL time, so a
+// stub installed on globalThis exercises the real append/trim/quota paths.
+
+interface FakeStore {
+  data: Map<string, string>;
+  reads: number;
+  writes: number;
+  bytesWritten: number;
+  quota: number;
+  failNext: number;
+}
+
+function installFakeStorage(quota = 5 * 1024 * 1024): FakeStore {
+  const f: FakeStore = { data: new Map(), reads: 0, writes: 0, bytesWritten: 0, quota, failNext: 0 };
+  const api = {
+    get length(): number {
+      return f.data.size;
+    },
+    key: (i: number): string | null => [...f.data.keys()][i] ?? null,
+    getItem: (k: string): string | null => {
+      f.reads++;
+      return f.data.get(k) ?? null;
+    },
+    setItem: (k: string, v: string): void => {
+      if (f.failNext > 0) {
+        f.failNext--;
+        throw new Error('QuotaExceededError');
+      }
+      let total = v.length;
+      for (const [key, val] of f.data) if (key !== k) total += val.length;
+      if (total > f.quota) throw new Error('QuotaExceededError');
+      f.writes++;
+      f.bytesWritten += v.length;
+      f.data.set(k, v);
+    },
+    removeItem: (k: string): void => void f.data.delete(k),
+  };
+  (globalThis as unknown as { localStorage: unknown }).localStorage = api;
+  return f;
+}
+
+test('§20.8 legacy Alpha 0.4 turn logs are cleared once; other streams are retained', () => {
+  const f = installFakeStorage();
+  // a fat pre-0.4.1 turn record (no `ls` field) plus valid sibling streams
+  f.data.set('breach:log:turns', JSON.stringify([{ turn: 1, identity: {}, config: {}, chargeRoutes: [] }]));
+  f.data.set('breach:log:metrics', JSON.stringify([{ battleId: 'b1' }]));
+  f.data.set('breach:log:selection', JSON.stringify([{ event: 'RUN_CREATED' }]));
+  f.data.set('breach:log:wizard', JSON.stringify([{ action: 'WIZARD_FORCE_WIN' }]));
+  f.data.set('breach:save', 'THE-ACTIVE-SAVE');
+
+  const note = storage.migrateLegacyLogs();
+  assert(note && note.includes('cleared 1'), `expected a migration diagnostic, got ${note}`);
+  assert(!f.data.has('breach:log:turns'), 'the incompatible turn history is cleared');
+  assert(f.data.has('breach:log:metrics'), 'metrics are retained');
+  assert(f.data.has('breach:log:selection'), 'selection records are retained');
+  assert(f.data.has('breach:log:wizard'), 'wizard records are retained');
+  assert(f.data.get('breach:save') === 'THE-ACTIVE-SAVE', 'the active save is never touched by log migration');
+  // idempotent: a second startup is a no-op
+  assert(storage.migrateLegacyLogs() === null, 'migration runs once');
+});
+
+test('§20.8 the logging-level preference round-trips and falls back safely', () => {
+  installFakeStorage();
+  storage.saveLoggingLevel('COMPLETE');
+  assert(storage.loadLoggingLevel() === 'COMPLETE', 'a valid preference round-trips');
+  (globalThis as unknown as { localStorage: { setItem(k: string, v: string): void } }).localStorage.setItem(
+    'breach:log:meta',
+    JSON.stringify({ ls: 999, level: 'COMPLETE' }),
+  );
+  assert(storage.loadLoggingLevel() !== 'COMPLETE', 'a stale schema version falls back to the environment default');
+  (globalThis as unknown as { localStorage: { setItem(k: string, v: string): void } }).localStorage.setItem(
+    'breach:log:meta',
+    'not json',
+  );
+  assert(LOGGING_LEVELS.includes(storage.loadLoggingLevel()), 'a corrupt preference still yields a valid level');
+});
+
+test('§20.5 the byte budget trims before the write and never exceeds itself', () => {
+  const f = installFakeStorage();
+  const fat = (n: number): unknown[] => Array.from({ length: n }, (_, i) => ({ i, pad: 'x'.repeat(400) }));
+  // push far more than the 3 MiB budget through the lowest-priority stream
+  for (let round = 0; round < 12; round++) {
+    storage.appendEventLogs(fat(400) as never);
+    let total = 0;
+    for (const [k, v] of f.data) total += (k.length + v.length) * 2;
+    assert(total <= LOG_BUDGET_BYTES, `estimated footprint ${total} must stay within ${LOG_BUDGET_BYTES}`);
+  }
+  assert(f.data.has('breach:log:events'), 'the stream survives, trimmed rather than dropped');
+});
+
+test('§20.5 lower-priority streams are sacrificed before metrics', () => {
+  const f = installFakeStorage();
+  const pad = 'y'.repeat(2000);
+  storage.appendMetricsLog({ battleId: 'keep-me', pad } as never);
+  for (let i = 0; i < 40; i++) storage.appendEventLogs(Array.from({ length: 200 }, () => ({ pad })) as never);
+  const metrics = JSON.parse(f.data.get('breach:log:metrics') || '[]') as { battleId?: string }[];
+  assert(metrics.some((m) => m.battleId === 'keep-me'), 'the metrics record outlives the flood of low-priority events');
+});
+
+test('§20.7 a quota failure trims, retries once, then degrades without looping', () => {
+  const f = installFakeStorage();
+  f.failNext = 99; // every write throws, however much we trim
+  const before = f.writes;
+  for (let i = 0; i < 25; i++) storage.appendEventLogs([{ battleId: 'b', pad: 'z'.repeat(100) }] as never);
+  assert(f.writes === before, 'no write ever succeeded');
+  // the adapter must have STOPPED attempting rather than retrying every event
+  assert(f.failNext > 99 - 25 * 3, `expected bounded retry attempts, ${99 - f.failNext} throws observed`);
+});
+
+test('§16 wiping logs never touches the active save or preferences', () => {
+  const f = installFakeStorage();
+  f.data.set('breach:save', 'SAVE');
+  f.data.set('breach:config', 'SETTINGS');
+  f.data.set('breach:pref:constructed', 'PRESET');
+  storage.appendEventLogs([{ battleId: 'b' }] as never);
+  storage.wipeLogs();
+  assert(f.data.get('breach:save') === 'SAVE', 'active save survives');
+  assert(f.data.get('breach:config') === 'SETTINGS', 'menu settings survive');
+  assert(f.data.get('breach:pref:constructed') === 'PRESET', 'the Constructed preset survives');
+  assert(!f.data.has('breach:log:events'), 'log streams are cleared');
 });
 
 // ---- §22.10 UI and vocabulary (headless-checkable parts) ----

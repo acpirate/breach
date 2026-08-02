@@ -42,7 +42,17 @@ import type { TargetKind } from './logic/data/effects';
 import { formatIssue, loadContent } from './logic/data/load';
 import { findBotMove, findHintMove } from './logic/bot';
 import { Game } from './logic/game';
-import { LOG_VERSION, SelectionLogEntry, identityStamp } from './logic/logger';
+import {
+  LOGGING_LEVELS,
+  LOGGING_SCHEMA_VERSION,
+  LOG_VERSION,
+  METRICS_SCHEMA_VERSION,
+  LoggingLevel,
+  SelectionLogEntry,
+  identityStamp,
+  loggingLevel,
+  setLoggingLevel,
+} from './logic/logger';
 import { BattleMetrics } from './logic/metrics';
 import {
   BuildContext,
@@ -99,10 +109,14 @@ import { browserDataFiles } from './dataBrowser';
 import { attachInput } from './render/input';
 import { Hud, View } from './render/view';
 import {
+  appendEventLogs,
   appendMetricsLog,
   appendSelectionLog,
   appendTurnLogs,
   appendWizardLog,
+  loadLoggingLevel,
+  migrateLegacyLogs,
+  saveLoggingLevel,
   clearBattleSave,
   loadBattleJson,
   loadConstructedPreset,
@@ -303,6 +317,7 @@ function metricsElement(m: BattleMetrics): HTMLElement {
   row('BATTLE', true);
   row(`Turns to resolution: ${m.turns}`);
   row(`Sync-locks (auto-reshuffles): ${m.autoReshuffles}`);
+  row(`Detonations: ${m.detonations}`);
   row(`System shields — created ${m.enemyShieldCreated}, sliced ${m.enemyShieldRemoved}`);
   row(`Shielded hits: ${m.enemyShieldInstances}, damage prevented: ${fmt(m.enemyShieldPrevented)}`);
 
@@ -327,6 +342,9 @@ function metricsElement(m: BattleMetrics): HTMLElement {
     row(`Line clears: ${sm.lineClears}`);
     const contPct = sm.tilesDestroyed > 0 ? ((sm.contentionTiles / sm.tilesDestroyed) * 100).toFixed(1) : '0.0';
     row(`Opponent-bound Packets sliced: ${sm.contentionTiles} of ${sm.tilesDestroyed} (${contPct}%)`);
+    // §8.4 — charge that outran the whole active queue, counted once for the
+    // side rather than blamed on the bottom-most Program.
+    row(`Charge discarded (no Program could take it): ${fmt(sm.chargeDiscardedTotal)}`);
     for (const p of programsFor(side)) {
       const u = sm.units[p.id];
       if (!u) continue;
@@ -546,6 +564,34 @@ function configPanel(rerender: () => void): HTMLElement {
       saveMenuSettings(menuSettings);
     }
   });
+
+  // Alpha 0.4.1 §3.3 — logging level lives on the DEVELOPER surface, not among
+  // normal player settings, and is absent from production builds entirely.
+  if (import.meta.env.DEV) {
+    const dev = section('Developer — logging');
+    const note = document.createElement('div');
+    note.className = 'cfgnote';
+    note.textContent =
+      'BASIC keeps battle results only. VERBOSE adds compact per-turn records. ' +
+      'COMPLETE also keeps every charge route and readable action mirrors — short retention, diagnostics only.';
+    dev.appendChild(note);
+    for (const level of LOGGING_LEVELS) {
+      const l = document.createElement('label');
+      const radio = document.createElement('input');
+      radio.type = 'radio';
+      radio.name = 'logginglevel';
+      radio.checked = loggingLevel() === level;
+      radio.addEventListener('change', () => {
+        // §3.2 — future records only; nothing already retained is rewritten.
+        setLoggingLevel(level as LoggingLevel);
+        saveLoggingLevel(level as LoggingLevel);
+        rerender();
+      });
+      l.appendChild(radio);
+      l.appendChild(document.createTextNode(` ${level}`));
+      dev.appendChild(l);
+    }
+  }
 
   const reset = document.createElement('button');
   reset.className = 'cfgreset';
@@ -831,8 +877,11 @@ function persistBuildIfCommitted(): void {
 function afterAction(): void {
   if (!game || !session) return;
   const ctx = battleContext(session);
-  const entries = game.drainTurnLogs().map((e) => ({ ...e, mode: ctx.mode, ...(ctx.runStep !== undefined ? { runStep: ctx.runStep } : {}) }));
-  appendTurnLogs(entries);
+  const stamp = <T,>(e: T): T => ({ ...e, mode: ctx.mode, ...(ctx.runStep !== undefined ? { runStep: ctx.runStep } : {}) });
+  appendTurnLogs(game.drainTurnLogs().map(stamp));
+  // §4.3 — high-value events persist at every level, including BASIC where
+  // there is no turn stream for them to ride along in.
+  appendEventLogs(game.drainEventLogs().map(stamp));
   if (game.state.winner) {
     if (!pending) {
       pending = { natural: naturalOf(game.state.winner), metricsLogged: false };
@@ -849,8 +898,13 @@ function logBattleMetrics(): void {
   const ctx = battleContext(session);
   appendMetricsLog({
     v: LOG_VERSION,
+    ls: LOGGING_SCHEMA_VERSION,
+    ms: METRICS_SCHEMA_VERSION,
+    lvl: loggingLevel(),
     battleId: game.state.battleId,
     config: { ...game.state.config },
+    // §4.1 — the stamp is deduplicated by fingerprint at the storage boundary.
+    fp: getContent().fingerprint,
     content: contentStamp(),
     endedAt: new Date().toISOString(),
     winner: game.state.winner,
@@ -1762,6 +1816,13 @@ function showDataFailure(errors: number, warnings: number, lines: string[]): voi
 
 function boot(): void {
   menuSettings = loadMenuSettings();
+  // Alpha 0.4.1 §18 — clear the incompatible pre-0.4.1 turn history once, then
+  // §3.1 install the validated level (saved preference, else the environment
+  // default: BASIC in production, VERBOSE under `npm run dev`).
+  const migrated = migrateLegacyLogs();
+  if (migrated) console.info(`[breach] log migration: ${migrated}`);
+  setLoggingLevel(loadLoggingLevel());
+  console.info(`[breach] logging level ${loggingLevel()} (schema ${LOGGING_SCHEMA_VERSION})`);
 
   attachInput(canvas, view, {
     onTap(p: Pt): void {

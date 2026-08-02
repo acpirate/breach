@@ -29,7 +29,7 @@ import {
 } from './data/content';
 import { generateInitialBoard, shakeBoard, swap } from './board';
 import { pickBotMove } from './bot';
-import { TurnLogEntry, TurnLogger } from './logger';
+import { BattleEventEntry, TurnLogEntry, TurnLogger } from './logger';
 import { detectMatches } from './match';
 import { consumeEvents, createBattleMetrics } from './metrics';
 import {
@@ -199,11 +199,17 @@ export class Game {
   }
 
   // MK4.3 — the orchestrator drains finalized per-turn log entries after each
-  // action and hands them to the platform storage adapter.
+  // action and hands them to the platform storage adapter. Alpha 0.4.1 adds
+  // the battle-event stream (routes/targeted/drains), which is written at
+  // every logging level because BASIC keeps no turn records at all.
   drainTurnLogs(): TurnLogEntry[] {
     const out = this.pendingTurnLogs;
     this.pendingTurnLogs = [];
     return out;
+  }
+
+  drainEventLogs(): BattleEventEntry[] {
+    return this.logger.drainEvents();
   }
 
   // MK2.3/MK4.3 — every event batch a public action produces is routed

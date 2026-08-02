@@ -62,6 +62,8 @@ function report(label: string, group: BattleMetrics[]): void {
     console.log(`  Deepest cascade: avg ${f1(avg(s.map((x) => x.deepestCascade)))}, max ${max(s.map((x) => x.deepestCascade))}`);
     const contPcts = s.map((x) => (x.tilesDestroyed > 0 ? (x.contentionTiles / x.tilesDestroyed) * 100 : 0));
     console.log(`  Contention: ${f1(avg(s.map((x) => x.contentionTiles)))} opp-bound tiles of ${f1(avg(s.map((x) => x.tilesDestroyed)))} destroyed (avg ${f1(avg(contPcts))}%)`);
+    // Alpha 0.4.1 §8.4 — charge generated that no active Program could absorb.
+    console.log(`  Charge discarded by routing: ${f1(avg(s.map((x) => x.chargeDiscardedTotal)))}`);
     // Alpha §21.3: per-Program rows by stable ID, display name joined here
     for (const p of programsFor(side)) {
       // Alpha 0.4.0 §5.8 — an inactive inventory Program has no metrics slot in

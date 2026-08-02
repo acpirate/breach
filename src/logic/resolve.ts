@@ -381,14 +381,12 @@ export function routeChargeStream(
     discarded: remaining,
   });
 
-  // The surviving per-Program `chargeWasted` metric: a discard is charged to
-  // the BOTTOM-MOST compatible Program, whose fullness is what ended the
-  // stream. With no compatible Program at all the discard belongs to no
-  // Program and is visible only in the routing event above.
-  if (remaining > 0 && eligibleIdx.length) {
-    const last = order[eligibleIdx[eligibleIdx.length - 1]];
-    waste.set(last, (waste.get(last) ?? 0) + remaining);
-  }
+  // Alpha 0.4.1 §8.4 — end-of-stream discard is NOT attributed to any Program.
+  // Alpha 0.4 charged it to the bottom-most compatible Program, which reads as
+  // "that Program wasted charge" when in fact the stream simply outran the
+  // whole queue. It now aggregates into a battle-level total, collected by
+  // metrics.ts straight off the routing event's `discarded` field above.
+  void waste;
 }
 
 // Route a whole wave's streams in the canonical order (§10.3).
