@@ -12,16 +12,22 @@ import {
   EFFECT_PARAM_NAMES,
   EffectParamName,
   EffectTupleField,
+  TargetKind,
   effectContract,
   isEffectId,
 } from './effects';
 import { SkillEffectId, SkillParamKind, isSkillEffectId, skillContract, skillEffectIds } from './skills';
 import {
+  ACTIVE_BUILD_SIZE,
+  BombParams,
   DATA_SCHEMA_VERSION,
   DEFAULT_DECK_ID,
   DEFAULT_HACKER_ID,
   EffectParams,
   GAME_VERSION,
+  INVENTORY_SIZE,
+  LineSliceParams,
+  PORTFOLIO_SIZE,
   PlanOp,
   ResolvedContent,
   ResolvedDeck,
@@ -30,6 +36,7 @@ import {
   ResolvedProgram,
   ResolvedSkill,
   ShakeParams,
+  TARGETING_TARGETED,
 } from './content';
 import { Color, Shape, Side } from '../types';
 
@@ -136,21 +143,37 @@ const FUNCTION_HEADER = [
   'params',
   'startCharged',
 ];
-const HACKER_HEADER = ['HAK_ID', 'name', 'BASE_LINK', 'STRONG_COLORS', 'STRONG_SHAPES', 'SKILL', 'BIO', 'GRAPHICS'];
+// §4.4/§4.5 — Alpha 0.4 activates PRG_SET on both identity datasets.
+const HACKER_HEADER = ['HAK_ID', 'name', 'BASE_LINK', 'STRONG_COLORS', 'STRONG_SHAPES', 'PRG_SET', 'SKILL', 'BIO', 'GRAPHICS'];
 const SKILL_HEADER = ['SKILL_ID', 'skill_effect', 'params', 'display'];
-const DECK_HEADER = ['DEK_ID', 'name', 'ADD_LINK', 'FUNCTIONS', 'DESCRIPT', 'GRAPHICS'];
+const DECK_HEADER = ['DEK_ID', 'name', 'ADD_LINK', 'PRG_SET', 'FUNCTIONS', 'DESCRIPT', 'GRAPHICS'];
 
 // Required Alpha record IDs (their VALUES are validated by the schema/contract
 // rules; per designer ruling the dataset is the final authority on the values).
 const REQUIRED_FNC_IDS = [
   'FNC_001', 'FNC_002', 'FNC_003', 'FNC_004', 'FNC_005',
   'FNC_006', 'FNC_007', 'FNC_008', 'FNC_009', 'FNC_010',
+  // Alpha 0.4.0 §4.7 — DATACUT and PLINK
+  'FNC_011', 'FNC_012',
 ];
-const REQUIRED_PRG_H_IDS = ['PRG_H_001', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004'];
+// Alpha 0.4.0 — NINJA and WEASEL complete the six-Program inventory.
+const REQUIRED_PRG_H_IDS = ['PRG_H_001', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004', 'PRG_H_005', 'PRG_H_006'];
 const REQUIRED_PRG_S_IDS = ['PRG_S_001', 'PRG_S_002', 'PRG_S_003', 'PRG_S_004'];
 const REQUIRED_HAK_IDS = ['HAK_01'];
 const REQUIRED_SKL_IDS = ['SKL_001', 'SKL_002'];
 const REQUIRED_DEK_IDS = ['DEK_01'];
+
+// ---- Alpha 0.4.0 §4.2 spreadsheet-safe value normalization ----
+
+// Spreadsheets prefix a cell with a single apostrophe to force text mode, so
+// `'0:1:0:0:1` and `'7` survive editing as literal strings. Remove EXACTLY one
+// leading apostrophe: a second one is data (`''VALUE` -> `'VALUE`), and
+// embedded or trailing apostrophes are never touched. This runs BEFORE the
+// trim, so a quoted-then-padded cell normalizes the same way an unquoted one
+// does — which is what makes fingerprints agree across the two authorings.
+export function stripLeadingApostrophe(raw: string): string {
+  return raw.startsWith("'") ? raw.slice(1) : raw;
+}
 
 // ---- numeric parsing (§6.2 rules) ----
 
@@ -202,6 +225,7 @@ interface HackerRow {
   baseLink: number;
   strongColors: Color[];
   strongShapes: Shape[];
+  portfolio: string[]; // §4.4 — ordered PRG_SET
   skillIds: string[];
   bio: string;
   graphics: string;
@@ -225,6 +249,7 @@ interface DeckRow {
   id: string;
   name: string;
   addLink: number;
+  portfolio: string[]; // §4.5 — ordered PRG_SET
   functionId: string;
   descript: string;
   graphics: string;
@@ -277,7 +302,11 @@ export function loadContent(files: DataFiles): LoadResult {
     const idx = new Map(header.map((h, i) => [h, i] as const));
     const rows = parsed.rows.slice(1).map((r) => ({
       line: r.line,
-      get: (col: string): string => r.fields[idx.get(col)!] ?? '',
+      // Alpha 0.4.0 §4.2 — spreadsheet-safe normalization happens HERE, once,
+      // for every data cell of every dataset, before any field-specific
+      // trimming, parsing, resolution, validation, or fingerprinting. Header
+      // names keep their Alpha 0.3 handling (trim only), as §4.2 permits.
+      get: (col: string): string => stripLeadingApostrophe(r.fields[idx.get(col)!] ?? ''),
     }));
     for (const r of parsed.rows.slice(1)) {
       if (r.fields.length !== header.length) {
@@ -368,6 +397,24 @@ export function loadContent(files: DataFiles): LoadResult {
       out.push(t);
     }
     return ok ? out : null;
+  };
+
+  // §4.4/§4.5 — an ordered Program portfolio: exactly PORTFOLIO_SIZE distinct
+  // valid PRG_H_* references. Authored order is preserved and is gameplay
+  // significant, so this deliberately does NOT sort or deduplicate silently.
+  const parsePortfolio = (raw: string, ctx: Ctx & { field: string }): string[] | null => {
+    const ids = parseRefList(raw, 'PRG_H_', ctx, false);
+    if (ids === null) return null;
+    if (ids.length !== PORTFOLIO_SIZE) {
+      err({
+        ...ctx,
+        value: raw.trim(),
+        expected: `exactly ${PORTFOLIO_SIZE} PRG_H_* references`,
+        reason: `PRG_SET must contain exactly ${PORTFOLIO_SIZE} distinct Programs`,
+      });
+      return null;
+    }
+    return ids;
   };
 
   const checkName = (raw: string, ctx: Ctx): string | null => {
@@ -657,9 +704,10 @@ export function loadContent(files: DataFiles): LoadResult {
         const baseLink = readInt(r.get('BASE_LINK'), { ...ctx, field: 'BASE_LINK' }, 1, 9999);
         const strongColors = parseTokenList(r.get('STRONG_COLORS'), COLOR_TOKENS, { ...ctx, field: 'STRONG_COLORS' });
         const strongShapes = parseTokenList(r.get('STRONG_SHAPES'), SHAPE_TOKENS, { ...ctx, field: 'STRONG_SHAPES' });
+        const portfolio = parsePortfolio(r.get('PRG_SET'), { ...ctx, field: 'PRG_SET' });
         // duplicates permitted: repeated qualifying Skills stack additively
         const skillIds = parseRefList(r.get('SKILL'), 'SKL_', { ...ctx, field: 'SKILL' }, true);
-        if (name === null || baseLink === null || strongColors === null || strongShapes === null || skillIds === null) continue;
+        if (name === null || baseLink === null || strongColors === null || strongShapes === null || portfolio === null || skillIds === null) continue;
         hackerRows.push({
           file: files.hackers.name,
           row: r.line,
@@ -668,6 +716,7 @@ export function loadContent(files: DataFiles): LoadResult {
           baseLink,
           strongColors,
           strongShapes,
+          portfolio,
           skillIds,
           // §2.12 placeholders: retained verbatim, never interpreted
           bio: r.get('BIO').trim(),
@@ -697,6 +746,7 @@ export function loadContent(files: DataFiles): LoadResult {
         }
         const name = checkName(r.get('name'), ctx);
         const addLink = readInt(r.get('ADD_LINK'), { ...ctx, field: 'ADD_LINK' }, 0, 9999);
+        const portfolio = parsePortfolio(r.get('PRG_SET'), { ...ctx, field: 'PRG_SET' });
         // §4.5 — Alpha 0.3 requires EXACTLY one Function; more than one is an error
         const fnRefs = parseRefList(r.get('FUNCTIONS'), 'FNC_', { ...ctx, field: 'FUNCTIONS' }, false);
         let functionId: string | null = null;
@@ -707,13 +757,14 @@ export function loadContent(files: DataFiles): LoadResult {
             functionId = fnRefs[0];
           }
         }
-        if (name === null || addLink === null || functionId === null) continue;
+        if (name === null || addLink === null || portfolio === null || functionId === null) continue;
         deckRows.push({
           file: files.decks.name,
           row: r.line,
           id,
           name,
           addLink,
+          portfolio,
           functionId,
           descript: r.get('DESCRIPT').trim(),
           graphics: r.get('GRAPHICS').trim(),
@@ -853,9 +904,31 @@ export function loadContent(files: DataFiles): LoadResult {
     const out: EffectParams = {};
     let ok = true;
     const required = new Set<EffectParamName>(contract.required);
+    const optional = new Set<EffectParamName>(contract.optional ?? []);
     for (const col of EFFECT_PARAM_NAMES) {
       const raw = f.params[col];
       const isRequired = required.has(col);
+      // §14.3 — an OPTIONAL column is validated when supplied and simply
+      // absent otherwise. Blank is meaningful (immediate Bomb resolution), so
+      // it is neither an error nor a populated-but-unused warning.
+      if (!isRequired && optional.has(col) && col !== 'areaPattern') {
+        const parsed = parseIntField(raw);
+        if (!parsed.present) continue;
+        if (parsed.invalid || parsed.value === undefined) {
+          err({ ...ctx, field: col, value: raw.trim(), expected: 'non-negative integer', reason: `invalid ${col} for ${p.effectId}` });
+          ok = false;
+          continue;
+        }
+        // countdown 0 is explicitly "resolve immediately" (§14.3); a negative
+        // value cannot reach here because the integer syntax rejects the sign.
+        if (parsed.value > 9999) {
+          err({ ...ctx, field: col, value: raw.trim(), expected: '0-9999', reason: 'parameter out of range' });
+          ok = false;
+          continue;
+        }
+        out[col] = parsed.value;
+        continue;
+      }
       if (col === 'areaPattern') {
         const t = raw.trim();
         if (isRequired) {
@@ -902,7 +975,19 @@ export function loadContent(files: DataFiles): LoadResult {
       } else {
         const vals = readTuple(f.tupleRaw, contract.tuple, { ...ctx, field: 'params' });
         if (!vals) ok = false;
-        else if (p.effectId === 'EFFECT_SHAKE') {
+        else if (p.effectId === 'EFFECT_BOMB') {
+          // §14.2 — all three values are mandatory; readTuple has already
+          // enforced exact length and per-field range.
+          out.bomb = { targeting: vals[0], dealDamage: vals[1], gainCharge: vals[2] } as BombParams;
+        } else if (p.effectId === 'EFFECT_LINESLICE') {
+          out.line = {
+            dimension: vals[0],
+            targeting: vals[1],
+            specialRetention: vals[2],
+            dealDamage: vals[3],
+            gainCharge: vals[4],
+          } as LineSliceParams;
+        } else if (p.effectId === 'EFFECT_SHAKE') {
           const shake: ShakeParams = {
             boardComposition: vals[0] as ShakeParams['boardComposition'],
             specialGems: vals[1] as ShakeParams['specialGems'],
@@ -921,6 +1006,21 @@ export function loadContent(files: DataFiles): LoadResult {
       }
     } else if (f.tupleRaw !== '') {
       warn({ ...ctx, field: 'params', value: f.tupleRaw, reason: `populated parameter is unused by ${p.effectId}` });
+    }
+    // §12.3 — a PLAYER-TARGETED configuration deploys exactly once. Quantity
+    // above one would mean accumulating several player-chosen targets, which
+    // is deferred multi-target behavior and explicitly out of scope (§22).
+    // Random targeting may still deploy more than once.
+    const targeting = out.bomb?.targeting ?? out.line?.targeting;
+    if (targeting === TARGETING_TARGETED && (out.quantity ?? 1) !== 1) {
+      err({
+        ...ctx,
+        field: 'quantity',
+        value: String(out.quantity),
+        expected: '1',
+        reason: `a targeted ${p.effectId} must have quantity 1 (multi-target selection is out of scope)`,
+      });
+      ok = false;
     }
     if (ok) fnParams.set(f.id, out);
   }
@@ -945,7 +1045,80 @@ export function loadContent(files: DataFiles): LoadResult {
     }
   }
 
+  // ---- Alpha 0.4.0 §4.6 — portfolio references and combined inventory ----
+
+  const hackerProgramIds = new Set(uniquePrograms.filter((p) => p.dataset === 'hacker-programs').map((p) => p.id));
+  const portfolioOk = new Map<string, boolean>(); // by HAK_/DEK_ id
+  const checkPortfolioRefs = (
+    id: string,
+    portfolio: string[],
+    ctx: { dataset: DatasetName; file: string; row: number },
+  ): void => {
+    let ok = true;
+    for (const pid of portfolio) {
+      if (!hackerProgramIds.has(pid)) {
+        err({ ...ctx, id, field: 'PRG_SET', value: pid, expected: 'a loaded PRG_H_* Program', reason: 'PRG_SET references an unknown Hacker Program ID' });
+        ok = false;
+      }
+    }
+    portfolioOk.set(id, ok);
+  };
+  for (const h of uniqueHackers) checkPortfolioRefs(h.id, h.portfolio, { dataset: 'hackers', file: h.file, row: h.row });
+  for (const d of uniqueDecks) checkPortfolioRefs(d.id, d.portfolio, { dataset: 'decks', file: d.file, row: d.row });
+
+  // §4.6 — because every Deck is compatible with every Hacker (§2.7), EVERY
+  // pairing must be able to produce a valid six-Program inventory. Overlap
+  // between a Hacker and a Deck portfolio is a startup content error: Alpha
+  // 0.4 has no owned Program instances and no duplicate copies of one PRG_ID
+  // (§2.2), so the pairing simply could not yield six distinct Programs.
+  for (const h of uniqueHackers) {
+    if (!portfolioOk.get(h.id)) continue;
+    for (const d of uniqueDecks) {
+      if (!portfolioOk.get(d.id)) continue;
+      const overlap = h.portfolio.filter((pid) => d.portfolio.includes(pid));
+      if (overlap.length) {
+        err({
+          dataset: 'content',
+          file: files.decks.name,
+          id: d.id,
+          field: 'PRG_SET',
+          value: overlap.join(':'),
+          reason: `Hacker ${h.id} and Deck ${d.id} portfolios overlap — the pairing cannot produce ${INVENTORY_SIZE} distinct Programs`,
+        });
+        continue;
+      }
+      const combined = new Set([...h.portfolio, ...d.portfolio]);
+      if (combined.size !== INVENTORY_SIZE) {
+        err({
+          dataset: 'content',
+          file: files.hackers.name,
+          id: `${h.id}/${d.id}`,
+          reason: `combined inventory resolves ${combined.size} distinct Programs, expected ${INVENTORY_SIZE}`,
+        });
+      } else if (h.portfolio.length < ACTIVE_BUILD_SIZE / 2 || d.portfolio.length < ACTIVE_BUILD_SIZE / 2) {
+        // §4.13 — content that cannot produce the required default build.
+        err({
+          dataset: 'content',
+          file: files.hackers.name,
+          id: `${h.id}/${d.id}`,
+          reason: `pairing cannot produce the default ${ACTIVE_BUILD_SIZE}-Program build from portfolio order`,
+        });
+      }
+    }
+  }
+
   // ---- Phase 9 — expand composites, targeting constraints (§7.3) ----
+
+  // §12/§13.2/§14.2 — resolve THIS row's targeting requirement. An Effect is
+  // targeted either always (Drain) or because its typed tuple says so
+  // (Bomb/LineSlice with targeting=1). Resolved once here so neither
+  // validation nor combat ever re-reads the raw tuple.
+  const resolveTarget = (effectId: string, params: EffectParams): TargetKind | null => {
+    const contract = effectContract(effectId)!;
+    if (contract.targeted) return contract.targetKind ?? 'unit';
+    const targeting = params.bomb?.targeting ?? params.line?.targeting;
+    return targeting === TARGETING_TARGETED ? (contract.targetKind ?? 'packet') : null;
+  };
 
   const buildPlan = (fnId: string): PlanOp[] | null => {
     const payload = payloads.get(fnId);
@@ -953,7 +1126,8 @@ export function loadContent(files: DataFiles): LoadResult {
     if (payload.kind === 'leaf') {
       const params = fnParams.get(fnId);
       if (!params) return null;
-      return [{ fnId, effectId: payload.effectId! as PlanOp['effectId'], params }];
+      const effectId = payload.effectId! as PlanOp['effectId'];
+      return [{ fnId, effectId, params, target: resolveTarget(effectId, params) }];
     }
     const plan: PlanOp[] = [];
     for (const child of payload.children!) {
@@ -969,9 +1143,12 @@ export function loadContent(files: DataFiles): LoadResult {
     const plan = buildPlan(f.id);
     if (!plan) continue; // upstream errors already reported
     const ctx = { dataset: 'functions' as const, file: f.file, row: f.row, id: f.id, field: 'payload' };
+    // §7.3 — payload-order validation now reads the RESOLVED per-op target, so
+    // a Bomb row configured for random placement is correctly not targeted
+    // while the same Effect configured for player selection is.
     const targetedIdxs = plan
       .map((op, i) => ({ op, i }))
-      .filter(({ op }) => effectContract(op.effectId)!.targeted);
+      .filter(({ op }) => op.target !== null);
     const drainCount = plan.filter((op) => op.effectId === 'EFFECT_DRAIN').length;
     let ok = true;
     if (drainCount > 1) {
@@ -1119,6 +1296,7 @@ export function loadContent(files: DataFiles): LoadResult {
       weakShapes,
       skillIds: h.skillIds,
       skills: h.skillIds.map((sid) => skills.get(sid)!),
+      portfolioProgramIds: h.portfolio,
       bio: h.bio,
       graphics: h.graphics,
     });
@@ -1132,6 +1310,7 @@ export function loadContent(files: DataFiles): LoadResult {
       addLink: d.addLink,
       functionId: d.functionId,
       fn: functions.get(d.functionId)!,
+      portfolioProgramIds: d.portfolio,
       descript: d.descript,
       graphics: d.graphics,
     });
@@ -1190,20 +1369,36 @@ function computeFingerprint(
         shake: op.params.shake
           ? [op.params.shake.boardComposition, op.params.shake.specialGems, op.params.shake.matches, op.params.shake.cascades]
           : null,
+        // §4.12 — the Alpha 0.4 typed tuples and the resolved targeting they
+        // select are gameplay-affecting and therefore fingerprinted.
+        bomb: op.params.bomb ? [op.params.bomb.targeting, op.params.bomb.dealDamage, op.params.bomb.gainCharge] : null,
+        line: op.params.line
+          ? [
+              op.params.line.dimension,
+              op.params.line.targeting,
+              op.params.line.specialRetention,
+              op.params.line.dealDamage,
+              op.params.line.gainCharge,
+            ]
+          : null,
+        tgt: op.target,
       };
     }),
   }));
   const progNorm = (list: ResolvedProgram[]): unknown =>
     list.map((p) => ({ id: p.id, side: p.side, colors: [...p.colors], shapes: [...p.shapes], fn: p.functionId }));
+  // §4.12 — portfolio ORDER is mandatory fingerprint input: it determines the
+  // default build and the inventory's source display.
   const hakNorm = byId(hackers).map((h) => ({
     id: h.id,
     link: h.baseLink,
     sc: [...h.strongColors],
     ss: [...h.strongShapes],
     skills: [...h.skillIds],
+    prg: [...h.portfolioProgramIds],
   }));
   const sklNorm = byId(skills).map((s) => ({ id: s.id, effect: s.effectType, color: s.color, mag: s.magnitude }));
-  const dekNorm = byId(decks).map((d) => ({ id: d.id, add: d.addLink, fn: d.functionId }));
+  const dekNorm = byId(decks).map((d) => ({ id: d.id, add: d.addLink, fn: d.functionId, prg: [...d.portfolioProgramIds] }));
   const areas = [...usedAreas].sort().map((id) => ({ id, cells: AREA_PATTERNS[id as keyof typeof AREA_PATTERNS] }));
   const canonical = JSON.stringify({
     schema: DATA_SCHEMA_VERSION,

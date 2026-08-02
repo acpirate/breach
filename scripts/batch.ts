@@ -10,14 +10,14 @@ import { defaultIdentity } from '../src/logic/session';
 import { BattleSettings } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { initContentOrExit } from './dataNode';
-import { D, newBattle } from './harness';
+import { D, defaultActiveBuild, defaultInventory, newBattle } from './harness';
 
 initContentOrExit();
 
 const N = 100;
 
-function playOne(seed: number, settings: BattleSettings): BattleMetrics {
-  const g = newBattle(settings, seed);
+function playOne(seed: number, settings: BattleSettings, build?: string[]): BattleMetrics {
+  const g = newBattle(settings, seed, build ?? defaultActiveBuild(), build ? 'PLAYER_EDITED' : 'DEFAULT');
   g.startPlayerPhase();
   let safety = 0;
   while (!g.state.winner && safety++ < 2000) {
@@ -45,10 +45,12 @@ function report(label: string, group: BattleMetrics[]): void {
   for (const side of ['player', 'enemy'] as const) {
     const s = group.map((m) => m.sides[side]);
     console.log(`--- ${side.toUpperCase()} (averages per battle) ---`);
-    const abilityPcts = s.map((x) => (x.totalDamage > 0 ? ((x.attackerDamage + x.bombDamage) / x.totalDamage) * 100 : 0));
-    // MK7.3/7.4 + §11.3: five DISJOINT causal buckets
-    // (sync + bomb + atk + buffer + skill = total)
-    console.log(`  Total damage: ${f1(avg(s.map((x) => x.totalDamage)))}  [sync ${f1(avg(s.map((x) => x.matchDamage)))} | bomb ${f1(avg(s.map((x) => x.bombDamage)))} | atk ${f1(avg(s.map((x) => x.attackerDamage)))} | buffer ${f1(avg(s.map((x) => x.bufferDamageAdded)))} | skill ${f1(avg(s.map((x) => x.skillDamage)))}]  Function share ${f1(avg(abilityPcts))}%`);
+    const abilityPcts = s.map((x) =>
+      x.totalDamage > 0 ? ((x.attackerDamage + x.bombDamage + x.linesliceDamage) / x.totalDamage) * 100 : 0,
+    );
+    // MK7.3/7.4 + §11.3 + §15.3: SIX DISJOINT causal buckets
+    // (sync + bomb + atk + slice + buffer + skill = total)
+    console.log(`  Total damage: ${f1(avg(s.map((x) => x.totalDamage)))}  [sync ${f1(avg(s.map((x) => x.matchDamage)))} | bomb ${f1(avg(s.map((x) => x.bombDamage)))} | atk ${f1(avg(s.map((x) => x.attackerDamage)))} | slice ${f1(avg(s.map((x) => x.linesliceDamage)))} | buffer ${f1(avg(s.map((x) => x.bufferDamageAdded)))} | skill ${f1(avg(s.map((x) => x.skillDamage)))}]  Function share ${f1(avg(abilityPcts))}%`);
     console.log(`  Cascade (RNG-refill) damage, any cause: ${f1(avg(s.map((x) => x.cascadeDamage)))}`);
     console.log(`  Sync dmg by axis: color ${f1(avg(s.map((x) => x.matchDamageColor)))} / shape ${f1(avg(s.map((x) => x.matchDamageShape)))}`);
     // §9.5 — line-clear frequency, so B1 board churn is observable
@@ -62,6 +64,10 @@ function report(label: string, group: BattleMetrics[]): void {
     console.log(`  Contention: ${f1(avg(s.map((x) => x.contentionTiles)))} opp-bound tiles of ${f1(avg(s.map((x) => x.tilesDestroyed)))} destroyed (avg ${f1(avg(contPcts))}%)`);
     // Alpha §21.3: per-Program rows by stable ID, display name joined here
     for (const p of programsFor(side)) {
+      // Alpha 0.4.0 §5.8 — an inactive inventory Program has no metrics slot in
+      // any battle of this cell; printing a row of zeroes for it would read as
+      // "it did nothing" rather than "it was not in the build".
+      if (!s.some((x) => x.units[p.id])) continue;
       const fires = avg(s.map((x) => x.units[p.id]?.fires ?? 0));
       const effect = avg(s.map((x) => x.units[p.id]?.effect ?? 0));
       const wasted = avg(s.map((x) => x.units[p.id]?.chargeWasted ?? 0));
@@ -92,16 +98,20 @@ function report(label: string, group: BattleMetrics[]): void {
   }
 }
 
-function runMode(label: string, settings: BattleSettings): void {
+function runMode(label: string, settings: BattleSettings, build?: string[]): void {
   const results: BattleMetrics[] = [];
-  for (let seed = 1; seed <= N; seed++) results.push(playOne(seed, settings));
+  for (let seed = 1; seed <= N; seed++) results.push(playOne(seed, settings, build));
   const won = results.filter((m) => m.winner === 'player');
   const lost = results.filter((m) => m.winner === 'enemy');
-  const probe = newBattle(settings, 1);
+  const active = build ?? defaultActiveBuild();
+  const probe = newBattle(settings, 1, active, 'DEFAULT');
   console.log(`\n############################################################`);
   console.log(`#  ${label}`);
   console.log(`#  BOT WIN RATE: ${won.length}/${N} won, ${lost.length}/${N} lost (${((won.length / N) * 100).toFixed(1)}% wins)`);
   console.log(`#  Hacker LINK ${probe.state.config.playerHp} vs System ICE ${probe.state.config.enemyHp}, seeds 1-${N}`);
+  // Alpha 0.4.0 — the ACTIVE BUILD is now a variable of the simulation, so
+  // every record states which four Programs (and in what order) produced it.
+  console.log(`#  Active build: ${active.join(' > ')}`);
   console.log(`############################################################`);
   report('BATTLES THE HACKER WON', won);
   report('BATTLES THE HACKER LOST', lost);
@@ -118,8 +128,18 @@ console.log(`functions: ${stamp.functions.map((f) => `${f.id}=${f.cost}`).join('
 console.log(`identity: ${ids.hackerId}/${ids.deckId} (${ids.selectionSource}) skills=[${stamp.skills.join(', ')}]`);
 console.log(`fingerprint: ${getContent().fingerprint}`);
 
+console.log(`inventory: ${defaultInventory().join(', ')}`);
+
 // Alpha matrix: data-driven costs (7/8/10/9) across the main modes
 runMode('DEFAULT (cap-0, data costs, Normal LINK)', { ...D });
 runMode('SYSTEM_MATCHING ON', { ...D, enemyMatching: true });
 runMode('REINFORCED_CONNECTION ON (charge-aware bot)', { ...D, reinforcedConnection: true });
 runMode('REINFORCED_CONNECTION + SYSTEM_MATCHING (charge-aware bot)', { ...D, reinforcedConnection: true, enemyMatching: true });
+
+// Alpha 0.4.0 — the default build leaves NINJA and WEASEL in the inventory, so
+// these two cells are what actually exercise DATACUT, PLINK, and overlapping
+// charge bindings (WEASEL shares RED with BOMBER and CIR with DISABLER). The
+// second ordering is the same four Programs with WEASEL moved to the top, so
+// the reports can be read against each other to see routing priority move.
+runMode('ALPHA 0.4 BUILD — NINJA/WEASEL active', { ...D }, ['PRG_H_005', 'PRG_H_006', 'PRG_H_001', 'PRG_H_004']);
+runMode('ALPHA 0.4 BUILD — WEASEL first (charge priority flipped)', { ...D }, ['PRG_H_006', 'PRG_H_001', 'PRG_H_004', 'PRG_H_005']);

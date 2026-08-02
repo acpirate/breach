@@ -1,2 +1,2 @@
-DEK_ID,name,ADD_LINK,FUNCTIONS,DESCRIPT,GRAPHICS
-DEK_01,AGIMA,50,FNC_010,deck description goes here,graphics reference goes here
+DEK_ID,name,ADD_LINK,PRG_SET,FUNCTIONS,DESCRIPT,GRAPHICS
+DEK_01,AGIMA,50,PRG_H_003:PRG_H_004:PRG_H_006,FNC_010,deck description goes here,graphics reference goes here

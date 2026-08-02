@@ -10,17 +10,24 @@
 //         attributable without duplicating the full content identity.
 
 import { ContentStamp, GAME_VERSION, getContent } from './data/content';
+import type { EffectId } from './data/effects';
 import { BattleMetrics } from './metrics';
 import {
   BattleConfig,
   BattleIdentity,
+  BuildOrigin,
+  ChargeAssignment,
+  ChargeStreamSource,
   GameEvent,
   GameState,
   Mode,
   NaturalOutcome,
+  Pt,
+  Readiness,
   RunStep,
   SelectionSource,
   Side,
+  TileView,
   WizardAction,
   opponentOf,
 } from './types';
@@ -39,6 +46,7 @@ interface SideDamage {
   match: number;
   attacker: number;
   bomb: number;
+  lineslice: number; // Alpha 0.4.0 §15.3 — its own disjoint bucket
   total: number;
 }
 
@@ -50,9 +58,11 @@ export interface IdentityStamp {
   deckId: string;
   skillIds: string[];
   deckFunctionId: string;
-  hackerPrograms: string[];
+  hackerPrograms: string[]; // Alpha 0.4.0 — the ordered ACTIVE build
+  inventory: string[]; // §18.2 — the ordered six-Program inventory
   systemPrograms: string[];
   selectionSource: SelectionSource;
+  buildOrigin: BuildOrigin; // §18.3
 }
 
 export function identityStamp(id: BattleIdentity): IdentityStamp {
@@ -62,9 +72,62 @@ export function identityStamp(id: BattleIdentity): IdentityStamp {
     skillIds: [...id.skillIds],
     deckFunctionId: id.deckFunctionId,
     hackerPrograms: [...id.hackerPrograms],
+    inventory: [...id.inventory],
     systemPrograms: [...id.systemPrograms],
     selectionSource: id.selectionSource,
+    buildOrigin: id.buildOrigin,
   };
+}
+
+// ---- Alpha 0.4.0 structured per-turn records ----
+// These extend the ESTABLISHED turn entry rather than opening parallel log
+// streams (§11/§18.6). `actions` keeps its human-readable line per event; the
+// records below carry the machine-analyzable detail.
+
+// §11 — enough to reconstruct priority, skipping, fill, overflow and discard.
+export interface ChargeRouteRecord {
+  side: Side;
+  axis: 'color' | 'shape';
+  token: number;
+  amount: number;
+  source: ChargeStreamSource;
+  sourceId?: string;
+  order: string[];
+  eligible: string[];
+  assignments: ChargeAssignment[];
+  discarded: number;
+}
+
+// §18.5 — one per targeted Function activation.
+export interface TargetedRecord {
+  side: Side;
+  programId: string;
+  fnId: string;
+  effectId: EffectId;
+  target: Pt | null;
+  targetTile: TileView | null;
+  dimension?: 'row' | 'column';
+  slicedCount: number;
+  sliced: Pt[];
+  retainedCount: number;
+  directDamage: number;
+  directCharge: number;
+  resolved: boolean;
+  reason?: string;
+}
+
+// §16.4 — one per ACTUAL Drain activation. A withheld System activation is
+// not an activation and is deliberately absent here.
+export interface DrainRecord {
+  side: Side;
+  programId: string; // the activating Program
+  fnId: string;
+  targetProgramId: string;
+  readiness: Readiness;
+  chargeBefore: number;
+  chargeAfter: number;
+  targetCost: number;
+  removed: number;
 }
 
 export interface TurnLogEntry {
@@ -84,6 +147,11 @@ export interface TurnLogEntry {
   detonations: number;
   reshuffles: number;
   lineClears: number; // §9.5 — observable board churn under the B1 rule
+  // Alpha 0.4.0 §11/§16.4/§18.5 structured detail (empty arrays are omitted
+  // from the persisted entry by the writer below to keep volume down).
+  chargeRoutes?: ChargeRouteRecord[];
+  targeted?: TargetedRecord[];
+  drains?: DrainRecord[];
   hpAfter: Record<Side, number>;
   chargesAfter: { player: number[]; enemy: number[]; deck: number };
   thinkMs?: number; // MK6.6 — RAW think-time for this turn's committed move
@@ -116,7 +184,18 @@ export interface MetricLogEntry {
 export interface SelectionLogEntry {
   v: string; // LOG_VERSION
   at: string; // ISO timestamp
-  event: 'HACKER_SELECTED' | 'DECK_SELECTED' | 'RUN_CREATED' | 'QUICK_MATCH_CREATED';
+  // Alpha 0.4.0 §18.3 — build events extend this ESTABLISHED committed-choice
+  // stream. Mere modal opens, preselection, and Back navigation remain
+  // deliberately unlogged.
+  event:
+    | 'HACKER_SELECTED'
+    | 'DECK_SELECTED'
+    | 'RUN_CREATED'
+    | 'QUICK_MATCH_CREATED'
+    | 'BUILD_OPENED'
+    | 'BUILD_REPLACE'
+    | 'BUILD_REORDER'
+    | 'BATTLE_BUILD_APPLIED';
   mode?: Mode;
   runStep?: RunStep;
   battleId?: string; // present once a battle exists
@@ -124,6 +203,20 @@ export interface SelectionLogEntry {
   identity: Partial<IdentityStamp>;
   hackerMaxLink?: number;
   systemMaxIce?: number;
+  // §18.2/§18.3 — portfolio, inventory and build context.
+  hackerPortfolio?: string[];
+  deckPortfolio?: string[];
+  inventory?: string[];
+  inventorySources?: string[];
+  buildContext?: 'INITIAL_RUN' | 'RUN_BETWEEN' | 'RUN_RETRY' | 'CONSTRUCTED_QUICK_MATCH' | 'RANDOM_QUICK_MATCH';
+  buildOrigin?: BuildOrigin;
+  buildBefore?: string[];
+  build?: string[];
+  buildEdited?: boolean; // was the final build changed during this Build visit
+  // §18.4 — Random Quick Match reproducibility. This is the SETUP random
+  // source only; the battle seeds its gameplay RNG independently.
+  setupSeed?: number;
+  gameplayRngIndependent?: true;
 }
 
 // Alpha 0.2.0 §5.4/§13.4 — one record per explicit wizard invocation, kept
@@ -140,8 +233,8 @@ export interface WizardLogEntry {
 }
 
 const freshDamage = (): Record<Side, SideDamage> => ({
-  player: { match: 0, attacker: 0, bomb: 0, total: 0 },
-  enemy: { match: 0, attacker: 0, bomb: 0, total: 0 },
+  player: { match: 0, attacker: 0, bomb: 0, lineslice: 0, total: 0 },
+  enemy: { match: 0, attacker: 0, bomb: 0, lineslice: 0, total: 0 },
 });
 
 export class TurnLogger {
@@ -162,6 +255,9 @@ export class TurnLogger {
       detonations: 0,
       reshuffles: 0,
       lineClears: 0,
+      chargeRoutes: [],
+      targeted: [],
+      drains: [],
       hpAfter: { player: 0, enemy: 0 },
       chargesAfter: { player: [], enemy: [], deck: 0 },
     };
@@ -185,6 +281,56 @@ export class TurnLogger {
           // §7.5: expanded ops log their outcome (drain amounts, fizzles).
           if (ev.drained !== undefined) e.actions.push(`${ev.side} ${ev.effectId} drained ${ev.drained}`);
           else if (!ev.resolved) e.actions.push(`${ev.side} ${ev.effectId} fizzled (${ev.fnId})`);
+          // §16.4 — full Disabler target telemetry on the actual activation.
+          if (ev.targetProgramId !== undefined) {
+            e.drains!.push({
+              side: ev.side,
+              programId: ev.programId,
+              fnId: ev.fnId,
+              targetProgramId: ev.targetProgramId,
+              readiness: ev.targetReadiness!,
+              chargeBefore: ev.targetChargeBefore!,
+              chargeAfter: ev.targetChargeAfter!,
+              targetCost: ev.targetCost!,
+              removed: ev.drained ?? 0,
+            });
+          }
+          break;
+        case 'chargeRoute':
+          e.chargeRoutes!.push({
+            side: ev.side,
+            axis: ev.axis,
+            token: ev.token,
+            amount: ev.amount,
+            source: ev.streamSource,
+            ...(ev.sourceId ? { sourceId: ev.sourceId } : {}),
+            order: ev.order,
+            eligible: ev.eligible,
+            assignments: ev.assignments,
+            discarded: ev.discarded,
+          });
+          break;
+        case 'targeted':
+          e.targeted!.push({
+            side: ev.side,
+            programId: ev.programId,
+            fnId: ev.fnId,
+            effectId: ev.effectId,
+            target: ev.target,
+            targetTile: ev.targetTile,
+            ...(ev.dimension ? { dimension: ev.dimension } : {}),
+            slicedCount: ev.sliced.length,
+            sliced: ev.sliced,
+            retainedCount: ev.retained.length,
+            directDamage: ev.directDamage,
+            directCharge: ev.directCharge,
+            resolved: ev.resolved,
+            ...(ev.reason ? { reason: ev.reason } : {}),
+          });
+          e.actions.push(
+            `${ev.side} ${ev.effectId} ${ev.resolved ? `targeted (${ev.target!.x},${ev.target!.y})` : `fizzled — ${ev.reason ?? 'no target'}`}` +
+              (ev.resolved ? ` — sliced ${ev.sliced.length}, retained ${ev.retained.length}` : ''),
+          );
           break;
         case 'shake':
           // §21.3 — Shake attempts and legal fizzles stay visible in the turn log.
@@ -236,6 +382,11 @@ export class TurnLogger {
         deck: state.deckCharge,
       };
       if (state.winner) e.result = state.winner;
+      // Keep quiet turns small: an empty structured array carries no
+      // information and would otherwise triple the size of a plain swap turn.
+      if (!e.chargeRoutes!.length) delete e.chargeRoutes;
+      if (!e.targeted!.length) delete e.targeted;
+      if (!e.drains!.length) delete e.drains;
       done.push(e);
       this.current = state.winner ? null : this.fresh(state);
     }

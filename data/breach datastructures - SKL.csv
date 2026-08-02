@@ -1,3 +1,3 @@
 SKILL_ID,skill_effect,params,display
-SKL_001,SKL_EXTRA_MATCH_DAMAGE,RED:1,Deal %1 extra damage on a %0 Sync
-SKL_002,SKL_EXTRA_MATCH_CHARGE,RED:1,Gain %1 extra charge on a %0 Sync
+SKL_001,SKL_EXTRA_MATCH_DAMAGE,RED:1,Deal %1 extra damage on a %0 sync
+SKL_002,SKL_EXTRA_MATCH_CHARGE,RED:1,Gain %1 extra charge on a %0 sync

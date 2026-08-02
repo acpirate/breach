@@ -24,6 +24,16 @@ export type WizardAction = 'WIZARD_FORCE_WIN' | 'WIZARD_RESTART_LOST_BATTLE' | '
 // Match records defaulted identity; New Run records an explicit selection.
 export type SelectionSource = 'EXPLICIT_SELECTION' | 'QUICK_MATCH_DEFAULT';
 
+// Alpha 0.4.0 §18.3 — where the ordered active build came from. Recorded on
+// the battle and in logs so an analyst can separate a default build from an
+// edited one without diffing Program lists.
+export type BuildOrigin =
+  | 'DEFAULT' // derived from portfolio order (§5.4)
+  | 'RANDOM' // Random Quick Match, isolated setup RNG (§9.2)
+  | 'REMEMBERED_CONSTRUCTED' // the stored Constructed preset (§9.4)
+  | 'CARRIED_RUN' // carried forward from the previous Run battle (§8.4)
+  | 'PLAYER_EDITED'; // any of the above, then changed on the Build screen
+
 // Concrete whitebox identities for the 6 colors and 6 shapes (agent discretion,
 // approved): colors are six maximally-separated primary/secondary hues; shapes
 // are six simple canvas-drawable glyphs.
@@ -41,6 +51,12 @@ export interface Special {
   areaPattern?: AreaPatternId; // bombs only — blast footprint from Function data
   magnitude?: number; // buff/shield only — per-tile bonus/shield points from data
   programId?: string; // placing Program (metrics/logging attribution)
+  // Alpha 0.4.0 §14.2 — a countdown bomb detonates turns after it was placed,
+  // so its Function's typed damage/charge selections travel WITH the overlay
+  // rather than being looked up from whatever is firing at detonation time.
+  fnId?: string; // bombs only — the Function that placed it (attribution)
+  dealDamage?: 0 | 1; // bombs only
+  gainCharge?: 0 | 1; // bombs only
   seq: number; // global placement order — bombs tick oldest-first
 }
 
@@ -119,9 +135,19 @@ export interface BattleIdentity {
   deckId: string;
   skillIds: string[]; // ordered; duplicates are meaningful (§6.4)
   deckFunctionId: string;
-  hackerPrograms: string[]; // ordered stable PRG_H_* IDs
+  // Alpha 0.4.0 §5.3 — the ACTIVE BUILD: exactly four distinct inventory
+  // Programs in explicit top-to-bottom order. This order is authoritative for
+  // battle display, charge routing, Disabler target state, and save/restore —
+  // it is never an unordered set and never the full Program roster.
+  hackerPrograms: string[];
+  // §5.2 — the fixed six-Program Run/Quick Match inventory the build was drawn
+  // from, in Hacker-portfolio-then-Deck-portfolio order. Retained on the
+  // battle so a save can be revalidated without re-deriving it from content
+  // that may since have changed (§17.2).
+  inventory: string[];
   systemPrograms: string[]; // ordered stable PRG_S_* IDs
   selectionSource: SelectionSource;
+  buildOrigin: BuildOrigin; // §18.3
 }
 
 export interface GameState {
@@ -177,6 +203,36 @@ export function gridViewOf(board: Board): (TileView | null)[][] {
 // Runtime, save, targeting, metrics, and logs must distinguish them.
 export type OwnerKind = 'program' | 'deck';
 
+// Alpha 0.4.0 §12 — what the player picked for a targeted activation. A
+// Function needs zero targets, exactly one opposing Program slot (Drain), or
+// exactly one Packet coordinate. There is deliberately no target LIST, no
+// counter, and no partial multi-target state (§12.1).
+export type ActivationTarget = { kind: 'unit'; idx: number } | { kind: 'packet'; p: Pt };
+
+// ---- Alpha 0.4.0 §11 charge-routing telemetry ----
+
+// Where a routed charge stream came from. Distinguishes an initial Sync from
+// a cascade wave, a Skill-inflated Sync, and explicit Effect destruction, so
+// allocation can be reconstructed per cause (§11).
+export type ChargeStreamSource = 'SYNC' | 'CASCADE' | 'SKILL_MODIFIED_SYNC' | 'EFFECT_DESTRUCTION';
+
+export interface ChargeAssignment {
+  programId: string;
+  before: number;
+  assigned: number;
+  after: number;
+  overflowOut: number; // what was passed DOWN to the next eligible Program
+}
+
+// §16.4 — auditable readiness of a Drain target at target-resolution time.
+export type Readiness = 'READY' | 'CHARGING' | 'EMPTY';
+
+// Alpha 0.4.0 §15.3 — the DISJOINT causal damage buckets. `lineslice` is its
+// own bucket rather than a generic catch-all so DATACUT stays separable from
+// base Sync damage, Bomb damage, and Attack damage; totals must still equal
+// the sum of the attributed contributions.
+export type DamageSource = 'match' | 'attacker' | 'bomb' | 'lineslice';
+
 export type GameEvent =
   | { t: 'swap'; a: Pt; b: Pt }
   | { t: 'revert'; a: Pt; b: Pt }
@@ -199,7 +255,7 @@ export type GameEvent =
   // Program for Function-caused damage (attacker fire / bomb detonation);
   // skillRaw = the Hacker-Skill portion of `amount`, its own disjoint bucket
   // (Alpha 0.3.0 §6.4/§11.3 — never merged into base Sync damage).
-  | { t: 'damage'; target: Side; amount: number; label: string; source: 'match' | 'attacker' | 'bomb'; programId?: string; critExtra?: number; buffBonus?: number; colorRaw?: number; shapeRaw?: number; cascadeRaw?: number; skillRaw?: number }
+  | { t: 'damage'; target: Side; amount: number; label: string; source: DamageSource; programId?: string; fnId?: string; effectId?: EffectId; critExtra?: number; buffBonus?: number; colorRaw?: number; shapeRaw?: number; cascadeRaw?: number; skillRaw?: number }
   | { t: 'msg'; text: string }
   | { t: 'over'; winner: Side }
   // Alpha §7.5/§13.4 — one per parent Function ACTIVATION (the paid event);
@@ -209,14 +265,51 @@ export type GameEvent =
   // / Effect execution). resolved=false is a LEGAL fizzle (no valid target or
   // placement); unexpected exceptions are implementation failures and
   // propagate through the failure boundary instead of appearing here.
-  | { t: 'op'; side: Side; ownerKind: OwnerKind; programId: string; fnId: string; effectId: EffectId; resolved: boolean; drained?: number }
+  // Alpha 0.4.0 §16.4 — an actual Drain activation carries full target
+  // telemetry on this ESTABLISHED event rather than in a parallel stream:
+  // which Program was hit, how ready it was, and the exact charge delta.
+  | {
+      t: 'op'; side: Side; ownerKind: OwnerKind; programId: string; fnId: string; effectId: EffectId; resolved: boolean;
+      drained?: number;
+      targetProgramId?: string;
+      targetReadiness?: Readiness;
+      targetChargeBefore?: number;
+      targetChargeAfter?: number;
+      targetCost?: number;
+    }
+  // Alpha 0.4.0 §11 — one per routed charge stream. Emitted BEFORE the
+  // aggregated chargeWaste event so an analyst can verify priority, skipping,
+  // fill, downward overflow, and final discard rather than only a total.
+  | {
+      t: 'chargeRoute'; side: Side; axis: 'color' | 'shape'; token: number; amount: number;
+      streamSource: ChargeStreamSource;
+      sourceId?: string; // Skill or Function ID where one owns the stream
+      order: string[]; // ordered ACTIVE Program IDs at routing time
+      eligible: string[]; // of those, the ones compatible with this token
+      assignments: ChargeAssignment[];
+      discarded: number; // overflow with nowhere left to go
+    }
+  // Alpha 0.4.0 §18.5 — one per targeted Function activation, capturing the
+  // chosen coordinate and the Packet's properties BEFORE mutation.
+  | {
+      t: 'targeted'; side: Side; ownerKind: OwnerKind; programId: string; fnId: string; effectId: EffectId;
+      target: Pt | null; // null when no valid coordinate could be resolved
+      targetTile: TileView | null; // color/shape/special as they were pre-slice
+      dimension?: 'row' | 'column'; // EFFECT_LINESLICE only
+      sliced: Pt[]; // coordinates destroyed by the DIRECT operation
+      retained: Pt[]; // specials deliberately left in place (§13.2)
+      directDamage: number;
+      directCharge: number;
+      resolved: boolean;
+      reason?: string; // legal-fizzle / failure context when resolved is false
+    }
   // MK9.1/9.2/9.3 — bombs or shield tiles actually placed by one activation
   // (may be fewer than requested if the Datastream lacks legal targets).
   | { t: 'placed'; side: Side; ownerKind: OwnerKind; kind: 'bomb' | 'shield'; count: number; programId: string }
   // MK9.3 — one per shield-affected damage instance. preShield = base+buff
   // before absorption; shield = total active defender shield; prevented =
   // min(preShield, shield); final = preShield - prevented (the dealt amount).
-  | { t: 'shield'; target: Side; source: 'match' | 'attacker' | 'bomb'; preShield: number; shield: number; prevented: number; final: number }
+  | { t: 'shield'; target: Side; source: DamageSource; preShield: number; shield: number; prevented: number; final: number }
   // MK9.3 — shield tiles removed from the Datastream this event (synced,
   // cascaded, or blasted away).
   | { t: 'shieldRemoved'; count: number }

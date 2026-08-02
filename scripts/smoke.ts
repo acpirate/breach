@@ -200,11 +200,17 @@ function testSaveRoundTrip(): void {
   assert(!g.state.winner, 'battle still in progress at save point');
   assert(g.state.metrics.thinkTimesMs.length === 3, 'raw think-times must be recorded per move');
   assert(g.state.metrics.hintsShown === 1, 'hint-shown count must be recorded');
-  const info = { mode: 'QUICK_MATCH' as const, identity: defaultIdentity() };
+  const info = {
+    mode: 'QUICK_MATCH' as const,
+    identity: defaultIdentity(),
+    build: [...g.state.identity.hackerPrograms],
+    buildOrigin: g.state.identity.buildOrigin,
+  };
   const json = serializeSession(info, g, null);
   const r = deserializeSession(json);
   assert(r, 'valid save must deserialize');
   assert(r.info.mode === 'QUICK_MATCH' && r.pending === null, 'mode and phase survive');
+  assert(r.game, 'an active Quick Match save restores a battle');
   assert(serializeSession(r.info, r.game, r.pending) === json, 'restored session must re-serialize identically');
   assert(r.game.state.turn === g.state.turn && r.game.state.battleId === g.state.battleId, 'turn/battleId survive');
   assert(r.game.state.config.playerHp === 222 && r.game.state.config.enemyHp === 333, 'manual LINK/ICE survive the round trip');
@@ -213,6 +219,16 @@ function testSaveRoundTrip(): void {
   assert(r.game.state.identity.hackerId === 'HAK_01' && r.game.state.identity.deckId === 'DEK_01', 'identity survives');
   assert(r.game.state.identity.deckFunctionId === 'FNC_010', 'Deck Function ID survives');
   assert(r.game.state.deckCharge === g.state.deckCharge, 'Deck Function charge survives exactly');
+  // Alpha 0.4.0 §17.5 — the exact ordered active build and its source survive
+  assert(
+    r.game.state.identity.hackerPrograms.join(':') === g.state.identity.hackerPrograms.join(':'),
+    'ordered active build survives the round trip',
+  );
+  assert(
+    r.game.state.identity.inventory.join(':') === g.state.identity.inventory.join(':'),
+    'six-Program inventory survives the round trip',
+  );
+  assert(r.game.state.identity.buildOrigin === g.state.identity.buildOrigin, 'build source survives');
   let safety = 0;
   const rg = r.game;
   while (!rg.state.winner && safety++ < 600) {
@@ -225,8 +241,8 @@ function testSaveRoundTrip(): void {
     if (!rg.state.winner) rg.startPlayerPhase();
   }
   assert(rg.state.winner, 'restored game plays to completion');
-  // §17.1: pre-Alpha-0.3.0 saves reject cleanly (no migration, no partial load)
-  for (const old of ['mk9', 'alpha-0.1.0', 'alpha-0.2.0']) {
+  // §17.1: pre-Alpha-0.4.0 saves reject cleanly (no migration, no partial load)
+  for (const old of ['mk9', 'alpha-0.1.0', 'alpha-0.2.0', 'alpha-0.3.0']) {
     const preAlpha = JSON.parse(json) as { version: string };
     preAlpha.version = old;
     assert(deserializeSession(JSON.stringify(preAlpha)) === null, `${old} save -> no save`);
@@ -241,7 +257,7 @@ function testSaveRoundTrip(): void {
   console.log('save round-trip OK');
 }
 
-assert(SAVE_VERSION === 'alpha-0.3.0', 'save version must be alpha-0.3.0');
+assert(SAVE_VERSION === 'alpha-0.4.0', 'save version must be alpha-0.4.0');
 console.log(`content fingerprint: ${getContent().fingerprint}`);
 console.log(`default identity LINK: ${defaultHackerLink()} (deck function cost ${DECK_COST})`);
 

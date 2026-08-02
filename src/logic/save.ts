@@ -10,7 +10,7 @@
 
 import { BOARD_HEIGHT, BOARD_WIDTH, COLOR_COUNT, SHAPE_COUNT } from './constants';
 import { isAreaPatternId } from './data/areas';
-import { GAME_VERSION, getContent } from './data/content';
+import { GAME_VERSION, getContent, inventoryProgramIds, isValidBuild } from './data/content';
 import { Game } from './game';
 import { makeRNG } from './rng';
 import { BattleIdentity, BattleSettings, GameState } from './types';
@@ -71,7 +71,9 @@ export function isValidIdentity(raw: unknown): boolean {
   if (typeof id.hackerId !== 'string' || typeof id.deckId !== 'string') return false;
   if (typeof id.deckFunctionId !== 'string') return false;
   if (!isStringArray(id.skillIds) || !isStringArray(id.hackerPrograms) || !isStringArray(id.systemPrograms)) return false;
+  if (!isStringArray(id.inventory)) return false;
   if (id.selectionSource !== 'EXPLICIT_SELECTION' && id.selectionSource !== 'QUICK_MATCH_DEFAULT') return false;
+  if (typeof id.buildOrigin !== 'string') return false;
   const c = getContent();
   const hacker = c.hackers.get(id.hackerId);
   const deck = c.decks.get(id.deckId);
@@ -81,10 +83,16 @@ export function isValidIdentity(raw: unknown): boolean {
   if (id.skillIds.some((s, i) => s !== hacker.skillIds[i])) return false;
   if (id.skillIds.some((s) => !c.skills.has(s))) return false;
   if (id.deckFunctionId !== deck.fn.id) return false;
-  // ordered Program rosters must match the resolved content contract (§5.3)
-  const orderOk = (saved: string[], programs: ReadonlyArray<{ id: string }>): boolean =>
-    saved.length === programs.length && saved.every((pid, i) => pid === programs[i].id);
-  return orderOk(id.hackerPrograms, c.hacker) && orderOk(id.systemPrograms, c.system);
+  // Alpha 0.4.0 §17.2 — the saved inventory must be exactly what this
+  // Hacker/Deck pairing derives from CURRENT portfolio content, and the saved
+  // build must be a valid ordered four drawn from it. A save whose Program
+  // references have drifted is incompatible, never silently defaulted.
+  const inventory = inventoryProgramIds(id.hackerId, id.deckId);
+  if (id.inventory.length !== inventory.length) return false;
+  if (id.inventory.some((pid, i) => pid !== inventory[i])) return false;
+  if (!isValidBuild(id.hackerPrograms, id.inventory)) return false;
+  // the System roster still comes from the content contract (§5.3)
+  return id.systemPrograms.length === c.system.length && id.systemPrograms.every((pid, i) => pid === c.system[i].id);
 }
 
 export type PlainGameState = Omit<GameState, 'rng'> & { rngState: number };
@@ -133,19 +141,23 @@ export function restoreGameState(raw: unknown, concluded: boolean): Game | null 
     // §17.3 — explicit Hacker/Deck/Skill/build identity, verified against the
     // resolved content contract before anything else is trusted.
     if (!isValidIdentity(s.identity)) return null;
-    // Restore by stable IDs against current resolved definitions — slot order
-    // and IDs must match the loaded content exactly (§7.2 order round-trip).
+    // Restore by stable IDs — Alpha 0.4.0 §17.2: the battle's roster is the
+    // ORDERED ACTIVE BUILD (Hacker) and the content contract (System). Slot
+    // order and IDs must round-trip exactly, and each charge must sit within
+    // its own Program's pool.
     const content = getContent();
     const sides = [
-      { units: s.units?.player, programs: content.hacker },
-      { units: s.units?.enemy, programs: content.system },
+      { units: s.units?.player, programIds: s.identity.hackerPrograms },
+      { units: s.units?.enemy, programIds: content.system.map((p) => p.id) },
     ];
-    for (const { units, programs } of sides) {
-      if (!Array.isArray(units) || units.length !== programs.length) return null;
-      for (let i = 0; i < programs.length; i++) {
+    for (const { units, programIds } of sides) {
+      if (!Array.isArray(units) || units.length !== programIds.length) return null;
+      for (let i = 0; i < programIds.length; i++) {
         const u = units[i];
-        if (!u || u.programId !== programs[i].id) return null;
-        if (!(Number.isInteger(u.charge) && u.charge >= 0 && u.charge <= programs[i].chargeCap)) return null;
+        if (!u || u.programId !== programIds[i]) return null;
+        const prog = content.programsById.get(programIds[i]);
+        if (!prog) return null;
+        if (!(Number.isInteger(u.charge) && u.charge >= 0 && u.charge <= prog.chargeCap)) return null;
       }
     }
     // §7.2 — the Deck Function's exact current charge, capped at its cost.

@@ -11,36 +11,49 @@
 // carries its own independent charge pool and is identified as Deck-owned
 // (never as a PRG_H_*) in runtime, save, targeting, metrics, and logs (§7.1).
 
-import { ENEMY_TIMER_CHARGE_RATE } from './constants';
-import { AreaPatternId } from './data/areas';
+import { BOARD_HEIGHT, BOARD_WIDTH, ENEMY_TIMER_CHARGE_RATE } from './constants';
+import { AREA_PATTERNS, AreaPatternId } from './data/areas';
+import type { TargetKind } from './data/effects';
 import {
   PlanOp,
   ResolvedFunction,
-  ResolvedProgram,
   SHAKE_ALLOW_MATCHES,
   SHAKE_CASCADE_NONE,
   SHAKE_CASCADE_UNTIL_STABLE,
+  TARGETING_TARGETED,
   deckById,
+  functionTargetKind,
   planIsAllDrain,
   programById,
-  programsFor,
-  requiresTarget,
+  targetKindOf,
 } from './data/content';
 import { generateInitialBoard, shakeBoard, swap } from './board';
 import { pickBotMove } from './bot';
 import { TurnLogEntry, TurnLogger } from './logger';
 import { detectMatches } from './match';
 import { consumeEvents, createBattleMetrics } from './metrics';
-import { addUnitCharge, buffBonus, dealDamage, resolveCascades, resolveDetonation } from './resolve';
+import {
+  addUnitCharge,
+  buffBonus,
+  dealDamage,
+  detonateAt,
+  resolveCascades,
+  resolveDetonation,
+  resolveLineSlice,
+  settleAfterEffect,
+} from './resolve';
 import { makeRNG } from './rng';
 import {
+  ActivationTarget,
   BattleConfig,
   BattleIdentity,
   GameEvent,
   GameState,
   OwnerKind,
   Pt,
+  Readiness,
   Side,
+  TileView,
   UnitState,
   gridViewOf,
   opponentOf,
@@ -67,6 +80,31 @@ let battleCounter = 0;
 export function nextBattleId(): string {
   battleCounter += 1;
   return `b-${SESSION_TOKEN}-${battleCounter.toString(36)}`;
+}
+
+type OpEvent = Extract<GameEvent, { t: 'op' }>;
+
+// What one immediately resolving coordinate deployment did, for §18.5 target
+// logging and for deciding who settles the board afterwards.
+interface Deployment {
+  targetTile: TileView | null; // the target Packet BEFORE mutation
+  dimension?: 'row' | 'column'; // LineSlice only
+  sliced: Pt[];
+  retained: Pt[];
+  directDamage: number;
+  directCharge?: number;
+  // Bomb blasts settle themselves inside detonateAt; a LineSlice hands the
+  // gravity/refill/cascade step back so its target log lands before the board
+  // starts moving.
+  settle: boolean;
+  cause: 'bomb' | 'lineslice';
+}
+
+// One charge pool bound to a resolved Program by stable ID (§4.6 opens it at
+// the Function's cost when startCharged is Y).
+function unitFor(programId: string): UnitState {
+  const p = programById(programId);
+  return { programId: p.id, charge: p.fn.startCharged ? p.cost : 0 };
 }
 
 // The activation owner: a Program slot or the active Deck. Both pay a cost from
@@ -111,12 +149,16 @@ export class Game {
         player: config.playerHp,
         enemy: config.enemyHp,
       },
+      // Alpha 0.4.0 §5.8 — instantiate EXACTLY the four active Programs of the
+      // snapshotted ordered build, in build order. Inactive inventory Programs
+      // get no charge pool, no UI presence, no targeting eligibility, and no
+      // metrics slot: they are structurally absent from the battle.
       // §4.6 — `startCharged` applies UNIFORMLY to any directly assigned owner:
       // a Program's own charge pool opens at its Function cost when the data
       // says Y, exactly as the Deck's does below.
       units: {
-        player: programsFor('player').map((p) => ({ programId: p.id, charge: p.fn.startCharged ? p.cost : 0 })),
-        enemy: programsFor('enemy').map((p) => ({ programId: p.id, charge: p.fn.startCharged ? p.cost : 0 })),
+        player: identity.hackerPrograms.map((id) => unitFor(id)),
+        enemy: identity.systemPrograms.map((id) => unitFor(id)),
       },
       // §4.6/§7.2 — a directly assigned owner starts each battle with charge
       // equal to the Function cost when startCharged is Y, else zero. This
@@ -126,12 +168,13 @@ export class Game {
         ...identity,
         skillIds: [...identity.skillIds],
         hackerPrograms: [...identity.hackerPrograms],
+        inventory: [...identity.inventory],
         systemPrograms: [...identity.systemPrograms],
       },
       phase: 'playerPre',
       winner: null,
       turn: 1,
-      metrics: createBattleMetrics(),
+      metrics: createBattleMetrics(identity.hackerPrograms, identity.systemPrograms),
       battleId,
       // copied: the battle's config is immutable for its lifetime (MK5.4) —
       // later menu edits must not leak into a running battle
@@ -238,23 +281,39 @@ export class Game {
   // ownership, parameters, and charge all come from resolved Deck/Function
   // content, and the Effect runs through the same registry-dispatched executor
   // every Program Function uses (§8.1 — one authoritative Shake behavior).
-  fireDeckFunction(targetIdx?: number): GameEvent[] {
+  // §12.2 — target validity is checked BEFORE any charge is spent, so invalid
+  // target input never resolves the Function and never consumes the pool.
+  private targetSatisfies(need: TargetKind | null, target?: ActivationTarget): boolean {
+    if (need === null) return true;
+    if (!target || target.kind !== need) return false;
+    if (target.kind === 'unit') return !!this.state.units.enemy[target.idx];
+    const { x, y } = target.p;
+    if (x < 0 || x >= BOARD_WIDTH || y < 0 || y >= BOARD_HEIGHT) return false;
+    // Any occupied Packet is a legal target, specials and neutrals included:
+    // an immediately resolving Effect attaches no overlay, so the placement
+    // restrictions that constrain countdown Bombs do not apply here.
+    return !!this.state.board[y][x];
+  }
+
+  fireDeckFunction(target?: ActivationTarget): GameEvent[] {
     const s = this.state;
     const events: GameEvent[] = [];
     if (s.phase !== 'playerPre') return events;
     const deck = deckById(s.identity.deckId);
     if (s.deckCharge < deck.fn.cost) return events;
+    if (!this.targetSatisfies(functionTargetKind(deck.fn), target)) return events;
     s.deckCharge -= deck.fn.cost;
     s.phase = 'resolving';
-    this.castActor('player', { kind: 'deck', id: deck.id, name: deck.name, fn: deck.fn }, events, targetIdx);
+    this.castActor('player', { kind: 'deck', id: deck.id, name: deck.name, fn: deck.fn }, events, target);
     if (!s.winner) s.phase = 'playerPre';
     return this.collect(events);
   }
 
-  // 1.6.1.b — fire a charged Program during the pre-Sync window.
-  // A Program whose plan leads with the player-targeted Drain op requires
-  // `targetIdx` (which System slot to discharge); all others fire untargeted.
-  fireProgram(idx: number, targetIdx?: number): GameEvent[] {
+  // 1.6.1.b — fire a charged Program during the pre-Sync window. A Program
+  // whose plan leads with a targeted op requires the matching target: an
+  // opposing Program slot for Drain, or one Packet coordinate for a targeted
+  // LineSlice/Bomb. All others fire untargeted.
+  fireProgram(idx: number, target?: ActivationTarget): GameEvent[] {
     const s = this.state;
     const events: GameEvent[] = [];
     if (s.phase !== 'playerPre') return events;
@@ -262,10 +321,10 @@ export class Game {
     if (!u) return events;
     const prog = programById(u.programId);
     if (u.charge < prog.cost) return events;
-    if (requiresTarget(prog) && (targetIdx === undefined || !s.units.enemy[targetIdx])) return events;
+    if (!this.targetSatisfies(targetKindOf(prog), target)) return events;
     u.charge -= prog.cost;
     s.phase = 'resolving';
-    this.castActor('player', { kind: 'program', id: prog.id, name: prog.name, fn: prog.fn }, events, targetIdx);
+    this.castActor('player', { kind: 'program', id: prog.id, name: prog.name, fn: prog.fn }, events, target);
     if (!s.winner) s.phase = 'playerPre';
     return this.collect(events);
   }
@@ -275,19 +334,103 @@ export class Game {
   // payload plan left to right. A legal fizzle in one op never stops later ops
   // (§7.4). Unexpected exceptions propagate to the app failure boundary — they
   // are NOT converted into fizzles.
-  private castActor(owner: Side, actor: Actor, events: GameEvent[], targetIdx?: number): void {
+  private castActor(owner: Side, actor: Actor, events: GameEvent[], target?: ActivationTarget): void {
     events.push({ t: 'ability', side: owner, ownerKind: actor.kind, programId: actor.id, fn: actor.fn.id, name: actor.name });
     for (const op of actor.fn.plan) {
       if (this.state.winner) break;
-      this.castOp(owner, actor, op, events, targetIdx);
+      this.castOp(owner, actor, op, events, target);
     }
   }
 
+  // Every currently occupied board coordinate — the candidate pool for an
+  // immediately resolving targeted Effect's RANDOM mode (§14.2/§13.2), which
+  // places no overlay and therefore accepts any Packet.
+  private occupiedCells(exclude: Set<number>): Pt[] {
+    const s = this.state;
+    const out: Pt[] = [];
+    for (let y = 0; y < s.board.length; y++) {
+      for (let x = 0; x < s.board[y].length; x++) {
+        if (s.board[y][x] && !exclude.has(y * BOARD_WIDTH + x)) out.push({ x, y });
+      }
+    }
+    return out;
+  }
+
+  // §12/§13.3/§14.3 — drive the `quantity` deployments of an IMMEDIATELY
+  // resolving coordinate Effect (targeted LineSlice/Bomb, or their random
+  // variants). One shared driver so targeting, the per-activation exclusion
+  // rule, target logging, and post-slice settling cannot drift between the two
+  // Effects. Returns how many deployments actually resolved.
+  private resolveImmediateDeployments(
+    owner: Side,
+    actor: Actor,
+    op: PlanOp,
+    targeting: 0 | 1,
+    target: ActivationTarget | undefined,
+    events: GameEvent[],
+    run: (p: Pt) => Deployment,
+  ): number {
+    const s = this.state;
+    const quantity = op.params.quantity ?? 1;
+    // §13.2/§14.2 — a RANDOM deployment never reuses a coordinate this same
+    // activation already sliced.
+    const used = new Set<number>();
+    const logged = (
+      p: Pt | null,
+      d: Deployment | null,
+      reason?: string,
+    ): GameEvent => ({
+      t: 'targeted',
+      side: owner,
+      ownerKind: actor.kind,
+      programId: actor.id,
+      fnId: op.fnId,
+      effectId: op.effectId,
+      target: p,
+      targetTile: d?.targetTile ?? null,
+      ...(d?.dimension ? { dimension: d.dimension } : {}),
+      sliced: d?.sliced ?? [],
+      retained: d?.retained ?? [],
+      directDamage: d?.directDamage ?? 0,
+      directCharge: d?.directCharge ?? 0,
+      resolved: !!d,
+      ...(reason ? { reason } : {}),
+    });
+
+    let resolved = 0;
+    for (let i = 0; i < quantity; i++) {
+      if (s.winner) break;
+      let p: Pt | null = null;
+      if (targeting === TARGETING_TARGETED) {
+        // §12.3 pins targeted quantity at 1, and the coordinate was validated
+        // before any charge was spent, so this is present and legal.
+        p = target?.kind === 'packet' ? target.p : null;
+      } else {
+        const pool = this.occupiedCells(used);
+        p = pool.length ? pool[s.rng.int(pool.length)] : null;
+      }
+      if (!p) {
+        // §13.7 — a legal fizzle: no valid coordinate remains. The activation
+        // cost is still spent and the attempt is recorded; this is not an
+        // application error.
+        events.push(logged(null, null, 'no valid target coordinate'));
+        break;
+      }
+      used.add(p.y * BOARD_WIDTH + p.x);
+      const d = run(p);
+      for (const c of d.sliced) used.add(c.y * BOARD_WIDTH + c.x);
+      resolved++;
+      events.push(logged(p, d));
+      if (d.settle && !s.winner) settleAfterEffect(s, owner, d.cause, actor.id, events);
+    }
+    return resolved;
+  }
+
   // Coded Effect behavior, selected by the stable EffectId the data supplied.
-  private castOp(owner: Side, actor: Actor, op: PlanOp, events: GameEvent[], targetIdx?: number): void {
+  private castOp(owner: Side, actor: Actor, op: PlanOp, events: GameEvent[], target?: ActivationTarget): void {
     const s = this.state;
     const who = owner === 'player' ? 'Hacker' : 'System';
-    const opEvent = (resolved: boolean, drained?: number): GameEvent => ({
+    const opEvent = (resolved: boolean, drained?: number): OpEvent => ({
       t: 'op',
       side: owner,
       ownerKind: actor.kind,
@@ -299,15 +442,94 @@ export class Game {
     });
     switch (op.effectId) {
       case 'EFFECT_BOMB': {
-        const placed = this.placeSpecials({
-          type: 'bomb',
+        const bp = op.params.bomb!;
+        const countdown = op.params.countdown ?? 0;
+        // §14.3 — a positive countdown deploys the established overlay; blank
+        // or zero resolves the blast immediately with no overlay at all.
+        if (countdown > 0) {
+          const placed = this.placeSpecials({
+            type: 'bomb',
+            owner,
+            count: op.params.quantity ?? 1,
+            countdown,
+            areaPattern: op.params.areaPattern,
+            dealDamage: bp.dealDamage,
+            gainCharge: bp.gainCharge,
+            fnId: op.fnId,
+            actor,
+          }, events);
+          events.push(opEvent(placed > 0));
+          break;
+        }
+        const resolved = this.resolveImmediateDeployments(
           owner,
-          count: op.params.quantity ?? 1,
-          countdown: op.params.countdown,
-          areaPattern: op.params.areaPattern,
           actor,
-        }, events);
-        events.push(opEvent(placed > 0));
+          op,
+          bp.targeting,
+          target,
+          events,
+          (p) => {
+            const before = s.board[p.y][p.x];
+            const beforeView = before ? tileViewOf(before) : null;
+            const cellsBefore = new Set<number>();
+            for (const d of AREA_PATTERNS[op.params.areaPattern!]) {
+              const nx = p.x + d.x;
+              const ny = p.y + d.y;
+              if (nx >= 0 && nx < BOARD_WIDTH && ny >= 0 && ny < BOARD_HEIGHT && s.board[ny][nx]) {
+                cellsBefore.add(ny * BOARD_WIDTH + nx);
+              }
+            }
+            const hpBefore = s.hp[opponentOf(owner)];
+            detonateAt(s, p, {
+              owner,
+              areaPattern: op.params.areaPattern!,
+              programId: actor.id,
+              fnId: op.fnId,
+              dealDamage: bp.dealDamage,
+              gainCharge: bp.gainCharge,
+            }, events, false);
+            return {
+              targetTile: beforeView,
+              sliced: [...cellsBefore].map((k) => ({ x: k % BOARD_WIDTH, y: Math.floor(k / BOARD_WIDTH) })),
+              retained: [],
+              directDamage: Math.max(0, hpBefore - s.hp[opponentOf(owner)]),
+              settle: true,
+              cause: 'bomb',
+            };
+          },
+        );
+        events.push(opEvent(resolved > 0));
+        break;
+      }
+      // §13 — EFFECT_LINESLICE. The whole row or column through the resolved
+      // coordinate is sliced as ONE direct operation, then the board settles
+      // and any resulting Syncs cascade normally under the initiator.
+      case 'EFFECT_LINESLICE': {
+        const lp = op.params.line!;
+        const resolved = this.resolveImmediateDeployments(
+          owner,
+          actor,
+          op,
+          lp.targeting,
+          target,
+          events,
+          (p) => {
+            const before = s.board[p.y][p.x];
+            const beforeView = before ? tileViewOf(before) : null;
+            const outcome = resolveLineSlice(s, p, { owner, params: lp, programId: actor.id, fnId: op.fnId }, events);
+            return {
+              targetTile: beforeView,
+              dimension: outcome.dimension,
+              sliced: outcome.sliced,
+              retained: outcome.retained,
+              directDamage: outcome.damage,
+              directCharge: outcome.charge,
+              settle: true,
+              cause: 'lineslice',
+            };
+          },
+        );
+        events.push(opEvent(resolved > 0));
         break;
       }
       case 'EFFECT_BUFF': {
@@ -390,9 +612,13 @@ export class Game {
         // from both the Hacker's target list and System candidate selection,
         // and it never affects fully-charged/highest-charge/highest-cost
         // priority.
+        // §16.1 — the eligible pool is the opposing side's ACTIVE Programs.
+        // state.units holds exactly the active build, so inactive inventory
+        // Programs and the Deck Function are structurally excluded rather than
+        // filtered out here.
         let pick: UnitState | null = null;
         if (owner === 'player') {
-          pick = targetIdx === undefined ? null : (s.units.enemy[targetIdx] ?? null);
+          pick = target?.kind === 'unit' ? (s.units.enemy[target.idx] ?? null) : null;
         } else {
           const charged = s.units.player.filter((t) => t.charge > 0);
           if (charged.length) {
@@ -412,11 +638,23 @@ export class Game {
           events.push({ t: 'msg', text: `${who} fired ${actor.name} — nothing to drain` });
           break;
         }
+        // §16.4 — every actual activation records the target's stable ID, its
+        // readiness at target resolution, the charge before and after, and the
+        // Function cost that defines "ready". Readiness is auditable from
+        // charge/cost rather than asserted.
+        const targetProg = programById(pick.programId);
         const drained = pick.charge;
+        const readiness: Readiness = drained >= targetProg.cost ? 'READY' : drained > 0 ? 'CHARGING' : 'EMPTY';
         pick.charge = 0;
-        const drainedName = programById(pick.programId).name;
-        events.push(opEvent(true, drained));
-        events.push({ t: 'msg', text: `${who} fired ${actor.name} — drained ${drainedName}` });
+        events.push({
+          ...opEvent(true, drained),
+          targetProgramId: pick.programId,
+          targetReadiness: readiness,
+          targetChargeBefore: drained,
+          targetChargeAfter: 0,
+          targetCost: targetProg.cost,
+        });
+        events.push({ t: 'msg', text: `${who} fired ${actor.name} — drained ${targetProg.name}` });
         break;
       }
     }
@@ -437,6 +675,11 @@ export class Game {
       countdown?: number;
       areaPattern?: AreaPatternId;
       magnitude?: number;
+      // §14.2 — stamped onto each bomb overlay so a later detonation resolves
+      // under the Function that armed it, not under current global behavior.
+      dealDamage?: 0 | 1;
+      gainCharge?: 0 | 1;
+      fnId?: string;
       actor: Actor;
     },
     events: GameEvent[],
@@ -462,6 +705,9 @@ export class Game {
         areaPattern: opts.areaPattern,
         magnitude: opts.magnitude,
         programId: opts.actor.id,
+        fnId: opts.fnId,
+        dealDamage: opts.dealDamage,
+        gainCharge: opts.gainCharge,
         seq: s.nextSeq++,
       };
       events.push({ t: 'setTile', p, view: tileViewOf(t) });

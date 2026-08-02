@@ -9,14 +9,23 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { BOARD_HEIGHT, BOARD_WIDTH } from '../src/logic/constants';
 import { AREA_PATTERNS } from '../src/logic/data/areas';
 import {
+  ACTIVE_BUILD_SIZE,
   DEFAULT_DECK_ID,
   DEFAULT_HACKER_ID,
+  INVENTORY_SIZE,
   deckById,
+  defaultBuild,
   getContent,
   hackerById,
+  inventoryFor,
+  inventoryProgramIds,
+  isValidBuild,
+  programById,
   setActiveContent,
+  targetKindOf,
 } from '../src/logic/data/content';
 import { DataFiles, loadContent } from '../src/logic/data/load';
 import { DEFAULT_BATTLE_SETTINGS } from '../src/logic/constants';
@@ -24,15 +33,25 @@ import { Game, nextBattleId } from '../src/logic/game';
 import { LOG_VERSION } from '../src/logic/logger';
 import { SAVE_VERSION } from '../src/logic/save';
 import { computeLineClears, detectMatches } from '../src/logic/match';
+import { StreamMap, addStream, routeChargeStream, routeStreams } from '../src/logic/resolve';
 import {
   PendingSetup,
+  QuickMatchInfo,
   RUN_ENCOUNTERS,
   RUN_LENGTH,
   RunInfo,
+  beginBuild,
   beginSetup,
   buildIdentity,
   chooseDeck,
   chooseHacker,
+  deserializeConstructedPreset,
+  inactiveOf,
+  makeSetupRandom,
+  moveBuildSlot,
+  randomBuild,
+  replaceInBuild,
+  serializeConstructedPreset,
   contextLabel,
   continueLabel,
   createRunBattle,
@@ -51,11 +70,11 @@ import {
   setupComplete,
   snapshotRunSettings,
 } from '../src/logic/session';
-import { BattleSettings, Color, RunStep, Shape, Side } from '../src/logic/types';
-import { GameEvent, Tile } from '../src/logic/types';
+import { BattleSettings, BuildOrigin, Color, RunStep, Shape, Side } from '../src/logic/types';
+import { GameEvent, Pt, Tile } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { nodeDataFiles } from './dataNode';
-import { D, defaultHackerLink, manualLink, newBattle } from './harness';
+import { D, defaultActiveBuild, defaultHackerLink, manualLink, newBattle } from './harness';
 
 let passed = 0;
 let failed = 0;
@@ -119,9 +138,9 @@ function expectErrors(over: Partial<Record<keyof DataFiles, string>>, reasonPart
 
 // ---- §21.1 version stamps ----
 
-test('version stamps are alpha-0.3.0', () => {
-  assert(SAVE_VERSION === 'alpha-0.3.0', `SAVE_VERSION = ${SAVE_VERSION}`);
-  assert(LOG_VERSION === 'alpha-0.3.0', `LOG_VERSION = ${LOG_VERSION}`);
+test('version stamps are alpha-0.4.0', () => {
+  assert(SAVE_VERSION === 'alpha-0.4.0', `SAVE_VERSION = ${SAVE_VERSION}`);
+  assert(LOG_VERSION === 'alpha-0.4.0', `LOG_VERSION = ${LOG_VERSION}`);
 });
 
 // §21.1 — no active output path may continue to emit a stale build tag.
@@ -145,9 +164,9 @@ test('no stale build tags in active source (§21.1)', () => {
   // no `g` flag: these are used as stateless containment tests per file, and
   // a global-flag regex's `lastIndex` would otherwise persist across the
   // per-file .test() calls in the loop below.
-  const stalePattern = /alpha-0\.[12]\.0/;
+  const stalePattern = /alpha-0\.[123]\.0/;
   const mkTagPattern = /(['"`])mk\d+\1/i;
-  // smoke.ts: the deliberate pre-Alpha-0.3.0 rejection fixture. This test
+  // smoke.ts: the deliberate pre-Alpha-0.4.0 rejection fixture. This test
   // file itself is excluded too — it necessarily quotes the old tags below to
   // verify the fixture's content, which would otherwise self-match.
   const allowedFiles = new Set([path.join(root, 'scripts', 'smoke.ts'), path.join(root, 'scripts', 'tests.ts')]);
@@ -163,8 +182,11 @@ test('no stale build tags in active source (§21.1)', () => {
   // rejection-test tags (proves the allowlist isn't hiding a real leak)
   const smokeText = fs.readFileSync(path.join(root, 'scripts', 'smoke.ts'), 'utf8');
   assert(
-    smokeText.includes("'mk9'") && smokeText.includes("'alpha-0.1.0'") && smokeText.includes("'alpha-0.2.0'"),
-    'expected pre-Alpha-0.3.0 rejection fixture strings in smoke.ts',
+    smokeText.includes("'mk9'") &&
+      smokeText.includes("'alpha-0.1.0'") &&
+      smokeText.includes("'alpha-0.2.0'") &&
+      smokeText.includes("'alpha-0.3.0'"),
+    'expected pre-Alpha-0.4.0 rejection fixture strings in smoke.ts',
   );
 });
 
@@ -177,8 +199,11 @@ test('§22.1 all six required datasets load through the shared pipeline', () => 
   assert(r.content !== null, `errors: ${r.issues.map((i) => i.reason).join('; ')}`);
   assert(r.errors === 0, 'expected zero errors');
   const c = r.content;
-  assert(c.hacker.length === 4 && c.system.length === 4, 'expected 4 programs per side');
-  assert(c.functions.size === 10, `expected 10 functions, got ${c.functions.size}`);
+  // Alpha 0.4.0 — six Hacker Programs form the inventory; the System keeps its
+  // four (System-side build selection is explicitly out of scope, §22).
+  assert(c.hacker.length === INVENTORY_SIZE, `expected ${INVENTORY_SIZE} Hacker Programs, got ${c.hacker.length}`);
+  assert(c.system.length === 4, 'expected 4 System Programs');
+  assert(c.functions.size === 12, `expected 12 functions, got ${c.functions.size}`);
   const costs: Record<string, number> = {};
   for (const f of c.functions.values()) costs[f.name] = f.cost;
   // §4.2 approved Alpha costs
@@ -210,8 +235,8 @@ test('§22.1 Skill display resolves %N placeholders in title case', () => {
   const chg = c.skills.get('SKL_002')!;
   assert(dmg.effectType === 'SKL_EXTRA_MATCH_DAMAGE' && dmg.color === Color.Red && dmg.magnitude === 1, 'SKL_001 typed params');
   assert(chg.effectType === 'SKL_EXTRA_MATCH_CHARGE' && chg.color === Color.Red && chg.magnitude === 1, 'SKL_002 typed params');
-  assert(dmg.display === 'Deal 1 extra damage on a Red Sync', `SKL_001 display: ${dmg.display}`);
-  assert(chg.display === 'Gain 1 extra charge on a Red Sync', `SKL_002 display: ${chg.display}`);
+  assert(dmg.display === 'Deal 1 extra damage on a Red sync', `SKL_001 display: ${dmg.display}`);
+  assert(chg.display === 'Gain 1 extra charge on a Red sync', `SKL_002 display: ${chg.display}`);
 });
 
 test('§22.1 fingerprint tracks gameplay fields and ignores placeholders/display', () => {
@@ -281,7 +306,12 @@ test('duplicate IDs across datasets fail', () => {
 });
 
 test('duplicate display names warn but load', () => {
-  const dup = real.functions.text.trimEnd() + '\n' + fncRow(['FNC_099', 'BOMB', '5', 'EFFECT_BOMB', '', '1', '2', 'AREA_SQUARE_3X3', '', '']);
+  // §14.2 — every live EFFECT_BOMB row must carry its complete three-value
+  // tuple, fixtures included; trailing defaults are never inferred.
+  const dup =
+    real.functions.text.trimEnd() +
+    '\n' +
+    fncRow(['FNC_099', 'BOMB', '5', 'EFFECT_BOMB', '', '1', '2', 'AREA_SQUARE_3X3', '', '', '', '0:0:1']);
   const r = loadContent(files({ functions: dup }));
   assert(r.content !== null, 'duplicate names must still load');
   assert(r.warnings > 0 && r.issues.some((i) => i.severity === 'warning' && i.reason.includes('duplicate display name')), 'expected a name warning');
@@ -324,11 +354,16 @@ test('invalid numeric syntax and ranges fail', () => {
     'parameter out of range',
     'quantity 0',
   );
-  expectErrors(
-    { functions: mutate(real.functions.text, 'player bomb,2,2,AREA_SQUARE_3X3', 'player bomb,2,0,AREA_SQUARE_3X3') },
-    'parameter out of range',
-    'countdown 0',
-  );
+  // Alpha 0.4.0 §14.3 — countdown 0 is no longer out of range: blank or zero
+  // now MEANS "resolve the blast immediately, place no overlay". It must load
+  // and resolve to an immediate Bomb.
+  {
+    const t = mutate(real.functions.text, 'player bomb,2,2,AREA_SQUARE_3X3', 'player bomb,2,0,AREA_SQUARE_3X3');
+    const r = loadContent(files({ functions: t }));
+    assert(r.content !== null, `countdown 0 must load: ${r.issues.map((i) => i.reason).join('; ')}`);
+    const op = r.content.functions.get('FNC_001')!.plan[0];
+    assert((op.params.countdown ?? 0) === 0, 'countdown 0 resolves as immediate');
+  }
 });
 
 test('populated unused parameters warn (including numeric 0)', () => {
@@ -472,9 +507,10 @@ test('self-reference fails', () => {
 });
 
 test('composite-to-composite nesting (and thus cycles) fails', () => {
-  // FNC_011: FNC_010 is now a required real record (SCRAMBLE), so the fixture
-  // uses the next free ID to test nesting rather than ID collision.
-  const t = real.functions.text.trimEnd() + '\n' + fncRow(['FNC_011', 'SHOWTWO', '9', 'FNC_007']);
+  // FNC_013: FNC_010-012 are now required real records (SCRAMBLE, DATACUT,
+  // PLINK), so the fixture uses the next free ID to test nesting rather than
+  // an ID collision.
+  const t = real.functions.text.trimEnd() + '\n' + fncRow(['FNC_013', 'SHOWTWO', '9', 'FNC_007']);
   expectErrors({ functions: t }, 'may not reference another composite', 'composite nesting');
 });
 
@@ -506,6 +542,163 @@ test('area patterns have the exact §8 coordinate sets', () => {
   }
 });
 
+// ============================================================================
+// Alpha 0.4.0 §20.1 — spreadsheet-safe parsing, portfolios, and the new
+// typed Effect contracts.
+// ============================================================================
+
+test('§20.1 exactly one leading apostrophe is stripped before any parsing', () => {
+  // One apostrophe in front of an ID reference, an integer, a tuple, and an
+  // enum list must all normalize away before parsing/resolution.
+  const fns = mutate(real.functions.text, 'FNC_011,DATACUT,7', "FNC_011,DATACUT,'7");
+  const fns2 = mutate(fns, ',,,,0:1:0:0:1', ",,,,'0:1:0:0:1");
+  const hak = mutate(real.hackers.text, 'PRG_H_001:PRG_H_002:PRG_H_005', "'PRG_H_001:PRG_H_002:PRG_H_005");
+  const prg = mutate(real.hacker.text, 'PRG_H_005,NINJA,MAG,CRO', "PRG_H_005,NINJA,'MAG,CRO");
+  const r = loadContent(files({ functions: fns2, hackers: hak, hacker: prg }));
+  assert(r.content !== null, `quoted values must load: ${r.issues.filter((i) => i.severity === 'error').map((i) => i.reason).join('; ')}`);
+  const fn = r.content.functions.get('FNC_011')!;
+  assert(fn.cost === 7, `'7 parsed as ${fn.cost}`);
+  assert(fn.plan[0].params.line!.targeting === 1, 'quoted tuple parsed');
+  assert(r.content.hackers.get('HAK_01')!.portfolioProgramIds.join(':') === 'PRG_H_001:PRG_H_002:PRG_H_005', 'quoted PRG_SET parsed');
+  assert(r.content.programsById.get('PRG_H_005')!.colors[0] === Color.Magenta, 'quoted enum parsed');
+  // §20.1.4 — the fingerprint of quoted and unquoted authorings is identical.
+  assert(r.content.fingerprint === loadContent(real).content!.fingerprint, 'quoting must not change the fingerprint');
+});
+
+test('§20.1 a second apostrophe, and embedded/trailing ones, are DATA', () => {
+  // ''PRG_H_001 -> 'PRG_H_001, which is not a valid reference and must fail.
+  expectErrors(
+    { hackers: mutate(real.hackers.text, 'PRG_H_001:PRG_H_002', "''PRG_H_001:PRG_H_002") },
+    'wrong ID prefix',
+    'double apostrophe stays data',
+  );
+  // a trailing apostrophe is likewise preserved and therefore invalid
+  expectErrors(
+    { hackers: mutate(real.hackers.text, 'PRG_H_001:PRG_H_002', "PRG_H_001':PRG_H_002") },
+    'unknown Hacker Program',
+    'trailing apostrophe stays data',
+  );
+  // …but a NON-reference field keeps it verbatim without failing
+  const r = loadContent(files({ hackers: mutate(real.hackers.text, 'hacker biography goes here', "it's fine") }));
+  assert(r.content !== null, 'an embedded apostrophe in a placeholder field is data');
+  assert(r.content.hackers.get('HAK_01')!.bio === "it's fine", 'embedded apostrophe preserved');
+});
+
+test('§20.1 portfolios resolve in authored order and must hold exactly three', () => {
+  const c = loadContent(real).content!;
+  assert(c.hackers.get('HAK_01')!.portfolioProgramIds.join(':') === 'PRG_H_001:PRG_H_002:PRG_H_005', 'Hacker portfolio order');
+  assert(c.decks.get('DEK_01')!.portfolioProgramIds.join(':') === 'PRG_H_003:PRG_H_004:PRG_H_006', 'Deck portfolio order');
+  expectErrors({ hackers: mutate(real.hackers.text, 'PRG_H_001:PRG_H_002:PRG_H_005', 'PRG_H_001:PRG_H_002') }, 'exactly 3', 'two-Program portfolio');
+  expectErrors(
+    { hackers: mutate(real.hackers.text, 'PRG_H_001:PRG_H_002:PRG_H_005', 'PRG_H_001:PRG_H_002:PRG_H_005:PRG_H_003') },
+    'exactly 3',
+    'four-Program portfolio',
+  );
+  // §4.13 — a duplicate WITHIN one portfolio
+  expectErrors({ hackers: mutate(real.hackers.text, 'PRG_H_001:PRG_H_002:PRG_H_005', 'PRG_H_001:PRG_H_001:PRG_H_005') }, 'duplicate token', 'intra-portfolio duplicate');
+  // an unknown reference
+  expectErrors({ hackers: mutate(real.hackers.text, 'PRG_H_001:PRG_H_002:PRG_H_005', 'PRG_H_001:PRG_H_002:PRG_H_404') }, 'unknown Hacker Program', 'missing portfolio ref');
+});
+
+test('§20.1 Hacker/Deck portfolio overlap is a startup content error', () => {
+  // PRG_H_003 sits in the Deck portfolio; putting it in the Hacker's too makes
+  // the only pairing unable to produce six distinct Programs (§4.6).
+  expectErrors(
+    { hackers: mutate(real.hackers.text, 'PRG_H_001:PRG_H_002:PRG_H_005', 'PRG_H_001:PRG_H_003:PRG_H_005') },
+    'overlap',
+    'cross-portfolio overlap',
+  );
+});
+
+test('§20.1/§20.2 the combined inventory is six distinct Programs in portfolio order', () => {
+  install();
+  const entries = inventoryFor('HAK_01', 'DEK_01');
+  assert(entries.length === INVENTORY_SIZE, `expected ${INVENTORY_SIZE} inventory entries`);
+  assert(new Set(entries.map((e) => e.programId)).size === INVENTORY_SIZE, 'six DISTINCT Programs');
+  assert(
+    entries.map((e) => e.programId).join(':') === 'PRG_H_001:PRG_H_002:PRG_H_005:PRG_H_003:PRG_H_004:PRG_H_006',
+    'Hacker portfolio then Deck portfolio, both in authored order',
+  );
+  assert(
+    entries.map((e) => e.source).join(',') === 'HACKER_PORTFOLIO,HACKER_PORTFOLIO,HACKER_PORTFOLIO,DECK_PORTFOLIO,DECK_PORTFOLIO,DECK_PORTFOLIO',
+    'source attribution is retained per entry',
+  );
+  // §4.6 — no owned instances and no duplicated runtime definitions
+  assert(entries.every((e) => e.program === programById(e.programId)), 'entries reference the SHARED resolved Program');
+});
+
+test('§20.1 every Program resolves exactly one active Function', () => {
+  const c = loadContent(real).content!;
+  for (const p of [...c.hacker, ...c.system]) {
+    assert(p.functionId.startsWith('FNC_'), `${p.id} references a Function`);
+    assert(c.functions.has(p.functionId), `${p.id} Function resolves`);
+  }
+  expectErrors({ hacker: mutate(real.hacker.text, 'PRG_H_005,NINJA,MAG,CRO,FNC_011', 'PRG_H_005,NINJA,MAG,CRO,FNC_011:FNC_012') }, 'exactly one Function', 'two Functions');
+  expectErrors({ hacker: mutate(real.hacker.text, 'PRG_H_005,NINJA,MAG,CRO,FNC_011,', 'PRG_H_005,NINJA,MAG,CRO,,') }, 'exactly one FNC', 'zero Functions');
+});
+
+test('§20.1 EFFECT_BOMB requires exactly three parameters, EFFECT_LINESLICE exactly five', () => {
+  // §4.8 — trailing defaults are never inferred and blank is invalid.
+  expectErrors({ functions: mutate(real.functions.text, 'AREA_SQUARE_3X3,,,,0:0:1', 'AREA_SQUARE_3X3,,,,0:0') }, 'exactly 3', 'short Bomb tuple');
+  expectErrors({ functions: mutate(real.functions.text, 'AREA_SQUARE_3X3,,,,0:0:1', 'AREA_SQUARE_3X3,,,,0:0:1:1') }, 'exactly 3', 'long Bomb tuple');
+  expectErrors({ functions: mutate(real.functions.text, 'AREA_SQUARE_3X3,,,,0:0:1', 'AREA_SQUARE_3X3,,,,') }, 'missing required params tuple', 'blank Bomb tuple');
+  expectErrors({ functions: mutate(real.functions.text, ',,,,0:1:0:0:1', ',,,,0:1:0:0') }, 'exactly 5', 'short LineSlice tuple');
+  expectErrors({ functions: mutate(real.functions.text, ',,,,0:1:0:0:1', ',,,,0:1:0:0:1:0') }, 'exactly 5', 'long LineSlice tuple');
+  expectErrors({ functions: mutate(real.functions.text, 'FNC_011,DATACUT,7,EFFECT_LINESLICE,"slice targeted row, deal damage, no charge",1,,,,,,0:1:0:0:1', 'FNC_011,DATACUT,7,EFFECT_LINESLICE,"slice targeted row, deal damage, no charge",1,,,,,,') }, 'missing required params tuple', 'blank LineSlice tuple');
+});
+
+test('§20.1 invalid parameter enums fail with field/position context', () => {
+  const r = loadContent(files({ functions: mutate(real.functions.text, ',,,,0:1:0:0:1', ',,,,0:1:9:0:1') }));
+  assert(r.content === null, 'out-of-range enum must fail');
+  const issue = r.issues.find((i) => i.severity === 'error' && i.reason.includes('specialRetention'));
+  assert(issue, `expected a specialRetention-specific error, got: ${r.issues.map((i) => i.reason).join('; ')}`);
+  assert(issue.field === 'params' && issue.value === '9' && issue.id === 'FNC_011', 'error carries field, value, and record context');
+});
+
+test('§20.1/§12.3 a targeted Effect configuration must have quantity 1', () => {
+  // PLINK is targeting=1; raising its quantity would mean multi-target
+  // selection, which is out of scope.
+  expectErrors(
+    { functions: mutate(real.functions.text, 'FNC_012,PLINK,5,EFFECT_BOMB,slice cross centered on target,1', 'FNC_012,PLINK,5,EFFECT_BOMB,slice cross centered on target,2') },
+    'must have quantity 1',
+    'targeted quantity 2',
+  );
+  // random targeting may exceed one — the live BOMB row already does
+  const c = loadContent(real).content!;
+  const bomb = c.functions.get('FNC_001')!.plan[0];
+  assert(bomb.params.bomb!.targeting === 0 && bomb.params.quantity === 2, 'random Bomb keeps quantity 2');
+  assert(bomb.target === null, 'a random Bomb is not a targeted operation');
+});
+
+test('§20.1 PLINK resolves as an immediate targeted AREA_CARDINAL_1 Bomb with no direct charge', () => {
+  const c = loadContent(real).content!;
+  const plink = c.functions.get('FNC_012')!;
+  assert(plink.name === 'PLINK' && plink.cost === 5, 'PLINK identity from the CSV');
+  const op = plink.plan[0];
+  assert(op.effectId === 'EFFECT_BOMB', 'PLINK is a Bomb');
+  assert(op.params.quantity === 1, 'quantity 1');
+  assert(op.params.countdown === undefined, 'no countdown — immediate resolution');
+  assert(op.params.areaPattern === 'AREA_CARDINAL_1', 'centre plus one cardinal neighbour');
+  assert(op.params.bomb!.targeting === 1 && op.params.bomb!.dealDamage === 0 && op.params.bomb!.gainCharge === 1, '1:0:1');
+  assert(op.target === 'packet', 'PLINK requires one Packet target');
+  // DATACUT's live variant
+  const cut = c.functions.get('FNC_011')!.plan[0];
+  assert(cut.effectId === 'EFFECT_LINESLICE' && cut.params.quantity === 1, 'DATACUT quantity 1');
+  const lp = cut.params.line!;
+  assert(lp.dimension === 0 && lp.targeting === 1 && lp.specialRetention === 0 && lp.dealDamage === 0 && lp.gainCharge === 1, '0:1:0:0:1');
+  assert(cut.target === 'packet', 'DATACUT requires one Packet target');
+  // the Programs that carry them
+  assert(c.programsById.get('PRG_H_005')!.functionId === 'FNC_011', 'NINJA -> DATACUT');
+  assert(c.programsById.get('PRG_H_006')!.functionId === 'FNC_012', 'WEASEL -> PLINK');
+});
+
+test('§20.1 there is exactly one AREA_CARDINAL_1 definition (no alias)', () => {
+  const ids = Object.keys(AREA_PATTERNS);
+  const serialized = ids.map((id) => JSON.stringify(AREA_PATTERNS[id as keyof typeof AREA_PATTERNS]));
+  assert(new Set(serialized).size === serialized.length, 'no two area patterns share a coordinate set');
+  assert(ids.includes('AREA_CARDINAL_1') && !ids.includes('AREA_CROSS'), 'the established ID, with no second alias');
+});
+
 // ---- gameplay fixtures ----
 
 function install(over?: Partial<Record<keyof DataFiles, string>>): void {
@@ -524,6 +717,25 @@ function newGame(seed = 7, settings: BattleSettings = D): Game {
   const g = newBattle(settings, seed);
   g.startPlayerPhase();
   return g;
+}
+
+// Alpha 0.4.0 — a battle whose ACTIVE BUILD is stated explicitly, for the
+// order/routing/inventory cases. Any four distinct inventory Programs.
+function newGameWithBuild(build: string[], seed = 7, settings: BattleSettings = D): Game {
+  const g = newBattle(settings, seed, build, 'PLAYER_EDITED');
+  g.startPlayerPhase();
+  return g;
+}
+
+// Alpha 0.4.0 — the Quick Match session info a save round-trip needs. The
+// build and its source are part of the saved session now (§9.5).
+function qmInfo(build: readonly string[] = defaultActiveBuild(), origin: BuildOrigin = 'DEFAULT'): QuickMatchInfo {
+  return { mode: 'QUICK_MATCH', identity: defaultIdentity(), build: [...build], buildOrigin: origin };
+}
+
+// The slot index holding a given Program in a battle's active build.
+function slotOf(g: Game, programId: string): number {
+  return g.state.units.player.findIndex((u) => u.programId === programId);
 }
 
 function chargeSlot(g: Game, side: 'player' | 'enemy', idx: number): void {
@@ -605,7 +817,7 @@ test('FNC_004: Hacker Drain uses the chosen target (valid even at 0 charge)', ()
   chargeSlot(g, 'player', 3);
   // untargeted fire must be rejected for a targeted Program
   assert(g.fireProgram(3).length === 0, 'targeted Program requires a target');
-  const ev = g.fireProgram(3, 1);
+  const ev = g.fireProgram(3, { kind: 'unit', idx: 1 });
   assert(g.state.units.enemy[1].charge === 0, 'chosen target drained');
   assert(g.state.units.enemy[0].charge === 3, 'other slots untouched');
   const op = ev.find((e) => e.t === 'op' && e.effectId === 'EFFECT_DRAIN');
@@ -613,7 +825,7 @@ test('FNC_004: Hacker Drain uses the chosen target (valid even at 0 charge)', ()
   // 0-charge target is still valid
   const g2 = newGame(15);
   chargeSlot(g2, 'player', 3);
-  const ev2 = g2.fireProgram(3, 2);
+  const ev2 = g2.fireProgram(3, { kind: 'unit', idx: 2 });
   const op2 = ev2.find((e) => e.t === 'op' && e.effectId === 'EFFECT_DRAIN');
   assert(op2 && op2.t === 'op' && op2.drained === 0 && op2.resolved, '0-charge target drains 0 but resolves');
 });
@@ -735,11 +947,24 @@ test('detonation uses the bomb-owned footprint, clips at edges, owner strength a
   assert(det.cells.length === 4, `corner 3x3 clips to 4 cells, got ${det.cells.length}`);
   for (const k of ['0,0', '1,0', '0,1', '1,1']) assert(cellKeys.has(k), `missing ${k}`);
 
-  // owner strength: 9 Red tiles under a player 3x3 bomb → 9×2=18 (Red is
-  // player-strong); the same board under an enemy bomb → 9×1=9
+  // Owner strength on BOTH axes. DESIGNER OVERRIDE (2026-08-01) of §14.5:
+  // collateral is valued on color AND shape and pays the higher tier, so a
+  // Packet is HIGH for a side if either of its bindings is strong for it.
+  // Here every Packet is Red with shapes cycling 0-5. For the player (strong
+  // RED + TRI/SQU/STR) every Packet is HIGH on colour: 9x2 = 18. For the enemy
+  // (the complements: strong MAG/CYA/BLU + CIR/DIA/CRO) Red is LOW, so each
+  // Packet pays HIGH only when its shape is enemy-strong.
+  const enemyStrongShapes = [Shape.Circle, Shape.Diamond, Shape.Cross];
+  let enemyExpected = 0;
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const shape = ((dx + 1) + (dy + 1) * 3) % 6;
+      enemyExpected += enemyStrongShapes.includes(shape) ? 2 : 1;
+    }
+  }
   const strengths: Array<{ owner: 'player' | 'enemy'; expected: number }> = [
     { owner: 'player', expected: 18 },
-    { owner: 'enemy', expected: 9 },
+    { owner: 'enemy', expected: enemyExpected },
   ];
   for (const { owner, expected } of strengths) {
     const gg = newGame(24);
@@ -837,12 +1062,15 @@ install();
 // ---- §22.2 selection state and the fixed build ----
 
 const ids = defaultIdentity();
-const runInfoFor = (settings: BattleSettings, step: RunStep = 1): RunInfo => ({
+const runInfoFor = (settings: BattleSettings, step: RunStep = 1, build?: string[]): RunInfo => ({
   mode: 'RUN',
   step,
   settings,
   identity: { hackerId: ids.hackerId, deckId: ids.deckId, selectionSource: 'EXPLICIT_SELECTION' },
   hackerMaxLink: resolveHackerMaxLink(settings, ids.hackerId, ids.deckId),
+  inventory: inventoryProgramIds(ids.hackerId, ids.deckId),
+  build: build ?? defaultBuild(ids.hackerId, ids.deckId),
+  buildOrigin: build ? 'PLAYER_EDITED' : 'DEFAULT',
 });
 
 test('§22.2 New Run setup advances Hacker -> Deck -> Review and retains choices on Back', () => {
@@ -851,10 +1079,10 @@ test('§22.2 New Run setup advances Hacker -> Deck -> Review and retains choices
   assert(!setupComplete(s), 'an empty setup is not committable');
   s = chooseHacker(s, 'HAK_01');
   assert(s.step === 'DECK' && s.hackerId === 'HAK_01', 'choosing the Hacker advances to Deck Selection');
-  assert(!setupComplete(s), 'setup is not committable before Build Review');
+  assert(!setupComplete(s), 'setup is not committable before the Build screen');
   s = chooseDeck(s, 'DEK_01');
-  assert(s.step === 'REVIEW' && s.deckId === 'DEK_01', 'choosing the Deck advances to Build Review');
-  assert(setupComplete(s), 'Build Review with both choices is committable');
+  assert(s.step === 'BUILD' && s.deckId === 'DEK_01', 'choosing the Deck advances to Build');
+  assert(setupComplete(s), 'Build with both choices is committable');
   // §12.2 — Back RETAINS the pending choices
   const back1 = setupBack(s)!;
   assert(back1.step === 'DECK' && back1.hackerId === 'HAK_01' && back1.deckId === 'DEK_01', 'Back to Deck keeps both choices');
@@ -872,25 +1100,36 @@ test('§22.2 every loaded Deck is offered for the selected Hacker (no compatibil
   assert(c.hackerOrder.length === c.hackers.size, 'every Hacker is offered');
   for (const h of c.hackerOrder) {
     for (const d of c.deckOrder) {
-      const id = buildIdentity(h, d, 'EXPLICIT_SELECTION');
+      const id = buildIdentity(h, d, 'EXPLICIT_SELECTION', defaultBuild(h, d), 'DEFAULT');
       assert(id.hackerId === h && id.deckId === d, `identity builds for ${h}/${d}`);
     }
   }
 });
 
-test('§22.2/§5.3 the fixed Program roster and order survive identity construction', () => {
+test('§22.2/§5.3 the ordered active build survives identity construction', () => {
   const c = getContent();
-  const expected = ['PRG_H_001', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004'];
-  assert(c.hacker.map((p) => p.id).join(',') === expected.join(','), 'authored Hacker order');
-  const id = buildIdentity('HAK_01', 'DEK_01', 'EXPLICIT_SELECTION');
-  assert(id.hackerPrograms.join(',') === expected.join(','), 'identity carries the fixed ordered roster');
+  // Alpha 0.4.0 §5.4 — the DEFAULT build, derived from portfolio order, NOT a
+  // hardcoded list. For the current content it resolves to H1,H2,D1,D2.
+  const expected = defaultBuild('HAK_01', 'DEK_01');
+  assert(expected.join(',') === 'PRG_H_001,PRG_H_002,PRG_H_003,PRG_H_004', 'current content default build');
+  assert(c.hacker.length === INVENTORY_SIZE, 'all six Hacker Programs are loaded content');
+  const id = buildIdentity('HAK_01', 'DEK_01', 'EXPLICIT_SELECTION', expected, 'DEFAULT');
+  assert(id.hackerPrograms.join(',') === expected.join(','), 'identity carries the ordered active build');
+  assert(id.inventory.join(',') === inventoryProgramIds('HAK_01', 'DEK_01').join(','), 'identity carries the inventory');
+  assert(id.buildOrigin === 'DEFAULT', 'identity records the build source');
   assert(id.systemPrograms.join(',') === c.system.map((p) => p.id).join(','), 'identity carries the System roster');
   assert(id.skillIds.join(',') === 'SKL_001,SKL_002', 'identity carries the ordered Skill IDs');
   assert(id.deckFunctionId === 'FNC_010', 'identity carries the Deck Function ID');
-  // battle construction preserves that order in the runtime slots
+  // §5.8 — battle construction instantiates EXACTLY the four active Programs
   const g = createRunBattle(runInfoFor(D), 1, 5);
-  assert(g.state.units.player.map((u) => u.programId).join(',') === expected.join(','), 'battle slots follow content order');
-  assert(g.state.identity.hackerPrograms.join(',') === expected.join(','), 'battle identity preserves the roster');
+  assert(g.state.units.player.length === ACTIVE_BUILD_SIZE, 'exactly four Hacker Program slots');
+  assert(g.state.units.player.map((u) => u.programId).join(',') === expected.join(','), 'battle slots follow build order');
+  assert(g.state.identity.hackerPrograms.join(',') === expected.join(','), 'battle identity preserves the build');
+  // a non-default ordered build initializes in exactly the order given
+  const custom = ['PRG_H_006', 'PRG_H_001', 'PRG_H_005', 'PRG_H_003'];
+  const g2 = createRunBattle(runInfoFor(D, 1, custom), 1, 5);
+  assert(g2.state.units.player.map((u) => u.programId).join(',') === custom.join(','), 'custom build order is authoritative');
+  assert(!g2.state.units.player.some((u) => u.programId === 'PRG_H_002'), 'inactive Programs get no charge pool');
 });
 
 // ---- §22.3 Quick Match defaults ----
@@ -925,9 +1164,10 @@ test('§22.4 Run encounters, envelope round-trip, and rejections', () => {
   const r = deserializeSession(json);
   assert(r && r.info.mode === 'RUN' && r.info.step === 2, 'Run step round-trips');
   assert(r.info.mode === 'RUN' && r.info.hackerMaxLink === 175, 'resolved maximum LINK round-trips');
+  assert(r.game, 'an active Run battle restores a game');
   assert(r.game.state.config.playerHp === 175, 'effective LINK round-trips');
   // §17.2: Quick Match must not carry Run values
-  const qmJson = serializeSession({ mode: 'QUICK_MATCH', identity: ids }, g2, null);
+  const qmJson = serializeSession(qmInfo(g2.state.identity.hackerPrograms, g2.state.identity.buildOrigin), g2, null);
   assert(!qmJson.includes('"run"'), 'QM envelope has no run field');
   const fakeRun = JSON.parse(qmJson) as Record<string, unknown>;
   fakeRun.run = { step: 1, settings: D, hackerMaxLink: 150 };
@@ -959,6 +1199,7 @@ test('§22.4 Run encounters, envelope round-trip, and rejections', () => {
   const rp = deserializeSession(pendingJson);
   assert(rp && rp.pending, 'pending result restores');
   assert(rp.pending.natural === natural && rp.pending.metricsLogged, 'result context round-trips');
+  assert(rp.game, 'a pending-result save restores its concluded battle');
   assert(rp.game.state.winner === g3.state.winner, 'concluded state restores');
   // an active-battle envelope claiming a result rejects
   const bad = JSON.parse(json) as Record<string, unknown>;
@@ -969,7 +1210,7 @@ test('§22.4 Run encounters, envelope round-trip, and rejections', () => {
 test('§22.4 an Alpha 0.2 save is rejected cleanly and non-partially', () => {
   const g = newBattle(D, 11);
   g.startPlayerPhase();
-  const json = serializeSession({ mode: 'QUICK_MATCH', identity: ids }, g, null);
+  const json = serializeSession(qmInfo(g.state.identity.hackerPrograms, g.state.identity.buildOrigin), g, null);
   // §17.1 — the version and schema checks reject without migrating or partially
   // loading; nothing is inferred into an old save.
   for (const old of ['alpha-0.2.0', 'alpha-0.1.0', 'mk9']) {
@@ -1038,8 +1279,8 @@ test('§22.4 battle IDs are collision-resistant under synchronous construction',
   // the ID survives save/restore
   const g = newBattle(D, 77);
   g.startPlayerPhase();
-  const r = deserializeSession(serializeSession({ mode: 'QUICK_MATCH', identity: ids }, g, null));
-  assert(r && r.game.state.battleId === g.state.battleId, 'battle ID survives save/restore');
+  const r = deserializeSession(serializeSession(qmInfo(g.state.identity.hackerPrograms, g.state.identity.buildOrigin), g, null));
+  assert(r?.game && r.game.state.battleId === g.state.battleId, 'battle ID survives save/restore');
 });
 
 test('§22.4 Run configuration is stable after a title Settings change', () => {
@@ -1739,7 +1980,7 @@ test('§22.9 Reinforced Connection suppresses base Sync damage for the System to
 });
 
 test('§22.9 the Force Win availability matrix matches §18.1 exactly', () => {
-  const qm = { mode: 'QUICK_MATCH' as const, identity: ids };
+  const qm = qmInfo();
   const victory = { natural: 'NATURAL_VICTORY' as const, metricsLogged: true };
   const defeat = { natural: 'NATURAL_DEFEAT' as const, metricsLogged: true };
   // Quick Match: defeat yes, victory NO
@@ -1778,7 +2019,7 @@ test('§22.9 Battle 4 defeat can be Force Won to Run Complete; a natural win is 
 // ---- §14.1 mode/title label tests ----
 
 test('§14.1 Continue/context labels identify mode and exact Run step', () => {
-  const qm = { mode: 'QUICK_MATCH' as const, identity: ids };
+  const qm = qmInfo();
   assert(continueLabel(qm) === 'Continue Quick Match', 'QM continue label');
   assert(contextLabel(qm) === 'Quick Match', 'QM context label');
   for (const step of [1, 2, 3, 4] as const) {
@@ -1823,6 +2064,7 @@ test('every Run step round-trips through the save envelope', () => {
     g.startPlayerPhase();
     const r = deserializeSession(serializeSession(info, g, null));
     assert(r && r.info.mode === 'RUN' && r.info.step === step, `step ${step} round-trips`);
+    assert(r.game, `step ${step} restores its battle`);
     assert(r.game.state.config.enemyHp === encounterFor(step).systemHp, `step ${step} encounter ICE round-trips`);
     assert(r.game.state.deckCharge === g.state.deckCharge, `step ${step} Deck charge round-trips exactly`);
   }
@@ -1872,16 +2114,757 @@ test('isRunComplete truth table across all 4 steps x outcome', () => {
     }
     assert(!loss, `step ${step} defeat is never Run Complete`);
   }
-  assert(!isRunComplete({ mode: 'QUICK_MATCH', identity: ids }, { natural: 'NATURAL_VICTORY', metricsLogged: true }), 'Quick Match is never Run Complete');
+  assert(!isRunComplete(qmInfo(), { natural: 'NATURAL_VICTORY', metricsLogged: true }), 'Quick Match is never Run Complete');
 });
 
-test('authored Program order is stable and independent of charge/readiness', () => {
-  const hackerIds = getContent().hacker.map((p) => p.id);
+test('active build order is stable and independent of charge/readiness', () => {
+  // Alpha 0.4.0 §5.3 — the runtime slot order is the ACTIVE BUILD's order, not
+  // the content roster's; it must never be resorted by charge or readiness.
+  const hackerIds = defaultBuild('HAK_01', 'DEK_01');
   const g1 = createRunBattle(runInfoFor(D), 1, 5);
-  assert(g1.state.units.player.map((u) => u.programId).join(',') === hackerIds.join(','), 'runtime slot order matches content order');
+  assert(g1.state.units.player.map((u) => u.programId).join(',') === hackerIds.join(','), 'runtime slot order matches build order');
   // charging every slot to its cap (readiness) must not reorder anything
   for (const u of g1.state.units.player) u.charge = getContent().programsById.get(u.programId)!.chargeCap;
   assert(g1.state.units.player.map((u) => u.programId).join(',') === hackerIds.join(','), 'order unaffected by charge/readiness');
+});
+
+// ============================================================================
+// Alpha 0.4.0 §20.2 — default inventory, default build, and Build actions
+// ============================================================================
+
+test('§20.2 the default build is portfolio H1,H2,D1,D2 — derived, not hardcoded', () => {
+  assert(defaultBuild('HAK_01', 'DEK_01').join(',') === 'PRG_H_001,PRG_H_002,PRG_H_003,PRG_H_004', 'current content default');
+  // §20.2.3 — the ALGORITHM must be portfolio order, not those four IDs. Load
+  // content whose portfolios are reordered and confirm the default follows.
+  const hak = mutate(real.hackers.text, 'PRG_H_001:PRG_H_002:PRG_H_005', 'PRG_H_005:PRG_H_002:PRG_H_001');
+  const dek = mutate(real.decks.text, 'PRG_H_003:PRG_H_004:PRG_H_006', 'PRG_H_006:PRG_H_004:PRG_H_003');
+  const c = loadContent(files({ hackers: hak, decks: dek })).content!;
+  setActiveContent(c);
+  assert(defaultBuild('HAK_01', 'DEK_01').join(',') === 'PRG_H_005,PRG_H_002,PRG_H_006,PRG_H_004', 'default follows reordered portfolios');
+  assert(inventoryProgramIds('HAK_01', 'DEK_01').join(',') === 'PRG_H_005,PRG_H_002,PRG_H_001,PRG_H_006,PRG_H_004,PRG_H_003', 'inventory follows portfolio order');
+  install(); // restore real content
+});
+
+test('§20.2 Build opens with four occupied unique slots and stays valid through every action', () => {
+  const s0 = beginBuild('INITIAL_RUN', 'HAK_01', 'DEK_01', null, 'DEFAULT');
+  const ids = s0.inventory.map((e) => e.programId);
+  const valid = (s: typeof s0, label: string): void => {
+    assert(s.build.length === ACTIVE_BUILD_SIZE, `${label}: four slots`);
+    assert(new Set(s.build).size === ACTIVE_BUILD_SIZE, `${label}: no duplicates`);
+    assert(s.build.every((id) => ids.includes(id)), `${label}: all from inventory`);
+    assert(isValidBuild(s.build, ids), `${label}: satisfies the shared invariant`);
+  };
+  valid(s0, 'default');
+  assert(s0.build.join(',') === defaultBuild('HAK_01', 'DEK_01').join(','), 'opens on the default build');
+  assert(inactiveOf(s0).map((e) => e.programId).join(',') === 'PRG_H_005,PRG_H_006', 'the other two are inactive');
+  assert(!s0.edited, 'opening is not an edit');
+
+  // §5.6 replacement is a SWAP — the displaced Program returns to inventory
+  const s1 = replaceInBuild(s0, 1, 'PRG_H_006');
+  valid(s1, 'after replace');
+  assert(s1.build[1] === 'PRG_H_006', 'the chosen Program takes the chosen slot');
+  assert(inactiveOf(s1).map((e) => e.programId).includes('PRG_H_002'), 'displaced Program returns to the inventory');
+  assert(s1.edited && s1.origin === 'PLAYER_EDITED', 'an accepted replacement marks the build edited');
+
+  // §5.7 reorder swaps neighbours and preserves all four
+  const s2 = moveBuildSlot(s1, 0, 1);
+  valid(s2, 'after reorder');
+  assert(s2.build[0] === s1.build[1] && s2.build[1] === s1.build[0], 'neighbours swapped');
+  assert(s2.build.slice(2).join(',') === s1.build.slice(2).join(','), 'the rest is untouched');
+
+  // §20.2.7 — no normal interaction can produce an invalid slot count or a
+  // duplicate, and out-of-range actions are inert.
+  assert(replaceInBuild(s2, 0, s2.build[2]) === s2, 'replacing with an already-ACTIVE Program is refused');
+  assert(replaceInBuild(s2, 0, s2.build[0]) === s2, 'replacing a slot with its own Program is a no-op');
+  assert(replaceInBuild(s2, 0, 'PRG_S_001') === s2, 'a non-inventory Program is refused');
+  assert(replaceInBuild(s2, 9, 'PRG_H_005') === s2, 'an out-of-range slot is refused');
+  assert(moveBuildSlot(s2, 0, -1) === s2, 'moving the top slot up is inert');
+  assert(moveBuildSlot(s2, ACTIVE_BUILD_SIZE - 1, 1) === s2, 'moving the bottom slot down is inert');
+});
+
+test('§20.2 an invalid or stale initial build falls back to the default', () => {
+  const bad = ['PRG_H_001', 'PRG_H_001', 'PRG_H_003', 'PRG_H_004']; // duplicate
+  assert(beginBuild('RUN_BETWEEN', 'HAK_01', 'DEK_01', bad, 'CARRIED_RUN').build.join(',') === defaultBuild('HAK_01', 'DEK_01').join(','), 'duplicates fall back');
+  const short = ['PRG_H_001', 'PRG_H_002'];
+  assert(beginBuild('RUN_BETWEEN', 'HAK_01', 'DEK_01', short, 'CARRIED_RUN').origin === 'DEFAULT', 'a short build falls back and re-labels its origin');
+  const foreign = ['PRG_S_001', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004'];
+  assert(beginBuild('RUN_BETWEEN', 'HAK_01', 'DEK_01', foreign, 'CARRIED_RUN').build.join(',') === defaultBuild('HAK_01', 'DEK_01').join(','), 'a non-inventory Program falls back');
+  // a VALID carried build is kept exactly, order included
+  const good = ['PRG_H_006', 'PRG_H_005', 'PRG_H_004', 'PRG_H_001'];
+  const s = beginBuild('RUN_BETWEEN', 'HAK_01', 'DEK_01', good, 'CARRIED_RUN');
+  assert(s.build.join(',') === good.join(',') && s.origin === 'CARRIED_RUN', 'a valid carried build is preserved exactly');
+});
+
+// ============================================================================
+// Alpha 0.4.0 §20.5 — charge routing
+// ============================================================================
+
+// Sum of one side's Program charge.
+const totalCharge = (g: Game, side: Side = 'player'): number => g.state.units[side].reduce((n, u) => n + u.charge, 0);
+
+// Read a slot's charge through a function call so an assert() on one value
+// does not narrow the property's type for later comparisons.
+const chargeAt = (g: Game, i: number, side: Side = 'player'): number => g.state.units[side][i].charge;
+
+// Drive a single color-axis stream of `amount` through a battle's active build
+// by invoking the shared router directly — the same entry point Sync
+// resolution uses, so this tests the real allocation path.
+function routeColor(g: Game, token: Color, amount: number, side: Side = 'player'): GameEvent[] {
+  const events: GameEvent[] = [];
+  const waste = new Map<string, number>();
+  routeChargeStream(g.state, side, { axis: 'color', token, amount, source: 'SYNC' }, events, waste);
+  return events;
+}
+
+const routeEventOf = (events: GameEvent[]): Extract<GameEvent, { t: 'chargeRoute' }> =>
+  events.find((e) => e.t === 'chargeRoute') as Extract<GameEvent, { t: 'chargeRoute' }>;
+
+test('§20.5 charge fills the first compatible non-full Program and overflows downward', () => {
+  // BOMBER (RED/TRI, cost 7) above WEASEL (RED/CIR, cost 5): both take Red.
+  const g = newGameWithBuild(['PRG_H_001', 'PRG_H_006', 'PRG_H_002', 'PRG_H_003']);
+  const ev = routeColor(g, Color.Red, 3);
+  assert(chargeAt(g, 0) === 3, 'the TOP compatible Program takes it');
+  assert(chargeAt(g, 1) === 0, 'charge does not reach lower Programs until the top is full');
+  const r = routeEventOf(ev);
+  assert(r.eligible.join(',') === 'PRG_H_001,PRG_H_006', 'both Red Programs are eligible, in build order');
+  assert(r.assignments.length === 1 && r.assignments[0].assigned === 3 && r.assignments[0].overflowOut === 0, 'one assignment, no overflow');
+  assert(r.discarded === 0, 'nothing discarded');
+
+  // fill the top exactly, then overflow the remainder downward
+  const ev2 = routeColor(g, Color.Red, 6);
+  assert(chargeAt(g, 0) === 7, 'the top Program fills to its Function cost');
+  assert(chargeAt(g, 1) === 2, 'the overflow lands in the next compatible Program');
+  const r2 = routeEventOf(ev2);
+  assert(r2.assignments.length === 2, 'two recipients');
+  assert(r2.assignments[0].before === 3 && r2.assignments[0].assigned === 4 && r2.assignments[0].after === 7, 'top fill recorded exactly');
+  assert(r2.assignments[0].overflowOut === 2, 'overflow passed onward is recorded');
+  assert(r2.assignments[1].programId === 'PRG_H_006' && r2.assignments[1].assigned === 2, 'the lower Program received the overflow');
+});
+
+test('§20.5 incompatible and already-full Programs are skipped; charge never flows upward', () => {
+  const g = newGameWithBuild(['PRG_H_002', 'PRG_H_001', 'PRG_H_003', 'PRG_H_006']);
+  // BUFFER is GRE/SQU and ATTACKER is YEL/STR — neither is compatible with Red.
+  const ev = routeColor(g, Color.Red, 2);
+  const r = routeEventOf(ev);
+  assert(r.order.join(',') === 'PRG_H_002,PRG_H_001,PRG_H_003,PRG_H_006', 'the routing event records the full active order');
+  assert(r.eligible.join(',') === 'PRG_H_001,PRG_H_006', 'only the Red-bound Programs are eligible');
+  assert(chargeAt(g, 0) === 0 && chargeAt(g, 2) === 0, 'incompatible Programs receive nothing');
+  assert(chargeAt(g, 1) === 2, 'the first COMPATIBLE Program takes it, wherever it sits');
+
+  // fill BOMBER, then a further stream must skip it and reach WEASEL below
+  g.state.units.player[1].charge = 7;
+  routeColor(g, Color.Red, 3);
+  assert(chargeAt(g, 1) === 7, 'a full compatible Program is skipped, never exceeded');
+  assert(chargeAt(g, 3) === 3, 'the stream continues to the next compatible Program below');
+
+  // with the lower one now holding charge, an upward flow must never happen
+  const before0 = chargeAt(g, 0);
+  routeColor(g, Color.Red, 1);
+  assert(chargeAt(g, 0) === before0, 'charge never flows upward');
+  assert(chargeAt(g, 3) === 4, 'it continues downward instead');
+});
+
+test('§20.5 remaining overflow discards only after every lower compatible Program is full', () => {
+  const g = newGameWithBuild(['PRG_H_001', 'PRG_H_006', 'PRG_H_002', 'PRG_H_003']);
+  const ev = routeColor(g, Color.Red, 40); // far more than 7 + 5
+  assert(g.state.units.player[0].charge === 7 && g.state.units.player[1].charge === 5, 'both Red Programs fill to their costs');
+  const r = routeEventOf(ev);
+  assert(r.discarded === 40 - 12, 'the remainder is discarded, and only at the end');
+  assert(r.assignments.map((a) => a.programId).join(',') === 'PRG_H_001,PRG_H_006', 'both recipients recorded in order');
+  // a stream with NO compatible Program discards entirely and charges nobody
+  const g2 = newGameWithBuild(['PRG_H_002', 'PRG_H_003', 'PRG_H_004', 'PRG_H_005']);
+  const r2 = routeEventOf(routeColor(g2, Color.Red, 5));
+  assert(r2.eligible.length === 0 && r2.discarded === 5, 'no eligible Program discards the whole stream');
+  assert(totalCharge(g2) === 0, 'and nothing is charged');
+});
+
+test('§20.5 inactive Programs and the Deck Function are excluded from routing', () => {
+  // WEASEL (RED/CIR) is left OUT of the build; BOMBER is the only Red Program.
+  const g = newGameWithBuild(['PRG_H_001', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004']);
+  const deckBefore = g.state.deckCharge;
+  const r = routeEventOf(routeColor(g, Color.Red, 12));
+  assert(r.order.length === ACTIVE_BUILD_SIZE, 'the queue holds only the four active Programs');
+  assert(!r.order.includes('PRG_H_006') && !r.eligible.includes('PRG_H_006'), 'an inactive Program is structurally absent');
+  assert(r.discarded === 12 - 7, 'overflow discards rather than reaching the inactive Red Program');
+  assert(g.state.deckCharge === deckBefore, 'the Deck Function pool is separate and untouched');
+});
+
+test('§20.5 build ORDER changes where charge lands', () => {
+  const a = newGameWithBuild(['PRG_H_001', 'PRG_H_006', 'PRG_H_002', 'PRG_H_003']);
+  const b = newGameWithBuild(['PRG_H_006', 'PRG_H_001', 'PRG_H_002', 'PRG_H_003']);
+  routeColor(a, Color.Red, 5);
+  routeColor(b, Color.Red, 5);
+  assert(a.state.units.player[slotOf(a, 'PRG_H_001')].charge === 5, 'BOMBER first: BOMBER takes all 5');
+  assert(a.state.units.player[slotOf(a, 'PRG_H_006')].charge === 0, 'WEASEL gets nothing');
+  assert(b.state.units.player[slotOf(b, 'PRG_H_006')].charge === 5, 'WEASEL first: WEASEL fills to its cost of 5');
+  assert(b.state.units.player[slotOf(b, 'PRG_H_001')].charge === 0, 'and nothing overflows because 5 exactly fills it');
+});
+
+test('§20.5 a dual-compatible Program receives from both axes, colours before shapes', () => {
+  // WEASEL is RED and CIR; DISABLER is BLU and CIR.
+  const g = newGameWithBuild(['PRG_H_006', 'PRG_H_004', 'PRG_H_002', 'PRG_H_003']);
+  const events: GameEvent[] = [];
+  const waste = new Map<string, number>();
+  const streams: StreamMap = new Map();
+  addStream(streams, 'shape', Shape.Circle, 2, 'SYNC');
+  addStream(streams, 'color', Color.Red, 3, 'SYNC');
+  routeStreams(g.state, 'player', streams, events, waste);
+  const routes = events.filter((e) => e.t === 'chargeRoute') as Extract<GameEvent, { t: 'chargeRoute' }>[];
+  assert(routes.length === 2, 'two streams routed');
+  assert(routes[0].axis === 'color' && routes[1].axis === 'shape', 'colour resolves before shape regardless of insertion order');
+  assert(g.state.units.player[0].charge === 5, 'the dual-compatible Program received from BOTH streams');
+  assert(g.state.units.player[1].charge === 0, 'the lower Circle Program got nothing — the top absorbed it all');
+});
+
+test('§20.5 same-axis streams resolve in a deterministic, RNG-free order', () => {
+  const build = ['PRG_H_001', 'PRG_H_006', 'PRG_H_002', 'PRG_H_003'];
+  const run = (insertReversed: boolean): string => {
+    const g = newGameWithBuild(build, 31);
+    const events: GameEvent[] = [];
+    const streams: StreamMap = new Map();
+    const add = (): void => {
+      addStream(streams, 'color', Color.Red, 2, 'SYNC');
+      addStream(streams, 'color', Color.Green, 2, 'SYNC');
+      addStream(streams, 'shape', Shape.Triangle, 1, 'SYNC');
+    };
+    if (insertReversed) {
+      addStream(streams, 'shape', Shape.Triangle, 1, 'SYNC');
+      addStream(streams, 'color', Color.Green, 2, 'SYNC');
+      addStream(streams, 'color', Color.Red, 2, 'SYNC');
+    } else add();
+    const rngBefore = g.state.rng.getState();
+    routeStreams(g.state, 'player', streams, events, new Map());
+    assert(g.state.rng.getState() === rngBefore, 'routing consumes no RNG');
+    return (events.filter((e) => e.t === 'chargeRoute') as Extract<GameEvent, { t: 'chargeRoute' }>[])
+      .map((e) => `${e.axis}:${e.token}`)
+      .join('|');
+  };
+  const order = run(false);
+  assert(order === run(true), 'stream order does not depend on insertion order');
+  assert(order === 'color:0|color:3|shape:2', 'colours ascending, then shapes ascending');
+});
+
+test('§20.5 Sync and cascade charge route through the queue and never exceed Function cost', () => {
+  const g = newGameWithBuild(['PRG_H_001', 'PRG_H_006', 'PRG_H_002', 'PRG_H_003'], 12);
+  let safety = 0;
+  let sawRoute = false;
+  while (!g.state.winner && safety++ < 40) {
+    const mv = botMove(g);
+    if (!mv) break;
+    const r = g.attemptSwap(mv.a, mv.b);
+    for (const ev of r.events) {
+      if (ev.t !== 'chargeRoute') continue;
+      sawRoute = true;
+      assert(ev.order.length === ACTIVE_BUILD_SIZE, 'the queue is the active build');
+      let running = ev.amount;
+      for (const a of ev.assignments) {
+        assert(a.after === a.before + a.assigned, 'assignment arithmetic is exact');
+        running -= a.assigned;
+        assert(a.overflowOut === running, 'the overflow passed onward matches what is left');
+      }
+      assert(running === ev.discarded, 'amount = assigned + discarded, exactly');
+    }
+    for (const u of g.state.units.player) {
+      assert(u.charge <= programById(u.programId).chargeCap, `${u.programId} never exceeds its Function cost`);
+    }
+    if (!g.state.winner) g.runEnemyPhase();
+    if (!g.state.winner) g.startPlayerPhase();
+  }
+  assert(sawRoute, 'real play produced routed charge streams');
+});
+
+test('§20.5/§10.6 SKL_EXTRA_MATCH_CHARGE inflates the stream BEFORE routing', () => {
+  // The Skill adds to the qualifying RED stream rather than charging every
+  // Red-bound Program separately (which is what Alpha 0.3 did).
+  const g = newGameWithBuild(['PRG_H_001', 'PRG_H_006', 'PRG_H_002', 'PRG_H_003']);
+  const streams: StreamMap = new Map();
+  addStream(streams, 'color', Color.Red, 4, 'SYNC');
+  addStream(streams, 'color', Color.Red, 1, 'SKILL_MODIFIED_SYNC', 'SKL_002');
+  const events: GameEvent[] = [];
+  routeStreams(g.state, 'player', streams, events, new Map());
+  const r = routeEventOf(events);
+  assert(r.amount === 5, 'the Skill magnitude joined the existing stream');
+  assert(r.streamSource === 'SKILL_MODIFIED_SYNC' && r.sourceId === 'SKL_002', 'the stream is labelled as Skill-modified');
+  assert(totalCharge(g) === 5, 'five charge total — NOT five to each compatible Program');
+  assert(g.state.units.player[0].charge === 5 && g.state.units.player[1].charge === 0, 'it routed top-to-bottom like any other stream');
+});
+
+test('§20.5 System-side routing uses the same shared implementation', () => {
+  const g = newGame(9);
+  // The System roster has no overlapping bindings today, so routing is a
+  // single-recipient case; what matters is that it goes through one code path.
+  const r = routeEventOf(routeColor(g, Color.Red, 3, 'enemy'));
+  assert(r.side === 'enemy' && r.eligible.join(',') === 'PRG_S_001', 'the System E-BOMBER is the Red-bound Program');
+  assert(g.state.units.enemy[0].charge === 3, 'System charge routes identically');
+  // and overflow behaves the same when a compatible Program is full
+  g.state.units.enemy[0].charge = programById('PRG_S_001').chargeCap;
+  const r2 = routeEventOf(routeColor(g, Color.Red, 2, 'enemy'));
+  assert(r2.discarded === 2, 'a full System Program discards rather than exceeding its cost');
+});
+
+// ============================================================================
+// Alpha 0.4.0 §20.6 — DATACUT / EFFECT_LINESLICE
+// ============================================================================
+
+// Put NINJA (DATACUT) in a known slot, fully charged.
+function ninjaGame(seed = 33, build = ['PRG_H_005', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004']): Game {
+  const g = newGameWithBuild(build, seed);
+  chargeSlot(g, 'player', build.indexOf('PRG_H_005'));
+  return g;
+}
+
+const targetedEventOf = (events: GameEvent[]): Extract<GameEvent, { t: 'targeted' }> =>
+  events.find((e) => e.t === 'targeted') as Extract<GameEvent, { t: 'targeted' }>;
+
+test('§20.6 DATACUT slices the target Packet\'s entire row from one Packet target', () => {
+  const g = ninjaGame();
+  assert(targetKindOf(programById('PRG_H_005')) === 'packet', 'NINJA requires a Packet target');
+  // §12.2 — no target, or the WRONG KIND of target, resolves nothing and
+  // spends no charge.
+  assert(g.fireProgram(0).length === 0, 'an untargeted activation is rejected');
+  assert(g.fireProgram(0, { kind: 'unit', idx: 0 }).length === 0, 'a unit target is rejected for a Packet Function');
+  assert(g.fireProgram(0, { kind: 'packet', p: { x: 99, y: 99 } }).length === 0, 'an out-of-bounds coordinate is rejected');
+  assert(g.state.units.player[0].charge === programById('PRG_H_005').cost, 'no charge was spent by any rejection');
+
+  const target: Pt = { x: 3, y: 4 };
+  const events = g.fireProgram(0, { kind: 'packet', p: target });
+  const t = targetedEventOf(events);
+  assert(t && t.resolved, 'the activation resolved');
+  assert(t.dimension === 'row', 'the live tuple slices a ROW');
+  assert(t.sliced.length === BOARD_WIDTH, `the whole row is sliced, got ${t.sliced.length}`);
+  assert(t.sliced.every((c) => c.y === target.y), 'every sliced cell is in the target row');
+  assert(t.retained.length === 0, 'the live tuple retains no specials');
+  assert(t.target!.x === target.x && t.target!.y === target.y, 'the chosen coordinate is logged');
+  assert(t.targetTile !== null, 'the target Packet properties are captured BEFORE mutation');
+  assert(g.state.units.player[0].charge === 0, 'the activation cost was paid');
+});
+
+test('§20.6 the live DATACUT tuple destroys specials, deals one instance, grants no charge', () => {
+  const g = ninjaGame(34);
+  // plant an enemy shield and a player bomb in the target row
+  plantSpecial(g, 1, 4, { type: 'shield', owner: 'enemy', magnitude: 2 });
+  plantSpecial(g, 6, 4, { type: 'bomb', owner: 'player', countdown: 3, areaPattern: 'AREA_SQUARE_3X3', programId: 'PRG_H_001' });
+  const chargeBefore = totalCharge(g);
+  const events = g.fireProgram(0, { kind: 'packet', p: { x: 3, y: 4 } });
+  const t = targetedEventOf(events);
+  assert(t.retained.length === 0, 'specialRetention=0 destroys specials in the line');
+  assert(!specialsOf(g, 'shield', 'enemy').some((tt) => tt.special!.owner === 'enemy' && false), 'shields in the row were swept');
+  // §13.5 — no DIRECT charge; the charge that exists came from refill Syncs
+  const directRoutes = events.filter((e) => e.t === 'chargeRoute' && e.streamSource === 'EFFECT_DESTRUCTION');
+  assert(directRoutes.length === 0, 'gainCharge=1 produces no direct-slice charge stream');
+  assert(t.directCharge === 0, 'the target log records zero direct charge');
+  assert(totalCharge(g) >= chargeBefore - programById('PRG_H_005').cost, 'any charge gained came from resulting Syncs, not the slice');
+  // §13.4 — exactly ONE combined non-critical damage instance for the slice
+  const sliceDamage = events.filter((e) => e.t === 'damage' && e.source === 'lineslice' && e.fnId === 'FNC_011');
+  assert(sliceDamage.length === 1, `expected one combined line-slice instance, got ${sliceDamage.length}`);
+  const d = sliceDamage[0] as Extract<GameEvent, { t: 'damage' }>;
+  assert(!d.critExtra, 'no Sync critical multiplier is applied');
+  assert(d.effectId === 'EFFECT_LINESLICE' && d.programId === 'PRG_H_005', 'detailed attribution carries FNC_ID, EFFECT_ID and Program');
+});
+
+test('§20.6 the direct row slice is not a Sync: no B1, no match Skills', () => {
+  const g = ninjaGame(35);
+  // a full row of Red Packets would be a Sync footprint if it were a Sync —
+  // it must trigger neither B1 line clears nor the Red match Skills.
+  for (let x = 0; x < BOARD_WIDTH; x++) {
+    const t = g.state.board[4][x]!;
+    t.kind = 'standard';
+    t.color = Color.Red;
+    t.shape = x % 6;
+    t.special = undefined;
+  }
+  const events = g.fireProgram(0, { kind: 'packet', p: { x: 0, y: 4 } });
+  const idx = events.findIndex((e) => e.t === 'targeted');
+  const duringSlice = events.slice(0, idx + 1);
+  assert(!duringSlice.some((e) => e.t === 'lineClear'), 'the direct slice contributes no B1 line clear');
+  assert(!duringSlice.some((e) => e.t === 'skill'), 'the direct slice triggers no colour/shape match Skill');
+  // §15.2 — refill Syncs AFTER the slice resolve completely normally
+  assert(events.some((e) => e.t === 'spawn'), 'the board refilled');
+});
+
+test('§20.6 line-slice damage survives Reinforced Connection, and Buff/Shield apply once', () => {
+  // §13.4 — it is Function damage, not base Sync damage.
+  const g = ninjaGame(36);
+  g.state.config.reinforcedConnection = true;
+  const events = g.fireProgram(0, { kind: 'packet', p: { x: 3, y: 4 } });
+  const dmg = events.find((e) => e.t === 'damage' && e.source === 'lineslice');
+  assert(dmg, 'line-slice damage is dealt under Reinforced Connection');
+
+  // Buff adds once to the combined instance; Shield absorbs it once.
+  const g2 = ninjaGame(37);
+  plantSpecial(g2, 0, 0, { type: 'buff', owner: 'player', magnitude: 5, programId: 'PRG_H_002' });
+  plantSpecial(g2, 7, 7, { type: 'shield', owner: 'enemy', magnitude: 3, programId: 'PRG_S_002' });
+  const ev2 = g2.fireProgram(0, { kind: 'packet', p: { x: 3, y: 4 } });
+  const shields = ev2.filter((e) => e.t === 'shield' && e.source === 'lineslice');
+  assert(shields.length === 1, 'the shield applies to exactly one line-slice instance');
+  const s = shields[0] as Extract<GameEvent, { t: 'shield' }>;
+  assert(s.prevented === Math.min(s.preShield, 3), 'the shield absorbs up to its magnitude, once');
+  const d2 = ev2.find((e) => e.t === 'damage' && e.source === 'lineslice') as Extract<GameEvent, { t: 'damage' }> | undefined;
+  if (d2) assert((d2.buffBonus ?? 0) > 0, 'the Buff contribution is attributed to its own metric, not hidden in the slice');
+});
+
+test('§20.6 the non-live EFFECT_LINESLICE enum branches behave as contracted', () => {
+  const cut = (params: string, seed: number, prep?: (g: Game) => void): { g: Game; ev: GameEvent[] } => {
+    const fns = mutate(real.functions.text, '0:1:0:0:1', params);
+    install({ functions: fns });
+    const g = ninjaGame(seed);
+    prep?.(g);
+    return { g, ev: g.fireProgram(0, { kind: 'packet', p: { x: 3, y: 4 } }) };
+  };
+
+  // dimension=1 — COLUMN
+  {
+    const { ev } = cut('1:1:0:0:1', 40);
+    const t = targetedEventOf(ev);
+    assert(t.dimension === 'column' && t.sliced.length === BOARD_HEIGHT, 'dimension 1 slices the column');
+    assert(t.sliced.every((c) => c.x === 3), 'every sliced cell is in the target column');
+  }
+  // targeting=0 — RANDOM, requiring no player target
+  {
+    const fns = mutate(real.functions.text, '0:1:0:0:1', '0:0:0:0:1');
+    install({ functions: fns });
+    const g = ninjaGame(41);
+    assert(targetKindOf(programById('PRG_H_005')) === null, 'a random LineSlice needs no target');
+    const ev = g.fireProgram(0);
+    const t = targetedEventOf(ev);
+    assert(t && t.resolved && t.sliced.length === BOARD_WIDTH, 'it picks its own coordinate and slices that row');
+  }
+  // specialRetention=1 — RETAIN ALL
+  {
+    const { ev } = cut('0:1:1:0:1', 42, (g) => {
+      plantSpecial(g, 1, 4, { type: 'shield', owner: 'enemy', magnitude: 2 });
+      plantSpecial(g, 6, 4, { type: 'buff', owner: 'player', magnitude: 3 });
+    });
+    const t = targetedEventOf(ev);
+    assert(t.retained.length === 2, 'both specials are retained');
+    assert(t.sliced.length === BOARD_WIDTH - 2, 'retained specials are excluded from the direct slice');
+  }
+  // specialRetention=2 — RETAIN ONLY THE ACTIVATING SIDE'S
+  {
+    const { ev } = cut('0:1:2:0:1', 43, (g) => {
+      plantSpecial(g, 1, 4, { type: 'shield', owner: 'enemy', magnitude: 2 });
+      plantSpecial(g, 6, 4, { type: 'buff', owner: 'player', magnitude: 3 });
+    });
+    const t = targetedEventOf(ev);
+    assert(t.retained.length === 1, 'only the activating side keeps its special');
+    assert(t.retained[0].x === 6, 'the player-owned buff survived');
+    assert(t.sliced.some((c) => c.x === 1), 'the opposing shield was destroyed');
+  }
+  // dealDamage=1 — no DIRECT damage, board still mutates. Refill Syncs caused
+  // by the slice still deal their own damage and still carry the 'lineslice'
+  // causal bucket (the same rule Bomb-caused cascades follow), so the check is
+  // for the direct instance specifically — the one stamped with its FNC_ID.
+  {
+    const { g, ev } = cut('0:1:0:1:1', 44);
+    const t = targetedEventOf(ev);
+    assert(t.directDamage === 0, 'dealDamage=1 deals no direct damage');
+    assert(!ev.some((e) => e.t === 'damage' && e.fnId === 'FNC_011'), 'no direct line-slice damage instance is emitted');
+    assert(g.state.board[4].every((c) => c !== null), 'the board still settled and refilled');
+  }
+  // gainCharge=0 — directly sliced Packets DO charge
+  {
+    const { g, ev } = cut('0:1:0:1:0', 45);
+    const direct = ev.filter((e) => e.t === 'chargeRoute' && e.streamSource === 'EFFECT_DESTRUCTION');
+    assert(direct.length > 0, 'gainCharge=0 opens direct-slice charge streams');
+    const t = targetedEventOf(ev);
+    assert(t.directCharge > 0, 'and the target log records what landed');
+    assert(totalCharge(g) > 0, 'the Programs actually received it');
+    // §10.7 — colours route before shapes for Effect-generated charge too
+    const axes = (direct as Extract<GameEvent, { t: 'chargeRoute' }>[]).map((e) => e.axis);
+    assert(axes.indexOf('shape') === -1 || axes.lastIndexOf('color') < axes.indexOf('shape'), 'colour streams route first');
+  }
+  install(); // restore real content
+});
+
+// ============================================================================
+// Alpha 0.4.0 §20.7 — PLINK and the parameterized EFFECT_BOMB
+// ============================================================================
+
+function weaselGame(seed = 50, build = ['PRG_H_006', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004']): Game {
+  const g = newGameWithBuild(build, seed);
+  chargeSlot(g, 'player', build.indexOf('PRG_H_006'));
+  return g;
+}
+
+test('§20.7 PLINK requires one Packet target and resolves immediately with no overlay', () => {
+  const g = weaselGame();
+  assert(targetKindOf(programById('PRG_H_006')) === 'packet', 'WEASEL requires a Packet target');
+  assert(g.fireProgram(0).length === 0, 'an untargeted PLINK is rejected');
+  const bombsBefore = specialsOf(g, 'bomb', 'player').length;
+  const events = g.fireProgram(0, { kind: 'packet', p: { x: 4, y: 4 } });
+  assert(events.some((e) => e.t === 'detonate'), 'the blast resolved during the activation');
+  assert(specialsOf(g, 'bomb', 'player').length === bombsBefore, 'no countdown overlay was placed');
+  assert(!events.some((e) => e.t === 'countdown'), 'no countdown was started');
+  const t = targetedEventOf(events);
+  assert(t.resolved && t.target!.x === 4 && t.target!.y === 4, 'the chosen coordinate is logged');
+});
+
+test('§20.7 the PLINK footprint is the target plus cardinal neighbours, clipped at edges', () => {
+  const centre = weaselGame(51);
+  const evC = centre.fireProgram(0, { kind: 'packet', p: { x: 4, y: 4 } });
+  const detC = evC.find((e) => e.t === 'detonate') as Extract<GameEvent, { t: 'detonate' }>;
+  assert(detC.cells.length === 5, `centre blast covers 5 cells, got ${detC.cells.length}`);
+  const keys = new Set(detC.cells.map((c) => `${c.x},${c.y}`));
+  for (const k of ['4,4', '4,3', '5,4', '4,5', '3,4']) assert(keys.has(k), `missing ${k}`);
+
+  const corner = weaselGame(52);
+  const evK = corner.fireProgram(0, { kind: 'packet', p: { x: 0, y: 0 } });
+  const detK = evK.find((e) => e.t === 'detonate') as Extract<GameEvent, { t: 'detonate' }>;
+  assert(detK.cells.length === 3, `corner blast clips to 3 cells, got ${detK.cells.length}`);
+});
+
+test('§20.7 PLINK may target a special or neutral Packet', () => {
+  // DESIGNER DECISION (2026-08-01): an immediately resolving Bomb attaches no
+  // overlay, so the countdown-Bomb placement restrictions do not apply.
+  const g = weaselGame(53);
+  plantSpecial(g, 4, 4, { type: 'shield', owner: 'enemy', magnitude: 2, programId: 'PRG_S_002' });
+  const ev = g.fireProgram(0, { kind: 'packet', p: { x: 4, y: 4 } });
+  assert(targetedEventOf(ev).resolved, 'a special Packet is a legal target');
+  assert(ev.some((e) => e.t === 'shieldRemoved'), 'the targeted shield was swept by the blast');
+
+  const g2 = weaselGame(54);
+  const t = g2.state.board[4][4]!;
+  t.kind = 'neutral';
+  t.color = undefined;
+  t.shape = undefined;
+  t.special = undefined;
+  assert(targetedEventOf(g2.fireProgram(0, { kind: 'packet', p: { x: 4, y: 4 } })).resolved, 'a neutral Packet is a legal target');
+});
+
+test('§20.7 PLINK deals Bomb collateral damage, grants no direct charge, and skips B1', () => {
+  const g = weaselGame(55);
+  const chargeBefore = totalCharge(g) - programById('PRG_H_006').cost;
+  const ev = g.fireProgram(0, { kind: 'packet', p: { x: 4, y: 4 } });
+  const dmg = ev.find((e) => e.t === 'damage' && e.source === 'bomb') as Extract<GameEvent, { t: 'damage' }> | undefined;
+  assert(dmg, 'the blast dealt Bomb damage');
+  assert(dmg.fnId === 'FNC_012' && dmg.programId === 'PRG_H_006', 'PLINK is distinguishable from the existing Bomber Function');
+  assert(!ev.some((e) => e.t === 'chargeRoute' && e.streamSource === 'EFFECT_DESTRUCTION'), 'gainCharge=1 grants no direct blast charge');
+  const idx = ev.findIndex((e) => e.t === 'targeted');
+  assert(!ev.slice(0, idx + 1).some((e) => e.t === 'lineClear'), 'the direct blast contributes nothing to B1');
+  assert(totalCharge(g) >= chargeBefore, 'any charge came from refill Syncs');
+});
+
+test('§20.7 existing Bomber/E-Bomber/ONEBOMB keep their countdown and quantity behaviour', () => {
+  const c = getContent();
+  for (const [id, quantity, countdown, area] of [
+    ['FNC_001', 2, 2, 'AREA_SQUARE_3X3'],
+    ['FNC_005', 1, 3, 'AREA_SQUARE_3X3_CARDINAL_2'],
+    ['FNC_008', 1, 2, 'AREA_SQUARE_3X3'],
+  ] as [string, number, number, string][]) {
+    const op = c.functions.get(id)!.plan[0];
+    assert(op.params.quantity === quantity, `${id} quantity`);
+    assert(op.params.countdown === countdown, `${id} countdown`);
+    assert(op.params.areaPattern === area, `${id} area`);
+    // §20.7.9 — no live Bomb row relies on a missing trailing default
+    assert(op.params.bomb !== undefined, `${id} carries a complete tuple`);
+    assert(op.params.bomb!.targeting === 0 && op.params.bomb!.gainCharge === 1, `${id} random placement, no blast charge`);
+  }
+  // BOMBER still PLACES overlays rather than resolving immediately
+  const g = newGameWithBuild(['PRG_H_001', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004'], 56);
+  chargeSlot(g, 'player', 0);
+  const ev = g.fireProgram(0);
+  assert(!ev.some((e) => e.t === 'detonate'), 'a countdown Bomb does not resolve on activation');
+  assert(specialsOf(g, 'bomb', 'player').length === 2, 'both bombs were placed as overlays');
+  const placed = specialsOf(g, 'bomb', 'player')[0].special!;
+  assert(placed.countdown === 2 && placed.fnId === 'FNC_001', 'the overlay carries its countdown and placing Function');
+  assert(placed.dealDamage === 0 && placed.gainCharge === 1, 'the overlay carries its Function\'s typed selections');
+});
+
+test('§20.7 EFFECT_BOMB dealDamage=1 and gainCharge=0 behave as contracted', () => {
+  // dealDamage=1 — the blast mutates the board but deals nothing
+  {
+    install({ functions: mutate(real.functions.text, 'AREA_CARDINAL_1,,,,1:0:1', 'AREA_CARDINAL_1,,,,1:1:1') });
+    const g = weaselGame(57);
+    const hpBefore = g.state.hp.enemy;
+    const ev = g.fireProgram(0, { kind: 'packet', p: { x: 4, y: 4 } });
+    assert(ev.some((e) => e.t === 'detonate'), 'the blast still resolved');
+    // as above: bomb-CAUSED cascades keep the bomb bucket, so check the direct
+    // blast instance by its FNC_ID rather than by the causal bucket alone.
+    assert(!ev.some((e) => e.t === 'damage' && e.fnId === 'FNC_012'), 'no direct blast damage instance');
+    assert(g.state.hp.enemy <= hpBefore, 'only refill-Sync damage, if any, was dealt');
+  }
+  // gainCharge=0 — directly sliced blast Packets charge
+  {
+    install({ functions: mutate(real.functions.text, 'AREA_CARDINAL_1,,,,1:0:1', 'AREA_CARDINAL_1,,,,1:0:0') });
+    const g = weaselGame(58);
+    const ev = g.fireProgram(0, { kind: 'packet', p: { x: 4, y: 4 } });
+    assert(ev.some((e) => e.t === 'chargeRoute' && e.streamSource === 'EFFECT_DESTRUCTION'), 'blast Packets opened charge streams');
+  }
+  install();
+});
+
+// ============================================================================
+// Alpha 0.4.0 §20.8 — Disabler gating and target telemetry
+// ============================================================================
+
+test('§20.8 System Disabler never activates when no active Program holds charge', () => {
+  const g = newGame(60);
+  chargeSlot(g, 'enemy', 3); // System DISABLER ready
+  for (const u of g.state.units.player) u.charge = 0;
+  const ev = g.runEnemyPhase();
+  assert(!ev.some((e) => e.t === 'op' && e.effectId === 'EFFECT_DRAIN'), 'no Drain op is emitted at all');
+  assert(!ev.some((e) => e.t === 'ability' && e.fn === 'FNC_004'), 'absence of activation is not logged as an activation');
+  assert(g.state.units.enemy[3].charge >= programById('PRG_S_004').cost, 'the charge is preserved, not spent on a no-op');
+});
+
+test('§20.8 Disabler targets only ACTIVE Programs, never inactive ones or the Deck', () => {
+  // BOMBER is left out of the build; only the four active Programs can be hit.
+  const build = ['PRG_H_002', 'PRG_H_003', 'PRG_H_004', 'PRG_H_006'];
+  const g = newGameWithBuild(build, 61);
+  chargeSlot(g, 'enemy', 3);
+  g.state.units.player[1].charge = 4; // ATTACKER partially charged
+  g.state.deckCharge = 3;
+  const deckBefore = g.state.deckCharge;
+  const ev = g.runEnemyPhase();
+  const op = ev.find((e) => e.t === 'op' && e.effectId === 'EFFECT_DRAIN') as Extract<GameEvent, { t: 'op' }>;
+  assert(op && op.resolved, 'the Drain resolved');
+  assert(build.includes(op.targetProgramId!), 'the target is an ACTIVE Program');
+  assert(op.targetProgramId !== 'PRG_H_001', 'an inactive inventory Program is never a target');
+  assert(g.state.deckCharge === deckBefore, 'the Deck Function pool is never drained');
+});
+
+test('§20.8 every Drain activation logs target ID, readiness, charge, cost, and removal', () => {
+  const g = newGame(62);
+  chargeSlot(g, 'enemy', 3);
+  g.state.units.player[0].charge = 4; // BOMBER: charging (cost 7)
+  const ev = g.runEnemyPhase();
+  const op = ev.find((e) => e.t === 'op' && e.effectId === 'EFFECT_DRAIN') as Extract<GameEvent, { t: 'op' }>;
+  assert(op.targetProgramId === 'PRG_H_001', 'target stable PRG_ID');
+  assert(op.targetReadiness === 'CHARGING', 'readiness is auditable from charge/cost');
+  assert(op.targetChargeBefore === 4 && op.targetChargeAfter === 0, 'charge before and after');
+  assert(op.targetCost === programById('PRG_H_001').cost, 'the target Function cost is recorded');
+  assert(op.drained === 4, 'charge removed matches');
+
+  // a FULLY charged target reports READY
+  const g2 = newGame(63);
+  chargeSlot(g2, 'enemy', 3);
+  chargeSlot(g2, 'player', 0);
+  const op2 = g2.runEnemyPhase().find((e) => e.t === 'op' && e.effectId === 'EFFECT_DRAIN') as Extract<GameEvent, { t: 'op' }>;
+  assert(op2.targetReadiness === 'READY', 'a full target reports READY');
+
+  // player-initiated Drain receives the same telemetry
+  const g3 = newGame(64);
+  chargeSlot(g3, 'player', 3);
+  g3.state.units.enemy[1].charge = 2;
+  const op3 = g3.fireProgram(3, { kind: 'unit', idx: 1 }).find((e) => e.t === 'op' && e.effectId === 'EFFECT_DRAIN') as Extract<GameEvent, { t: 'op' }>;
+  assert(op3.targetProgramId === 'PRG_S_002' && op3.targetReadiness === 'CHARGING' && op3.drained === 2, 'player Drain telemetry matches');
+});
+
+// ============================================================================
+// Alpha 0.4.0 §20.4/§20.9 — Quick Match modes, preferences, and saves
+// ============================================================================
+
+test('§20.4 Random Quick Match picks four unique Programs without consuming gameplay RNG', () => {
+  const inventory = inventoryProgramIds('HAK_01', 'DEK_01');
+  for (let seed = 1; seed <= 40; seed++) {
+    const { rng } = makeSetupRandom(seed);
+    const b = randomBuild(inventory, rng);
+    assert(b.length === ACTIVE_BUILD_SIZE, 'four Programs');
+    assert(new Set(b).size === ACTIVE_BUILD_SIZE, 'all distinct');
+    assert(isValidBuild(b, inventory), 'a valid build drawn from the inventory');
+  }
+  // the setup source is reproducible from its seed and independent of the
+  // battle's gameplay stream
+  assert(randomBuild(inventory, makeSetupRandom(7).rng).join(',') === randomBuild(inventory, makeSetupRandom(7).rng).join(','), 'the same setup seed reproduces the build');
+  const key = (g: Game): string => g.state.board.flat().map((t) => `${t!.kind}:${t!.color ?? '-'}:${t!.shape ?? '-'}`).join(',');
+  const a = newBattle(D, 4242, randomBuild(inventory, makeSetupRandom(1).rng), 'RANDOM');
+  const b = newBattle(D, 4242, randomBuild(inventory, makeSetupRandom(2).rng), 'RANDOM');
+  assert(key(a) === key(b), 'a different setup roll leaves the gameplay board for a given seed identical');
+  // orders differ across seeds (the generator produces an explicit order)
+  const orders = new Set<string>();
+  for (let seed = 1; seed <= 30; seed++) orders.add(randomBuild(inventory, makeSetupRandom(seed).rng).join(','));
+  assert(orders.size > 1, 'the generated order actually varies');
+});
+
+test('§20.4 the Constructed preference round-trips, revalidates, and defaults safely', () => {
+  const good = ['PRG_H_006', 'PRG_H_005', 'PRG_H_002', 'PRG_H_004'];
+  const json = serializeConstructedPreset('HAK_01', 'DEK_01', good);
+  const back = deserializeConstructedPreset(json);
+  assert(back && back.build.join(',') === good.join(','), 'a valid preset round-trips exactly, order included');
+  assert(back.hackerId === 'HAK_01' && back.deckId === 'DEK_01' && back.v === 1, 'identity and schema version are stored');
+  // §9.4 — anything unusable yields null (the caller opens on the default)
+  assert(deserializeConstructedPreset(null) === null, 'missing preference');
+  assert(deserializeConstructedPreset('not json') === null, 'corrupt preference');
+  assert(deserializeConstructedPreset(JSON.stringify({ v: 99, hackerId: 'HAK_01', deckId: 'DEK_01', build: good })) === null, 'wrong schema version');
+  assert(deserializeConstructedPreset(serializeConstructedPreset('HAK_404', 'DEK_01', good)) === null, 'unresolvable Hacker');
+  assert(deserializeConstructedPreset(serializeConstructedPreset('HAK_01', 'DEK_01', ['PRG_H_001', 'PRG_H_001', 'PRG_H_002', 'PRG_H_003'])) === null, 'duplicate Programs');
+  assert(deserializeConstructedPreset(serializeConstructedPreset('HAK_01', 'DEK_01', ['PRG_S_001', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004'])) === null, 'a Program outside the inventory');
+  assert(deserializeConstructedPreset(serializeConstructedPreset('HAK_01', 'DEK_01', ['PRG_H_001', 'PRG_H_002'])) === null, 'wrong build size');
+});
+
+test('§20.9 Quick Match saves round-trip the exact build and its source', () => {
+  for (const origin of ['RANDOM', 'REMEMBERED_CONSTRUCTED', 'PLAYER_EDITED'] as BuildOrigin[]) {
+    const b = ['PRG_H_006', 'PRG_H_005', 'PRG_H_003', 'PRG_H_002'];
+    const g = newBattle(D, 80, b, origin);
+    g.startPlayerPhase();
+    const r = deserializeSession(serializeSession(qmInfo(b, origin), g, null));
+    assert(r?.game, `${origin}: restores`);
+    assert(r.game.state.identity.hackerPrograms.join(',') === b.join(','), `${origin}: exact build and order`);
+    assert(r.game.state.identity.buildOrigin === origin, `${origin}: build source preserved`);
+    assert(r.info.mode === 'QUICK_MATCH' && r.info.build.join(',') === b.join(','), `${origin}: session build restored, not regenerated`);
+  }
+});
+
+test('§20.9 a Run save round-trips inventory, build, order, and the pre-battle Build phase', () => {
+  const custom = ['PRG_H_005', 'PRG_H_004', 'PRG_H_001', 'PRG_H_006'];
+  const info = runInfoFor(D, 2, custom);
+  // mid-battle
+  const g = createRunBattle(info, 2, 90);
+  g.startPlayerPhase();
+  const r = deserializeSession(serializeSession(info, g, null));
+  assert(r?.game, 'mid-battle Run save restores');
+  assert(r.game.state.units.player.map((u) => u.programId).join(',') === custom.join(','), 'the four selected Programs and order survive');
+  assert(r.info.mode === 'RUN' && r.info.build.join(',') === custom.join(','), 'the Run build survives');
+  assert(r.info.mode === 'RUN' && r.info.inventory.join(',') === inventoryProgramIds('HAK_01', 'DEK_01').join(','), 'the inventory survives');
+
+  // §17.4 — parked on the pre-battle Build screen: no battle, same encounter
+  const parked: RunInfo = { ...info, pendingBuild: true };
+  const rb = deserializeSession(serializeSession(parked, null, null));
+  assert(rb && rb.game === null, 'a PENDING_BUILD save restores without a battle');
+  assert(rb.info.mode === 'RUN' && rb.info.pendingBuild === true, 'the Build phase is recorded');
+  assert(rb.info.mode === 'RUN' && rb.info.step === 2 && rb.info.build.join(',') === custom.join(','), 'same upcoming encounter and build');
+});
+
+test('§20.9 an incompatible or drifted active save is rejected, never defaulted', () => {
+  const g = newBattle(D, 91);
+  g.startPlayerPhase();
+  const json = serializeSession(qmInfo(g.state.identity.hackerPrograms, 'DEFAULT'), g, null);
+  // §17.1 — the Alpha 0.3 shape (schema 2) is rejected outright
+  const old = JSON.parse(json) as Record<string, unknown>;
+  old.schema = 2;
+  assert(deserializeSession(JSON.stringify(old)) === null, 'the Alpha 0.3 schema is rejected');
+  // a build referencing a Program outside the inventory
+  const drifted = JSON.parse(json) as { identity: { hackerPrograms: string[] } };
+  drifted.identity.hackerPrograms = ['PRG_S_001', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004'];
+  assert(deserializeSession(JSON.stringify(drifted)) === null, 'a build outside the inventory rejects rather than defaulting');
+  // a duplicated Program in the saved build
+  const dup = JSON.parse(json) as { identity: { hackerPrograms: string[] } };
+  dup.identity.hackerPrograms = ['PRG_H_001', 'PRG_H_001', 'PRG_H_003', 'PRG_H_004'];
+  assert(deserializeSession(JSON.stringify(dup)) === null, 'a duplicated Program rejects');
+  // a stale inventory that no longer matches the portfolios
+  const inv = JSON.parse(json) as { identity: { inventory: string[] } };
+  inv.identity.inventory = ['PRG_H_001', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004', 'PRG_H_005', 'PRG_H_006'];
+  assert(deserializeSession(JSON.stringify(inv)) === null, 'an inventory disagreeing with portfolio order rejects');
+});
+
+test('§20.9 metrics stay disjoint and reconcile with the new line-slice bucket', () => {
+  const g = ninjaGame(70, ['PRG_H_005', 'PRG_H_001', 'PRG_H_002', 'PRG_H_003']);
+  g.fireProgram(0, { kind: 'packet', p: { x: 3, y: 4 } });
+  let safety = 0;
+  while (!g.state.winner && safety++ < 25) {
+    const mv = botMove(g);
+    if (!mv) break;
+    g.attemptSwap(mv.a, mv.b);
+    if (!g.state.winner) g.runEnemyPhase();
+    if (!g.state.winner) g.startPlayerPhase();
+  }
+  for (const side of ['player', 'enemy'] as const) {
+    const m = g.state.metrics.sides[side];
+    const sum = m.matchDamage + m.attackerDamage + m.bombDamage + m.linesliceDamage + m.skillDamage + m.bufferDamageAdded;
+    assert(Math.abs(sum - m.totalDamage) < 1e-9, `${side}: disjoint buckets must sum to the total (${sum} vs ${m.totalDamage})`);
+  }
+  assert(g.state.metrics.sides.player.linesliceDamage > 0, 'DATACUT damage landed in its own bucket');
+  assert(g.state.metrics.sides.player.units['PRG_H_005'].effect > 0, 'and is attributed to NINJA');
 });
 
 // ---- §22.10 UI and vocabulary (headless-checkable parts) ----

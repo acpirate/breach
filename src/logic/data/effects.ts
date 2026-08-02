@@ -12,7 +12,8 @@ export type EffectId =
   | 'EFFECT_ATTACK'
   | 'EFFECT_DRAIN'
   | 'EFFECT_SHIELD'
-  | 'EFFECT_SHAKE';
+  | 'EFFECT_SHAKE'
+  | 'EFFECT_LINESLICE';
 
 // The discrete Function-CSV parameter columns an effect contract can claim.
 export type EffectParamName = 'quantity' | 'countdown' | 'areaPattern' | 'magnitude' | 'damage';
@@ -35,13 +36,28 @@ export interface EffectTupleField {
   max: number;
 }
 
+// Alpha 0.4.0 §12 — what a targeted operation asks the player to pick.
+//   'unit'   — an opposing Program slot (Drain).
+//   'packet' — one Datastream coordinate (LineSlice / targeted Bomb).
+export type TargetKind = 'unit' | 'packet';
+
 export interface EffectContract {
   id: EffectId;
   required: ReadonlyArray<EffectParamName>;
+  // Alpha 0.4.0 §12/§14.2 — optional discrete parameter columns. Listed
+  // columns are accepted when populated (and validated) but never required;
+  // absence is meaningful rather than an error. `countdown` is optional for
+  // EFFECT_BOMB because blank/zero selects immediate resolution (§14.3).
+  optional?: ReadonlyArray<EffectParamName>;
   // §3.3/§7.3 — a "non-random targeted operation" for payload-order
-  // validation. Drain is the only targeted effect (Hacker: player-chosen
-  // target; System: the explicit deterministic override).
+  // validation. Alpha 0.3 had exactly one statically targeted Effect (Drain).
+  // Alpha 0.4 adds Effects whose targeting is selected by their `params`
+  // tuple, so `targeted` here means "ALWAYS targeted"; per-row targeting is
+  // resolved into PlanOp.target at load time and is what validation and
+  // runtime actually consume.
   targeted: boolean;
+  // The kind of target this Effect asks for when it is targeted at all.
+  targetKind?: TargetKind;
   // Present iff this Effect requires a compound `params` tuple. Absent means a
   // populated `params` column is unused (a warning, per §9's convention for
   // populated-but-unused parameters).
@@ -65,12 +81,51 @@ export function isEffectId(s: string): s is EffectId {
   return registry.has(s as EffectId);
 }
 
-// §9.1-9.5 contracts. Unused = every param column not listed as required.
-registerEffect({ id: 'EFFECT_BOMB', required: ['quantity', 'countdown', 'areaPattern'], targeted: false });
+// Alpha 0.4.0 §14.2 — EFFECT_BOMB takes exactly three colon-delimited integer
+// enum values:  targeting:dealDamage:gainCharge
+// Every live Bomb row must supply all three; trailing defaults are never
+// inferred from the old hardcoded behavior (§4.8).
+export const BOMB_TUPLE: ReadonlyArray<EffectTupleField> = [
+  { name: 'targeting', min: 0, max: 1 },
+  { name: 'dealDamage', min: 0, max: 1 },
+  { name: 'gainCharge', min: 0, max: 1 },
+];
+
+// Alpha 0.4.0 §13.2 — EFFECT_LINESLICE takes exactly five:
+//   dimension:targeting:specialRetention:dealDamage:gainCharge
+export const LINESLICE_TUPLE: ReadonlyArray<EffectTupleField> = [
+  { name: 'dimension', min: 0, max: 1 },
+  { name: 'targeting', min: 0, max: 1 },
+  { name: 'specialRetention', min: 0, max: 2 },
+  { name: 'dealDamage', min: 0, max: 1 },
+  { name: 'gainCharge', min: 0, max: 1 },
+];
+
+// §9.1-9.5 contracts. Unused = every param column not listed as required or
+// optional.
+// §14.3 — `countdown` is OPTIONAL for Bombs: a positive integer deploys the
+// countdown overlay, blank/zero resolves the blast immediately.
+registerEffect({
+  id: 'EFFECT_BOMB',
+  required: ['quantity', 'areaPattern'],
+  optional: ['countdown'],
+  targeted: false,
+  targetKind: 'packet',
+  tuple: BOMB_TUPLE,
+});
 registerEffect({ id: 'EFFECT_BUFF', required: ['quantity', 'magnitude'], targeted: false });
 registerEffect({ id: 'EFFECT_ATTACK', required: ['damage'], targeted: false });
-registerEffect({ id: 'EFFECT_DRAIN', required: [], targeted: true });
+registerEffect({ id: 'EFFECT_DRAIN', required: [], targeted: true, targetKind: 'unit' });
 registerEffect({ id: 'EFFECT_SHIELD', required: ['quantity', 'magnitude'], targeted: false });
+// §13.1 — registered through the same typed-contract architecture as
+// EFFECT_SHAKE. No areaPattern: the line is derived from the resolved target.
+registerEffect({
+  id: 'EFFECT_LINESLICE',
+  required: ['quantity'],
+  targeted: false,
+  targetKind: 'packet',
+  tuple: LINESLICE_TUPLE,
+});
 
 // Alpha 0.3.0 §8.2 — EFFECT_SHAKE takes exactly four colon-delimited integer
 // enum values and no discrete parameter columns:

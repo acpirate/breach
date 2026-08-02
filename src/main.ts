@@ -16,6 +16,10 @@ import {
   DEFAULT_BATTLE_SETTINGS,
 } from './logic/constants';
 import {
+  DEFAULT_DECK_ID,
+  DEFAULT_HACKER_ID,
+  GAME_VERSION,
+  PortfolioSource,
   ResolvedDeck,
   ResolvedHacker,
   ResolvedProgram,
@@ -23,47 +27,67 @@ import {
   allHackers,
   contentStamp,
   deckById,
+  defaultBuild,
+  functionTargetKind,
   getContent,
   hackerById,
+  inventoryFor,
+  inventoryProgramIds,
+  programById,
   programsFor,
-  requiresTarget,
   setActiveContent,
+  targetKindOf,
 } from './logic/data/content';
+import type { TargetKind } from './logic/data/effects';
 import { formatIssue, loadContent } from './logic/data/load';
 import { findBotMove, findHintMove } from './logic/bot';
 import { Game } from './logic/game';
 import { LOG_VERSION, SelectionLogEntry, identityStamp } from './logic/logger';
 import { BattleMetrics } from './logic/metrics';
 import {
+  BuildContext,
+  BuildState,
   PendingResultInfo,
   PendingSetup,
+  RunInfo,
   SessionInfo,
   battleContext,
+  beginBuild,
   beginSetup,
   chooseDeck,
   chooseHacker,
+  RUN_LENGTH,
   contextLabel,
   continueLabel,
   createQuickMatchBattle,
   createRunBattle,
   defaultIdentity,
+  deserializeConstructedPreset,
   deserializeSession,
   forceWinAvailable,
+  inactiveOf,
   isRunComplete,
+  makeSetupRandom,
+  moveBuildSlot,
   naturalOf,
   nextStep,
   progressesAsVictory,
+  randomBuild,
   recreateBattleFromConfig,
+  replaceInBuild,
   resolveHackerMaxLink,
+  serializeConstructedPreset,
   serializeSession,
   setupBack,
   setupComplete,
   snapshotRunSettings,
 } from './logic/session';
 import {
+  ActivationTarget,
   BattleConfig,
   BattleIdentity,
   BattleSettings,
+  BuildOrigin,
   Color,
   Pt,
   Shape,
@@ -81,9 +105,11 @@ import {
   appendWizardLog,
   clearBattleSave,
   loadBattleJson,
+  loadConstructedPreset,
   loadMenuSettings,
   readLogs,
   saveBattle,
+  saveConstructedPreset,
   saveMenuSettings,
   wipeLogs,
 } from './storage';
@@ -107,8 +133,14 @@ let battleStartAt = 0; // wall-clock anchor for this session's battle
 // MK7.7 — hint state
 let hintFiredThisTurn = false;
 let lastInputAt = performance.now();
-// Targeting mode: which Hacker slot is armed and awaiting a System target.
-let targetingSlot: number | null = null;
+// §12 — targeting mode: which Hacker control is armed, and what kind of target
+// it is waiting for. `slot` is a Program index, or DECK_SLOT for the Deck
+// Function. Tapping the armed control again cancels (the standard practice for
+// every targeted Function); tapping the target resolves it.
+const DECK_SLOT = -1;
+let targeting: { slot: number; kind: TargetKind } | null = null;
+// §8 — the Build screen's state while it is open (null at every other time).
+let build: BuildState | null = null;
 // §20.2 — true exactly while Hacker input is locked for the System turn.
 let systemTurnActive = false;
 // MK5.4: the menu's chosen settings — persisted, never implicitly reset.
@@ -165,11 +197,15 @@ function getHud(): Hud | null {
   if (!game) return null;
   const s = game.state;
   const act = canAct();
-  const hacker = programsFor('player');
-  const system = programsFor('enemy');
+  // §5.8/§19.4 — the battle roster IS the ordered active build; the Program
+  // boxes read top-to-bottom in exactly that order.
+  const hacker = s.units.player.map((u) => programById(u.programId));
+  const system = s.units.enemy.map((u) => programById(u.programId));
   // §7.1 — the fifth Hacker-side control is Deck-owned; its label and cost come
   // from resolved Deck content, never from a Program.
   const deck = deckById(s.identity.deckId);
+  const packetMode = targeting?.kind === 'packet';
+  const unitMode = targeting?.kind === 'unit';
   return {
     hpPlayer: Math.max(0, s.hp.player),
     hpPlayerMax: s.config.playerHp,
@@ -195,12 +231,20 @@ function getHud(): Hud | null {
     canAct: act,
     statusText: s.winner
       ? ''
-      : targetingSlot !== null
-        ? 'Tap a System Program to drain it'
-        : act
-          ? 'Fire Functions, then swap to Sync'
-          : '…',
-    targeting: targetingSlot !== null,
+      : packetMode
+        ? 'Tap a Packet to target — tap the Program again to cancel'
+        : unitMode
+          ? 'Tap a System Program to drain it — tap the Program again to cancel'
+          : act
+            ? 'Fire Functions, then swap to Sync'
+            : '…',
+    // §12/§19.4 — while armed, everything that is NOT a legal target dims and
+    // the armed control carries a red X (tap it to cancel). Packet targeting
+    // lights the Datastream; unit targeting lights the System Program boxes.
+    targeting: targeting !== null,
+    targetPackets: packetMode,
+    targetUnits: unitMode,
+    armedSlot: targeting ? targeting.slot : null,
     systemTurn: systemTurnActive,
   };
 }
@@ -564,6 +608,63 @@ function programLine(p: ResolvedProgram): string {
   );
 }
 
+// ---- §7 shared Program inspection ----
+// ONE informational component, opened from Hacker Selection, Deck Selection,
+// and the Build screen. It is strictly read-only: it never edits the build,
+// never renders Function `notes` as player-facing copy, and never synthesizes
+// prose from Effect parameters (§7).
+
+const SOURCE_LABEL: Record<PortfolioSource, string> = {
+  HACKER_PORTFOLIO: 'Hacker',
+  DECK_PORTFOLIO: 'Deck',
+};
+
+// §7 — Alpha 0.4 has no authored Function-description infrastructure, and
+// deciding how those are written and stored is explicitly the designer's next
+// call. Until then this literal placeholder holds the layout region.
+const FUNCTION_DESCRIPTION_PLACEHOLDER = 'Function description goes here';
+
+function showProgramInspection(programId: string, source: PortfolioSource | null, back: () => void): void {
+  const p = programById(programId);
+  const wrap = document.createElement('div');
+  wrap.className = 'config readonly';
+  const row = (text: string, head = false): void => {
+    const d = document.createElement('div');
+    if (head) d.className = 'cfghead';
+    d.textContent = text;
+    wrap.appendChild(d);
+  };
+  row(`${p.name} [${p.id}]`, true);
+  if (source) row(`Source: ${SOURCE_LABEL[source]} portfolio`);
+  row(`Colors: ${colorList(p.colors)}`);
+  row(`Shapes: ${shapeList(p.shapes)}`);
+  row('FUNCTION', true);
+  row(`${p.fn.name} [${p.fn.id}]`);
+  row(`Charge cost: ${p.cost}`);
+  row(startChargeText(p.fn.startCharged, p.cost));
+  row(FUNCTION_DESCRIPTION_PLACEHOLDER);
+  const panels = document.createElement('div');
+  panels.className = 'panelscroll';
+  panels.appendChild(wrap);
+  showDialog('PROGRAM', '', [['Back', back]], panels, true);
+}
+
+// A tappable row of portfolio Programs — used by both selection screens. Each
+// chip opens the shared inspection modal and nothing else (§19.2).
+function portfolioStrip(programIds: ReadonlyArray<string>, source: PortfolioSource, back: () => void): HTMLElement {
+  const wrap = document.createElement('div');
+  wrap.className = 'prgstrip';
+  for (const id of programIds) {
+    const p = programById(id);
+    const b = document.createElement('button');
+    b.className = 'prgchip';
+    b.textContent = `${p.name} — ${p.fn.name} (${p.cost})`;
+    b.addEventListener('click', () => showProgramInspection(id, source, back));
+    wrap.appendChild(b);
+  }
+  return wrap;
+}
+
 // ---- character sheets (§20.3 — per side, opened from the avatar boxes) ----
 
 function characterSheetSide(cfg: BattleConfig, side: Side, identity: BattleIdentity): HTMLElement {
@@ -604,9 +705,21 @@ function characterSheetSide(cfg: BattleConfig, side: Side, identity: BattleIdent
     row(`${deck.name} [${deck.id}] — +${deck.addLink} LINK`);
     row(`${deck.fn.name} costs ${deck.fn.cost}, ${startChargeText(deck.fn.startCharged, deck.fn.cost)}`);
   }
-  row('PROGRAMS', true);
-  for (const p of programsFor(side)) row(programLine(p));
+  // §5.3/§19.4 — the ACTIVE build in battle order, numbered so the charge
+  // priority the player is looking at is unambiguous.
+  row('PROGRAMS (active, top to bottom)', true);
+  const roster = side === 'player' ? identity.hackerPrograms : identity.systemPrograms;
+  roster.forEach((id, i) => row(`${i + 1}. ${programLine(programById(id))}`));
+  if (side === 'player') {
+    const inactive = identity.inventory.filter((id) => !identity.hackerPrograms.includes(id));
+    if (inactive.length) {
+      row('INVENTORY (inactive this battle)', true);
+      for (const id of inactive) row(programLine(programById(id)));
+    }
+  }
   row('GENERAL', true);
+  // §10.4 — charge no longer reaches every compatible Program at once.
+  row('Charge routes top-to-bottom: the first compatible Program that is not full takes it, and the overflow passes down.');
   row(`Charge: +${CHARGE_PER_TILE_COLOR_MATCH} per Packet of a Program's bound color, +${CHARGE_PER_TILE_SHAPE_MATCH} per bound shape`);
   row(`Neutral Packets: ${DAMAGE_PER_TILE_NEUTRAL} damage (Sync only with other neutrals); each one sliced in your Sync gives your Deck +${DECK_CHARGE_PER_NEUTRAL_TILE} charge`);
   return wrap;
@@ -640,11 +753,16 @@ function appendWizard(action: WizardAction): void {
   });
 }
 
-// §21.2 — COMMITTED selection events and battle creation. Preselection, screen
-// views, and Back navigation are deliberately never logged as committed choices.
+// §21.2/§18.2 — COMMITTED selection events and battle creation. Preselection,
+// screen views, and Back navigation are deliberately never logged as committed
+// choices.
 function logSelection(
   event: SelectionLogEntry['event'],
-  opts: { g?: Game; identity?: Partial<SelectionLogEntry['identity']> },
+  opts: {
+    g?: Game;
+    identity?: Partial<SelectionLogEntry['identity']>;
+    extra?: Partial<SelectionLogEntry>;
+  },
 ): void {
   const entry: SelectionLogEntry = {
     v: LOG_VERSION,
@@ -655,8 +773,55 @@ function logSelection(
     ...(session ? { mode: session.mode } : {}),
     ...(session?.mode === 'RUN' ? { runStep: session.step } : {}),
     ...(opts.g ? { battleId: opts.g.state.battleId, hackerMaxLink: opts.g.state.config.playerHp, systemMaxIce: opts.g.state.config.enemyHp } : {}),
+    ...(opts.extra ?? {}),
   };
   appendSelectionLog(entry);
+}
+
+// §18.2 — the portfolio/inventory context every setup and build record carries.
+function portfolioContext(hackerId: string, deckId: string): Partial<SelectionLogEntry> {
+  const entries = inventoryFor(hackerId, deckId);
+  return {
+    hackerPortfolio: [...hackerById(hackerId).portfolioProgramIds],
+    deckPortfolio: [...deckById(deckId).portfolioProgramIds],
+    inventory: entries.map((e) => e.programId),
+    inventorySources: entries.map((e) => e.source),
+  };
+}
+
+// §18.3 — every ACCEPTED replacement and reorder, with before/after order.
+function logBuildChange(kind: 'REPLACE' | 'REORDER', before: string[], after: string[]): void {
+  if (!build) return;
+  logSelection(kind === 'REPLACE' ? 'BUILD_REPLACE' : 'BUILD_REORDER', {
+    identity: { hackerId: build.hackerId, deckId: build.deckId },
+    extra: {
+      buildContext: build.context,
+      buildBefore: [...before],
+      build: [...after],
+      buildOrigin: build.origin,
+    },
+  });
+}
+
+function logBuildOpened(s: BuildState): void {
+  logSelection('BUILD_OPENED', {
+    identity: { hackerId: s.hackerId, deckId: s.deckId },
+    extra: {
+      ...portfolioContext(s.hackerId, s.deckId),
+      buildContext: s.context,
+      buildOrigin: s.origin,
+      build: [...s.build],
+    },
+  });
+}
+
+// §8.7/§17.4 — persist Build edits immediately once the Run is COMMITTED, so a
+// suspension can never resume a stale or half-applied build. Pending setup
+// (initial Run) and Constructed Quick Match Build write nothing.
+function persistBuildIfCommitted(): void {
+  if (!build || !session || session.mode !== 'RUN' || !session.pendingBuild) return;
+  session = { ...session, build: [...build.build], buildOrigin: build.origin };
+  saveBattle(serializeSession(session, null, null), 0);
 }
 
 // After every completed action: drain and context-stamp turn logs, then
@@ -707,6 +872,8 @@ function showTitle(): void {
   session = null;
   pending = null;
   setup = null; // §12.2 — returning to Title discards pending setup ONLY
+  build = null;
+  targeting = null;
   systemTurnActive = false;
   view.clearBoard();
   const restored = deserializeSession(loadBattleJson());
@@ -714,14 +881,15 @@ function showTitle(): void {
   if (restored) {
     buttons.push([continueLabel(restored.info), () => void resumeSession()]);
   }
-  const savedInfo = restored ? restored.info : null;
-  buttons.push(['Quick Match', () => confirmReplace(savedInfo, () => void startQuickMatch())]);
+  // §9.1 — Quick Match is a bounded submenu now; neither mode replaces the
+  // save until its battle is actually created.
+  buttons.push(['Quick Match', showQuickMatchMenu]);
   // §12.1/§12.3 — New Run enters SETUP. The resident save is preserved
-  // throughout Hacker Selection, Deck Selection, and Build Review; only the
-  // final Start Run action replaces it.
+  // throughout Hacker Selection, Deck Selection, and Build; only the final
+  // Start Run action replaces it.
   buttons.push(['New Run', () => showHackerSelection(beginSetup())]);
   buttons.push(['Settings', showSettings]);
-  showDialog('BREACH — alpha-0.3.0', '', buttons);
+  showDialog(`BREACH — ${GAME_VERSION}`, '', buttons);
 }
 
 // §12.3 replacement confirmation — only when a valid resident save exists.
@@ -790,9 +958,15 @@ function showHackerSelection(s: PendingSetup): void {
       id: h.id,
       title: `${h.name} [${h.id}]`,
       lines: [
-        `Base LINK ${h.baseLink}`,
+        // §6.1 — the LINK contribution resolved under the CURRENT selection
+        // context, plus strong AND weak sets on both axes.
+        s.deckId
+          ? `LINK ${resolveHackerMaxLink(menuSettings, h.id, s.deckId)} (base ${h.baseLink} + deck ${deckById(s.deckId).addLink})`
+          : `Base LINK ${h.baseLink}`,
         `Strong colors: ${colorList(h.strongColors)}`,
+        `Weak colors: ${colorList(h.weakColors)}`,
         `Strong shapes: ${shapeList(h.strongShapes)}`,
+        `Weak shapes: ${shapeList(h.weakShapes)}`,
         ...h.skills.map((sk) => `Skill: ${sk.display}`),
       ],
     })),
@@ -802,6 +976,19 @@ function showHackerSelection(s: PendingSetup): void {
   const panels = document.createElement('div');
   panels.className = 'panelscroll';
   panels.appendChild(list);
+  // §6.1 — the selected Hacker's three Programs in authored portfolio order,
+  // each with an inspection affordance.
+  if (preselect) {
+    const head = document.createElement('div');
+    head.className = 'cfghead';
+    head.textContent = 'PROGRAMS (portfolio order)';
+    panels.appendChild(head);
+    panels.appendChild(
+      portfolioStrip(hackerById(preselect).portfolioProgramIds, 'HACKER_PORTFOLIO', () =>
+        showHackerSelection({ ...s, hackerId: preselect }),
+      ),
+    );
+  }
   showDialog(
     'SELECT HACKER',
     'Step 1 of 3',
@@ -842,7 +1029,39 @@ function showDeckSelection(s: PendingSetup): void {
   );
   const panels = document.createElement('div');
   panels.className = 'panelscroll';
+  // §6.2 — the selected Hacker's strengths sit on the PRIMARY screen so the
+  // Deck's Programs can be compared against them without navigating away.
+  if (s.hackerId) {
+    const h = hackerById(s.hackerId);
+    const cmp = document.createElement('div');
+    cmp.className = 'config readonly';
+    for (const [text, head] of [
+      [`HACKER — ${h.name}`, true],
+      [`Strong colors: ${colorList(h.strongColors)}`, false],
+      [`Weak colors: ${colorList(h.weakColors)}`, false],
+      [`Strong shapes: ${shapeList(h.strongShapes)}`, false],
+      [`Weak shapes: ${shapeList(h.weakShapes)}`, false],
+    ] as [string, boolean][]) {
+      const d = document.createElement('div');
+      if (head) d.className = 'cfghead';
+      d.textContent = text;
+      cmp.appendChild(d);
+    }
+    panels.appendChild(cmp);
+  }
   panels.appendChild(list);
+  // §6.2 — the Deck's three Programs in authored portfolio order.
+  if (preselect) {
+    const head = document.createElement('div');
+    head.className = 'cfghead';
+    head.textContent = 'PROGRAMS (portfolio order)';
+    panels.appendChild(head);
+    panels.appendChild(
+      portfolioStrip(deckById(preselect).portfolioProgramIds, 'DECK_PORTFOLIO', () =>
+        showDeckSelection({ ...s, deckId: preselect }),
+      ),
+    );
+  }
   showDialog(
     'SELECT DECK',
     'Step 2 of 3',
@@ -850,7 +1069,11 @@ function showDeckSelection(s: PendingSetup): void {
       ['Choose', () => {
         if (!preselect) return;
         logSelection('DECK_SELECTED', { identity: { hackerId: s.hackerId ?? undefined, deckId: preselect } });
-        showBuildReview(chooseDeck({ ...s, deckId: preselect }, preselect));
+        const next = chooseDeck({ ...s, deckId: preselect }, preselect);
+        setup = next;
+        // §8.3 — a newly initiated Run always opens Build on the DEFAULT
+        // build, whatever any prior Run or remembered preset held.
+        openBuild(beginBuild('INITIAL_RUN', s.hackerId!, preselect, null, 'DEFAULT'));
       }, undefined, !preselect],
       // Back RETAINS the pending choices (§12.2)
       ['Back', () => {
@@ -864,79 +1087,238 @@ function showDeckSelection(s: PendingSetup): void {
   );
 }
 
-// §15 — Fixed Build Review. Confirms the selected identity and the fixed combat
-// build before persistent Run creation. NOT a build editor: no replacement,
-// reordering, inventory, ownership, targeting, or activation controls (§15.3).
-function showBuildReview(s: PendingSetup): void {
-  setup = s;
-  if (!s.hackerId || !s.deckId) {
-    showHackerSelection(s);
-    return;
-  }
+// ============================================================================
+// §8 — FUNCTIONAL BUILD SCREEN. Replaces the Alpha 0.3 fixed Build Review.
+//
+// All four validity rules live in the session layer's build actions (§5.5), so
+// this screen owns presentation only: it can never construct an invalid build
+// because it cannot express one. Selecting an inactive Program arms it; then
+// tapping an active slot SWAPS them. ▲/▼ reorder. No drag input (§19.1).
+// ============================================================================
+
+// Which inactive Program is armed for the next slot tap (presentation state:
+// it never affects the build until a slot is chosen).
+let buildPick: string | null = null;
+
+function buildTitle(c: BuildContext): string {
+  return c === 'CONSTRUCTED_QUICK_MATCH' ? 'CONSTRUCTED QUICK MATCH' : 'BUILD';
+}
+
+// §8.2 — the final action's wording follows the flow it sits in.
+function buildStartLabel(c: BuildContext, step: number): string {
+  if (c === 'CONSTRUCTED_QUICK_MATCH') return 'Start Quick Match';
+  if (c === 'INITIAL_RUN') return 'Start Run — Battle 1';
+  if (c === 'RUN_RETRY') return `Retry Battle ${step}`;
+  return `Start Battle ${step}`;
+}
+
+function openBuild(s: BuildState): void {
+  buildPick = null;
+  build = s;
+  showBuild();
+}
+
+function showBuild(): void {
+  const s = build;
+  if (!s) return;
   const hacker = hackerById(s.hackerId);
   const deck = deckById(s.deckId);
-  // §15.2 — resolved total Hacker LINK under the CURRENT pending Normal LINK
-  // configuration (not committed until Start Run).
+  const step = session?.mode === 'RUN' ? session.step : 1;
   const totalLink = resolveHackerMaxLink(menuSettings, s.hackerId, s.deckId);
-  const wrap = document.createElement('div');
-  wrap.className = 'config readonly';
-  const row = (text: string, head = false): void => {
+
+  const panels = document.createElement('div');
+  panels.className = 'panelscroll';
+
+  // ---- identity summary (§8.1) ----
+  // Collapsed by default: it is reference information, and on a narrow phone
+  // viewport it would otherwise push the four active slots and the reorder
+  // controls out of reach (§19.1/§19.3). The summary line still states the
+  // selected Hacker, Deck, Deck Function, and resolved LINK at a glance.
+  const idBox = document.createElement('div');
+  idBox.className = 'config readonly';
+  const details = document.createElement('details');
+  details.className = 'cfgsection';
+  const summary = document.createElement('summary');
+  summary.textContent = `${hacker.name} + ${deck.name} — LINK ${totalLink}, ${deck.fn.name} (${deck.fn.cost})`;
+  details.appendChild(summary);
+  const idRow = (text: string, head = false): void => {
     const d = document.createElement('div');
     if (head) d.className = 'cfghead';
     d.textContent = text;
-    wrap.appendChild(d);
+    details.appendChild(d);
   };
-  row('HACKER', true);
-  row(`${hacker.name} [${hacker.id}]`);
-  row(
-    menuSettings.normalLink
-      ? `Total LINK ${totalLink} (base ${hacker.baseLink} + deck ${deck.addLink})`
-      : `Total LINK ${totalLink} (manual — Normal LINK is OFF)`,
-  );
-  row(`Strong colors: ${colorList(hacker.strongColors)}`);
-  row(`Strong shapes: ${shapeList(hacker.strongShapes)}`);
-  row('SKILLS', true);
-  if (!hacker.skills.length) row('none');
-  for (const sk of hacker.skills) row(`${sk.display} [${sk.id}]`);
-  row('DECK', true);
-  row(`${deck.name} [${deck.id}] — +${deck.addLink} LINK`);
-  row(`${deck.fn.name} costs ${deck.fn.cost}, ${startChargeText(deck.fn.startCharged, deck.fn.cost)}`);
-  // §5.3 — the four fixed Programs in EXACT battle order; reviewable, not editable
-  row('PROGRAMS (fixed order)', true);
-  programsFor('player').forEach((p, i) => row(`${i + 1}. ${programLine(p)}`));
-  const panels = document.createElement('div');
-  panels.className = 'panelscroll';
-  panels.appendChild(wrap);
+  idRow(`${hacker.name} [${hacker.id}] — LINK ${totalLink}`, true);
+  idRow(`Strong colors: ${colorList(hacker.strongColors)}`);
+  idRow(`Weak colors: ${colorList(hacker.weakColors)}`);
+  idRow(`Strong shapes: ${shapeList(hacker.strongShapes)}`);
+  idRow(`Weak shapes: ${shapeList(hacker.weakShapes)}`);
+  for (const sk of hacker.skills) idRow(`Skill: ${sk.display}`);
+  idRow(`${deck.name} [${deck.id}] — +${deck.addLink} LINK`, true);
+  idRow(`Deck Function: ${deck.fn.name} costs ${deck.fn.cost}, ${startChargeText(deck.fn.startCharged, deck.fn.cost)}`);
+  idBox.appendChild(details);
+  panels.appendChild(idBox);
 
-  const restored = deserializeSession(loadBattleJson());
-  showDialog(
-    'BUILD REVIEW',
-    'Step 3 of 3 — this build is fixed for Alpha 0.3',
-    [
-      // §12.3 — the ONLY setup action that replaces/creates a save. Cancel
-      // leaves the old save and this pending Build Review unchanged.
-      ['Start Run', () => confirmReplace(restored ? restored.info : null, () => void commitRun(), () => showBuildReview(s))],
-      ['Back', () => {
-        const prev = setupBack(s);
-        if (prev) showDeckSelection(prev);
-        else showTitle();
-      }],
-    ],
-    panels,
-    true,
-  );
+  // ---- four ordered active slots (§8.1/§5.7) ----
+  const activeHead = document.createElement('div');
+  activeHead.className = 'cfghead';
+  activeHead.textContent = buildPick
+    ? `ACTIVE BUILD — tap a slot to swap in ${programById(buildPick).name}`
+    : 'ACTIVE BUILD (top to bottom)';
+  panels.appendChild(activeHead);
+
+  const slots = document.createElement('div');
+  slots.className = 'buildslots';
+  s.build.forEach((programId, i) => {
+    const p = programById(programId);
+    const entry = s.inventory.find((e) => e.programId === programId)!;
+    const rowEl = document.createElement('div');
+    rowEl.className = buildPick ? 'bslot armed' : 'bslot';
+
+    const pick = document.createElement('button');
+    pick.className = 'bslotmain';
+    pick.innerHTML = '';
+    const line1 = document.createElement('div');
+    line1.className = 'optname';
+    line1.textContent = `${i + 1}. ${p.name} [${SOURCE_LABEL[entry.source]}]`;
+    const line2 = document.createElement('div');
+    line2.className = 'optline';
+    line2.textContent = `${colorList(p.colors)} + ${shapeList(p.shapes)} — ${p.fn.name} (${p.cost})`;
+    pick.appendChild(line1);
+    pick.appendChild(line2);
+    pick.addEventListener('click', () => {
+      if (buildPick) {
+        // §5.6 — swap: the armed inactive Program takes this slot and the
+        // displaced Program returns to the inventory. Four slots stay filled.
+        const next = replaceInBuild(s, i, buildPick);
+        if (next !== s) logBuildChange('REPLACE', s.build, next.build);
+        buildPick = null;
+        build = next;
+        persistBuildIfCommitted();
+        showBuild();
+        return;
+      }
+      // §19.3 — inspection must never edit the build.
+      showProgramInspection(programId, entry.source, showBuild);
+    });
+    rowEl.appendChild(pick);
+
+    const moves = document.createElement('div');
+    moves.className = 'bslotmoves';
+    const mk = (label: string, delta: -1 | 1, enabled: boolean): void => {
+      const b = document.createElement('button');
+      b.className = 'bmove';
+      b.textContent = label;
+      b.disabled = !enabled;
+      b.addEventListener('click', () => {
+        const next = moveBuildSlot(s, i, delta);
+        if (next !== s) logBuildChange('REORDER', s.build, next.build);
+        build = next;
+        persistBuildIfCommitted();
+        showBuild();
+      });
+      moves.appendChild(b);
+    };
+    mk('▲', -1, i > 0);
+    mk('▼', 1, i < s.build.length - 1);
+    rowEl.appendChild(moves);
+    slots.appendChild(rowEl);
+  });
+  panels.appendChild(slots);
+
+  // ---- the remaining inventory (§8.1) ----
+  const invHead = document.createElement('div');
+  invHead.className = 'cfghead';
+  invHead.textContent = 'INVENTORY (inactive)';
+  panels.appendChild(invHead);
+
+  const inv = document.createElement('div');
+  inv.className = 'buildslots';
+  for (const entry of inactiveOf(s)) {
+    const p = entry.program;
+    const rowEl = document.createElement('div');
+    rowEl.className = buildPick === entry.programId ? 'bslot inactive sel' : 'bslot inactive';
+    const pick = document.createElement('button');
+    pick.className = 'bslotmain';
+    const line1 = document.createElement('div');
+    line1.className = 'optname';
+    line1.textContent = `${p.name} [${SOURCE_LABEL[entry.source]}]`;
+    const line2 = document.createElement('div');
+    line2.className = 'optline';
+    line2.textContent = `${colorList(p.colors)} + ${shapeList(p.shapes)} — ${p.fn.name} (${p.cost})`;
+    pick.appendChild(line1);
+    pick.appendChild(line2);
+    pick.addEventListener('click', () => {
+      buildPick = buildPick === entry.programId ? null : entry.programId;
+      showBuild();
+    });
+    rowEl.appendChild(pick);
+    const info = document.createElement('div');
+    info.className = 'bslotmoves';
+    const b = document.createElement('button');
+    b.className = 'bmove';
+    b.textContent = 'i';
+    b.addEventListener('click', () => showProgramInspection(entry.programId, entry.source, showBuild));
+    info.appendChild(b);
+    rowEl.appendChild(info);
+    inv.appendChild(rowEl);
+  }
+  panels.appendChild(inv);
+
+  // ---- context-appropriate actions (§8.2/§8.3/§8.4/§8.5) ----
+  const buttons: ButtonSpec[] = [];
+  const startLabel = buildStartLabel(s.context, step);
+  if (s.context === 'INITIAL_RUN') {
+    const restored = deserializeSession(loadBattleJson());
+    // §12.3/§17.3 — the ONLY setup action that replaces the save.
+    buttons.push([startLabel, () => confirmReplace(restored ? restored.info : null, () => void commitRun(), showBuild)]);
+    buttons.push(['Back', () => {
+      // §6.3 — Back preserves pending setup; the resident save is untouched.
+      const prev = setup ? setupBack(setup) : null;
+      build = null;
+      if (prev) showDeckSelection(prev);
+      else showTitle();
+    }]);
+  } else if (s.context === 'CONSTRUCTED_QUICK_MATCH') {
+    const restored = deserializeSession(loadBattleJson());
+    buttons.push([startLabel, () => confirmReplace(restored ? restored.info : null, () => void startConstructedQuickMatch(), showBuild)]);
+    // §9.3 — backing out neither writes the preset nor replaces the save.
+    buttons.push(['Back', () => {
+      build = null;
+      showQuickMatchMenu();
+    }]);
+  } else {
+    buttons.push([startLabel, () => void startRunBattleFromBuild()]);
+    // §8.4 — a committed Run may be suspended from Build and resumes here.
+    buttons.push(['Save and Quit', () => {
+      persistBuildIfCommitted();
+      build = null;
+      showTitle();
+    }]);
+  }
+
+  const sub =
+    s.context === 'INITIAL_RUN'
+      ? 'Step 3 of 3 — choose four Programs and their order'
+      : s.context === 'CONSTRUCTED_QUICK_MATCH'
+        ? 'Choose four Programs and their order'
+        : `Battle ${step} of ${RUN_LENGTH} — adjust your build`;
+  showDialog(buildTitle(s.context), sub, buttons, panels, true);
 }
 
-// §12.3 — atomic commitment: replace the save, commit the selected identity,
-// construct the Run, save Battle 1, and enter battle.
+// §12.3/§17.3 — atomic commitment: replace the save, commit the selected
+// identity, record the derived inventory and the final ordered build, create
+// Battle 1, and enter it.
 async function commitRun(): Promise<void> {
-  if (!setup || !setupComplete(setup) || !setup.hackerId || !setup.deckId) return;
+  if (!setup || !setupComplete(setup) || !setup.hackerId || !setup.deckId || !build) return;
   const hackerId = setup.hackerId;
   const deckId = setup.deckId;
   // §10.4 — snapshot the settings (including Normal LINK) and resolve the
   // effective Hacker maximum LINK now; the whole Run uses these saved values.
   const settings = snapshotRunSettings(menuSettings);
   const hackerMaxLink = resolveHackerMaxLink(settings, hackerId, deckId);
+  const finalBuild = [...build.build];
+  const origin = build.origin;
+  const edited = build.edited;
   clearBattleSave();
   session = {
     mode: 'RUN',
@@ -944,12 +1326,50 @@ async function commitRun(): Promise<void> {
     settings,
     identity: { hackerId, deckId, selectionSource: 'EXPLICIT_SELECTION' },
     hackerMaxLink,
+    inventory: inventoryProgramIds(hackerId, deckId),
+    build: finalBuild,
+    buildOrigin: origin,
   };
   pending = null;
   setup = null;
+  build = null;
   const g = createRunBattle(session, 1);
-  logSelection('RUN_CREATED', { g });
+  logSelection('RUN_CREATED', { g, extra: { ...portfolioContext(hackerId, deckId), buildContext: 'INITIAL_RUN', buildEdited: edited } });
   await enterBattle(g);
+}
+
+// §8.4/§17.4 — leave the pre-battle Build phase and start the encounter with
+// the build exactly as it now stands.
+async function startRunBattleFromBuild(): Promise<void> {
+  if (!build || !session || session.mode !== 'RUN') return;
+  const finalBuild = [...build.build];
+  const edited = build.edited;
+  const context = build.context;
+  session = { ...session, build: finalBuild, buildOrigin: build.origin };
+  delete (session as RunInfo).pendingBuild;
+  build = null;
+  pending = null;
+  const g = createRunBattle(session, session.step);
+  logSelection('BATTLE_BUILD_APPLIED', { g, extra: { buildContext: context, buildEdited: edited } });
+  await enterBattle(g);
+}
+
+// §8.4/§8.5 — open the pre-battle Build screen for the current Run step. The
+// committed Run parks here as real, saveable state.
+function openRunBuild(context: 'RUN_BETWEEN' | 'RUN_RETRY'): void {
+  if (!session || session.mode !== 'RUN') return;
+  session = { ...session, pendingBuild: true };
+  pending = null;
+  game = null;
+  view.clearBoard();
+  // §8.4 — carry the Run's current build and order forward; §8.5 does the same
+  // for a retry so the player can adjust before the rematch.
+  const s = beginBuild(context, session.identity.hackerId, session.identity.deckId, session.build, 'CARRIED_RUN');
+  // openBuild installs `s` as the live Build state; persisting must follow it,
+  // or the save would capture the PREVIOUS screen's build.
+  openBuild(s);
+  persistBuildIfCommitted();
+  logBuildOpened(s);
 }
 
 // ---- battle starts (all battle construction goes through logic/session.ts) ----
@@ -958,7 +1378,7 @@ async function enterBattle(g: Game): Promise<void> {
   hideDialog();
   game = g;
   selection = null;
-  targetingSlot = null;
+  targeting = null;
   systemTurnActive = false;
   battleStartAt = Date.now();
   view.reset(gridViewOf(game.state.board));
@@ -970,31 +1390,109 @@ async function enterBattle(g: Game): Promise<void> {
   maybeGameOver();
 }
 
-// §16 — Quick Match stays a direct single-battle title flow: it resolves the
-// explicit default Hacker and Deck IDs, records them as DEFAULTED rather than
-// explicitly chosen, and never shows the selection screens.
-async function startQuickMatch(): Promise<void> {
-  clearBattleSave(); // confirmed replacement
+// ---- §9 Quick Match: Random and Constructed ----
+
+// §9.1 — a bounded choice screen replaces the direct launch. Both modes use
+// the explicit default identity; neither adds a selection screen.
+function showQuickMatchMenu(): void {
+  build = null;
+  showDialog(
+    'QUICK MATCH',
+    `${hackerById(DEFAULT_HACKER_ID).name} / ${deckById(DEFAULT_DECK_ID).name}`,
+    [
+      ['Random Quick Match', () => {
+        const restored = deserializeSession(loadBattleJson());
+        confirmReplace(restored ? restored.info : null, () => void startRandomQuickMatch(), showQuickMatchMenu);
+      }],
+      // §9.3 — Constructed opens Build FIRST; the save is replaced only when
+      // the battle actually starts.
+      ['Constructed Quick Match', openConstructedQuickMatchBuild],
+      ['Back', showTitle],
+    ],
+  );
+}
+
+// §9.3 — open the Constructed Build screen: the last valid remembered build
+// when one exists, otherwise the default.
+function openConstructedQuickMatchBuild(): void {
   const ids = defaultIdentity();
-  session = { mode: 'QUICK_MATCH', identity: ids };
+  // §9.4 — an unusable preference is discarded quietly and falls back to the
+  // default; it never blocks startup or the mode.
+  const preset = deserializeConstructedPreset(loadConstructedPreset());
+  const usable = preset && preset.hackerId === ids.hackerId && preset.deckId === ids.deckId ? preset.build : null;
+  if (preset && !usable) {
+    console.warn('[breach] remembered Constructed build does not match the default identity — using the default build');
+  }
+  const s = beginBuild('CONSTRUCTED_QUICK_MATCH', ids.hackerId, ids.deckId, usable, 'REMEMBERED_CONSTRUCTED');
+  openBuild(s);
+  logBuildOpened(s);
+}
+
+// §9.2 — Random Quick Match: sample four of the six inventory Programs without
+// replacement, give them an explicit random order, log the whole resolution,
+// and start the battle WITHOUT opening Build.
+async function startRandomQuickMatch(): Promise<void> {
+  const ids = defaultIdentity();
+  const inventory = inventoryProgramIds(ids.hackerId, ids.deckId);
+  // §9.2 — an isolated setup random source. The Game seeds its gameplay RNG
+  // separately at construction, so this cannot perturb the board, refills, or
+  // AI sequence for a given gameplay seed.
+  const { rng, seed } = makeSetupRandom();
+  const chosen = randomBuild(inventory, rng);
+  clearBattleSave(); // confirmed replacement
+  session = { mode: 'QUICK_MATCH', identity: ids, build: chosen, buildOrigin: 'RANDOM' };
   pending = null;
   setup = null;
-  const g = createQuickMatchBattle(menuSettings, ids);
-  logSelection('QUICK_MATCH_CREATED', { g });
+  build = null;
+  // §18.4 — logged BEFORE battle creation.
+  logSelection('BUILD_OPENED', {
+    identity: { hackerId: ids.hackerId, deckId: ids.deckId },
+    extra: {
+      ...portfolioContext(ids.hackerId, ids.deckId),
+      buildContext: 'RANDOM_QUICK_MATCH',
+      buildOrigin: 'RANDOM',
+      build: [...chosen],
+      setupSeed: seed,
+      gameplayRngIndependent: true,
+    },
+  });
+  const g = createQuickMatchBattle(menuSettings, ids, chosen, 'RANDOM');
+  logSelection('QUICK_MATCH_CREATED', { g, extra: { buildContext: 'RANDOM_QUICK_MATCH', buildEdited: false } });
   await enterBattle(g);
 }
 
-// §18.3 — Quick Match Reset restarts under the concluded battle's OWN config
-// and identity, not under current menu settings.
+// §9.3 — start the Constructed battle and remember the build. The preset is
+// written ONLY here, never on Back.
+async function startConstructedQuickMatch(): Promise<void> {
+  if (!build) return;
+  const ids = defaultIdentity();
+  const chosen = [...build.build];
+  const edited = build.edited;
+  saveConstructedPreset(serializeConstructedPreset(ids.hackerId, ids.deckId, chosen));
+  clearBattleSave();
+  session = { mode: 'QUICK_MATCH', identity: ids, build: chosen, buildOrigin: build.origin };
+  pending = null;
+  setup = null;
+  build = null;
+  const g = createQuickMatchBattle(menuSettings, ids, chosen, session.buildOrigin);
+  logSelection('QUICK_MATCH_CREATED', { g, extra: { buildContext: 'CONSTRUCTED_QUICK_MATCH', buildEdited: edited } });
+  await enterBattle(g);
+}
+
+// §18.3 — Quick Match Reset restarts under the concluded battle's OWN config,
+// identity, and BUILD, not under current menu settings and never by rerolling
+// a Random build. It does not touch the remembered Constructed preset.
 async function resetQuickMatch(config: BattleConfig, identity: BattleIdentity): Promise<void> {
   clearBattleSave();
   session = {
     mode: 'QUICK_MATCH',
     identity: { hackerId: identity.hackerId, deckId: identity.deckId, selectionSource: identity.selectionSource },
+    build: [...identity.hackerPrograms],
+    buildOrigin: identity.buildOrigin,
   };
   pending = null;
   const g = recreateBattleFromConfig(config, identity);
-  logSelection('QUICK_MATCH_CREATED', { g });
+  logSelection('QUICK_MATCH_CREATED', { g, extra: { buildEdited: false } });
   await enterBattle(g);
 }
 
@@ -1012,12 +1510,33 @@ async function resumeSession(): Promise<void> {
     showTitle(); // save vanished/corrupted since the dialog was built
     return;
   }
+  // §17.4 — a Run suspended on its pre-battle Build screen resumes to exactly
+  // that screen, with the same upcoming encounter and the same build.
+  if (!r.game) {
+    session = r.info;
+    game = null;
+    pending = null;
+    setup = null;
+    selection = null;
+    targeting = null;
+    systemTurnActive = false;
+    view.clearBoard();
+    if (r.info.mode !== 'RUN') {
+      showTitle();
+      return;
+    }
+    const s = beginBuild('RUN_BETWEEN', r.info.identity.hackerId, r.info.identity.deckId, r.info.build, r.info.buildOrigin);
+    openBuild(s);
+    logBuildOpened(s);
+    return;
+  }
   hideDialog();
   session = r.info;
   game = r.game;
   pending = r.pending;
   selection = null;
-  targetingSlot = null;
+  targeting = null;
+  build = null;
   systemTurnActive = false;
   battleStartAt = Date.now();
   view.reset(gridViewOf(game.state.board));
@@ -1065,12 +1584,14 @@ function exitToTitleClearing(): void {
   showTitle();
 }
 
+// §8.4 — the Run advances to the next encounter's BUILD screen, not straight
+// into the battle. The build carries forward and may be adjusted first.
 function advanceRun(): void {
   if (!session || session.mode !== 'RUN') return;
   const n = nextStep(session.step);
   if (n === null) return; // step 4 concludes via Run Complete, not advance
   session = { ...session, step: n };
-  void startRunStep();
+  openRunBuild('RUN_BETWEEN');
 }
 
 // §18.2 — Force Win. On a natural DEFEAT it overrides the result while
@@ -1090,17 +1611,30 @@ function forceWin(): void {
   }
 }
 
+// §8.5 — retrying a lost battle returns to BUILD for the same Run step,
+// preserving the current build as the starting state so it can be adjusted
+// before the rematch. Same step, settings, and encounter ICE; new board + RNG.
 function wizardRestartLostBattle(): void {
   if (!session || session.mode !== 'RUN') return;
   appendWizard('WIZARD_RESTART_LOST_BATTLE');
-  void startRunStep(); // same step/settings/encounter ICE; new board + RNG
+  openRunBuild('RUN_RETRY');
 }
 
+// Restart Run resets to step 1 within the same saved Run snapshot. DESIGNER
+// DECISION (2026-08-01): it opens on the DEFAULT build rather than carrying
+// the current one, future-proofing for Programs acquired mid-Run.
 function wizardRestartRun(): void {
   if (!session || session.mode !== 'RUN') return;
   appendWizard('WIZARD_RESTART_RUN');
-  session = { ...session, step: 1 };
-  void startRunStep(); // same saved Run snapshot; fresh Battle 1
+  const ids = session.identity;
+  session = { ...session, step: 1, build: defaultBuild(ids.hackerId, ids.deckId), buildOrigin: 'DEFAULT', pendingBuild: true };
+  pending = null;
+  game = null;
+  view.clearBoard();
+  const s = beginBuild('RUN_BETWEEN', ids.hackerId, ids.deckId, session.build, 'DEFAULT');
+  openBuild(s);
+  persistBuildIfCommitted();
+  logBuildOpened(s);
 }
 
 function showResultModal(): void {
@@ -1182,6 +1716,27 @@ async function doSwap(a: Pt, b: Pt): Promise<void> {
   maybeGameOver();
 }
 
+// Play out one activation's events. An empty batch means the activation was
+// rejected at the logic boundary (not charged, not resolved) — nothing to do.
+function playActivation(events: ReturnType<Game['fireProgram']>): void {
+  if (!events.length) return;
+  busy = true;
+  void view.play(events).then(() => {
+    afterAction();
+    busy = false;
+    maybeGameOver();
+  });
+}
+
+// §12.2 — resolve the armed activation against the chosen target. Target mode
+// always ends here, whether or not the activation was accepted.
+function fireArmed(target: ActivationTarget): void {
+  if (!game || !targeting) return;
+  const { slot } = targeting;
+  targeting = null;
+  playActivation(slot === DECK_SLOT ? game.fireDeckFunction(target) : game.fireProgram(slot, target));
+}
+
 // ---- startup: load + validate data BEFORE any title/battle init (§4.9) ----
 
 function showDataFailure(errors: number, warnings: number, lines: string[]): void {
@@ -1210,9 +1765,12 @@ function boot(): void {
 
   attachInput(canvas, view, {
     onTap(p: Pt): void {
-      if (!canAct()) return;
-      if (targetingSlot !== null) {
-        targetingSlot = null;
+      if (!canAct() || !game) return;
+      // §12.2 — a Packet tap CONFIRMS a targeted activation; under unit
+      // targeting the board is not a legal target and the tap is ignored
+      // (cancel is the armed control, never a stray tap).
+      if (targeting) {
+        if (targeting.kind === 'packet') fireArmed({ kind: 'packet', p });
         return;
       }
       if (selection && selection.x === p.x && selection.y === p.y) {
@@ -1230,70 +1788,57 @@ function boot(): void {
     },
     onDrag(a: Pt, b: Pt): void {
       if (!canAct()) return;
-      if (targetingSlot !== null) {
-        targetingSlot = null;
-        return;
-      }
+      if (targeting) return; // a drag is never a target confirmation
       selection = null;
       view.setSelection(null);
       void doSwap(a, b);
     },
     onProgram(i: number): void {
       if (!canAct() || !game) return;
-      if (targetingSlot !== null) {
-        targetingSlot = null;
-        return;
+      // §12.2 — tapping the ARMED control cancels; this is the standard cancel
+      // for every targeted Function. Cancelling spends no charge and does not
+      // end the turn. Tapping a DIFFERENT Program just cancels.
+      if (targeting) {
+        const rearm = targeting.slot !== i;
+        targeting = null;
+        if (!rearm) return;
       }
       const u = game.state.units.player[i];
-      const prog: ResolvedProgram = programsFor('player')[i];
-      if (requiresTarget(prog)) {
-        if (u.charge >= prog.cost) targetingSlot = i;
+      if (!u) return;
+      const prog: ResolvedProgram = programById(u.programId);
+      const need = targetKindOf(prog);
+      if (need) {
+        if (u.charge >= prog.cost) targeting = { slot: i, kind: need };
         return;
       }
-      const events = game.fireProgram(i);
-      if (!events.length) return;
-      busy = true;
-      void view.play(events).then(() => {
-        afterAction();
-        busy = false;
-        maybeGameOver();
-      });
+      playActivation(game.fireProgram(i));
     },
-    // §7.4 — the Drain target list is Programs only. The Deck Function is not a
-    // Program and is structurally absent from this channel.
+    // §7.4/§16.1 — the Drain target list is ACTIVE Programs only. The Deck
+    // Function is not a Program and is structurally absent from this channel.
     onMinion(i: number): void {
-      if (!canAct() || !game || targetingSlot === null) return;
-      const slot = targetingSlot;
-      targetingSlot = null;
-      const events = game.fireProgram(slot, i);
-      if (!events.length) return;
-      busy = true;
-      void view.play(events).then(() => {
-        afterAction();
-        busy = false;
-        maybeGameOver();
-      });
+      if (!canAct() || !game || targeting?.kind !== 'unit') return;
+      fireArmed({ kind: 'unit', idx: i });
     },
     onDeck(): void {
       if (!canAct() || !game) return;
-      if (targetingSlot !== null) {
-        targetingSlot = null;
+      if (targeting) {
+        const rearm = targeting.slot !== DECK_SLOT;
+        targeting = null;
+        if (!rearm) return;
+      }
+      const deck = deckById(game.state.identity.deckId);
+      const need = functionTargetKind(deck.fn);
+      if (need) {
+        if (game.state.deckCharge >= deck.fn.cost) targeting = { slot: DECK_SLOT, kind: need };
         return;
       }
-      const events = game.fireDeckFunction();
-      if (!events.length) return;
-      busy = true;
-      void view.play(events).then(() => {
-        afterAction();
-        busy = false;
-        maybeGameOver();
-      });
+      playActivation(game.fireDeckFunction());
     },
     // §20.3 — avatar controls open the side's character sheet. Available only
     // at the same stable input phase as Pause; never a combat event.
     onAvatar(side: Side): void {
       if (!canAct() || !game) return;
-      targetingSlot = null;
+      targeting = null;
       showCharacterSheet(side);
     },
     onMenu(): void {
@@ -1301,7 +1846,7 @@ function boot(): void {
       // Quick Match keeps Reset; a Run does NOT show it (Run restarts are
       // result-screen wizard controls).
       if (!canAct() || !game || !session) return;
-      targetingSlot = null;
+      targeting = null;
       const cfg = { ...game.state.config };
       const id = { ...game.state.identity };
       const panels = document.createElement('div');
@@ -1380,6 +1925,21 @@ function boot(): void {
 // MK4.3 console-dump helpers (sanctioned log access — no viewing UI)
 const helpers = window as unknown as Record<string, unknown>;
 helpers.breachLogs = () => readLogs();
+// Alpha 0.4.0 whitebox affordance, DEV BUILDS ONLY: fill the active Programs'
+// charge pools so charge-gated Functions (targeted DATACUT/PLINK especially)
+// can be exercised by hand without grinding out the Syncs first. Never present
+// in a production build, and it touches nothing but charge.
+if (import.meta.env.DEV) {
+  helpers.breachCharge = (slot?: number): string => {
+    if (!game) return 'no active battle';
+    const slots = slot === undefined ? game.state.units.player.map((_, i) => i) : [slot];
+    for (const i of slots) {
+      const u = game.state.units.player[i];
+      if (u) u.charge = programById(u.programId).chargeCap;
+    }
+    return game.state.units.player.map((u, i) => `${i}:${u.programId}=${u.charge}`).join(' ');
+  };
+}
 helpers.breachWipe = (opts?: { save?: boolean }) => {
   wipeLogs();
   if (opts?.save) clearBattleSave();

@@ -21,6 +21,11 @@ const TURN_LOG_KEY = 'breach:log:turns';
 const WIZARD_LOG_KEY = 'breach:log:wizard'; // Alpha 0.2.0 §5.4 wizard records
 const SELECTION_LOG_KEY = 'breach:log:selection'; // Alpha 0.3.0 §21.2
 const CONFIG_KEY = 'breach:config';
+// Alpha 0.4.0 §9.4/§17.6 — the remembered Constructed Quick Match build.
+// Deliberately its OWN key: convenience preference data, versioned separately,
+// never competing for the single active save slot and never cleared by Run
+// completion or abandonment.
+const CONSTRUCTED_PRESET_KEY = 'breach:pref:constructed';
 const MAX_WIZARD_LOG_ENTRIES = 500;
 const MAX_SELECTION_LOG_ENTRIES = 500;
 
@@ -72,6 +77,24 @@ export function clearBattleSave(): void {
     localStorage.removeItem(SAVE_KEY);
   } catch {
     /* ignore */
+  }
+}
+
+// ---- Alpha 0.4.0 §9.4 remembered Constructed build ----
+
+export function saveConstructedPreset(json: string): void {
+  try {
+    localStorage.setItem(CONSTRUCTED_PRESET_KEY, json);
+  } catch {
+    /* a convenience preference must never break the game */
+  }
+}
+
+export function loadConstructedPreset(): string | null {
+  try {
+    return localStorage.getItem(CONSTRUCTED_PRESET_KEY);
+  } catch {
+    return null;
   }
 }
 

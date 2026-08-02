@@ -40,7 +40,13 @@ export interface Hud {
   turn: number;
   canAct: boolean;
   statusText: string;
-  targeting: boolean; // targeting mode — System Program boxes are tap-targets
+  // Alpha 0.4.0 §12/§19.4 — targeting presentation. While armed, regions that
+  // are not legal targets dim and the armed control shows a red X meaning
+  // "tap again to cancel". The two target kinds light different regions.
+  targeting: boolean;
+  targetPackets: boolean; // Datastream cells are the tap-targets
+  targetUnits: boolean; // System Program boxes are the tap-targets
+  armedSlot: number | null; // Hacker Program index, or -1 for the Deck control
   // Alpha 0.3.0 §20.2 — true exactly while Hacker input is disabled for the
   // System turn. Drives the red viewport border and the Datastream dim; it
   // never affects turn timing, event ordering, or deterministic state.
@@ -381,7 +387,7 @@ export class View {
 
   private update(now: number): void {
     if (this.cur) {
-      const p = (now - this.cur.started) / this.cur.dur;
+      const p = this.cur.dur > 0 ? (now - this.cur.started) / this.cur.dur : 1;
       const e = ease(p);
       for (const tw of this.cur.tweens) {
         tw.vt.fx = tw.x0 + (tw.x1 - tw.x0) * e;
@@ -392,14 +398,35 @@ export class View {
         this.cur = null;
       }
     }
-    if (!this.cur && this.queue.length) {
-      this.cur = this.startEvent(this.queue.shift()!, now);
+    // Metrics/logging-only events carry dur 0 and are drained WITHIN this
+    // frame rather than one per frame. Charge routing alone emits ~6 such
+    // events per turn (far more on a big line-clear wave); stepping a frame
+    // for each added hundreds of milliseconds of dead time between a Sync and
+    // its visible resolution. The guard is defensive against a pathological
+    // batch, not an expected limit.
+    let guard = 0;
+    while (!this.cur && this.queue.length && guard++ < 10000) {
+      const ae = this.startEvent(this.queue.shift()!, now);
+      if (ae.dur > 0) {
+        this.cur = ae;
+        break;
+      }
+      this.finishEvent(ae);
     }
   }
 
   private startEvent(ev: GameEvent, now: number): ActiveEvent {
     const tweens: Tween[] = [];
-    let dur = 200;
+    // Duration 0 means "nothing to draw" — the event applies instantly and the
+    // pump moves straight to the next one in the same frame. That is the
+    // DEFAULT deliberately: the event stream is mostly metrics and logging, so
+    // a new event type must opt IN to costing the player time. (Before Alpha
+    // 0.4.0 the default was 200ms, which silently charged every unlisted
+    // event — `shield`, `shieldRemoved`, `placed`, `hintShown` and, once it
+    // was added, the very high-volume `chargeRoute` — a fifth of a second of
+    // dead air each.) Only the cases below draw anything; see draw()'s event
+    // overlays and the tween lists here.
+    let dur = 0;
     switch (ev.t) {
       case 'swap':
       case 'revert': {
@@ -485,20 +512,10 @@ export class View {
         this.msgText = ev.winner === 'player' ? 'System ICE breached!' : 'Hacker LINK severed!';
         this.msgUntil = now + 3000;
         break;
-      // metrics/logging-only events (MK2.3/MK4.3): nothing to draw
-      case 'ability':
-      case 'op':
-      case 'chargeWaste':
-      case 'autoReshuffle':
-      case 'cascadeDepth':
-      case 'tileStats':
-      case 'thinkTime':
-      case 'deckCharge':
-      case 'lineClear':
-      case 'skill':
-      case 'shake':
-        dur = 1;
-        break;
+      // Everything else — ability, op, chargeWaste, autoReshuffle,
+      // cascadeDepth, tileStats, thinkTime, deckCharge, lineClear, skill,
+      // shake, placed, shield, shieldRemoved, hintShown, chargeRoute,
+      // targeted — is metrics/logging only and keeps dur 0.
     }
     return { ev, started: now, dur, tweens };
   }
@@ -625,16 +642,43 @@ export class View {
     ctx.textAlign = 'center';
     ctx.fillText('≡', this.menuRect.x + this.menuRect.w / 2, this.menuRect.y + this.menuRect.h / 2 + 1);
 
-    // Hacker Program stack (left, stable authored order) + the Deck Function
+    // Hacker Program stack (left, ACTIVE BUILD order) + the Deck Function.
+    // §12 — while targeting is armed, the armed control stays lit and every
+    // other Hacker control dims; the armed one carries the cancel X.
     for (let i = 0; i < 4; i++) {
-      this.drawUnitBox(this.programRects[i], hud.programs[i], true, false);
+      const armed = hud.armedSlot === i;
+      this.drawUnitBox(this.programRects[i], hud.programs[i], true, false, hud.targeting && !armed);
+      if (armed) this.drawArmedCancel(this.programRects[i]);
     }
     this.drawDeckBox(this.deckRect, hud);
+    if (hud.armedSlot === -1) this.drawArmedCancel(this.deckRect);
 
-    // System Program stack (right; highlighted while targeting is armed)
+    // System Program stack (right; highlighted only while a UNIT target is
+    // being asked for, dimmed while a Packet target is).
     for (let i = 0; i < 4; i++) {
-      this.drawUnitBox(this.minionRects[i], hud.minions[i], false, hud.targeting);
+      this.drawUnitBox(this.minionRects[i], hud.minions[i], false, hud.targetUnits, hud.targetPackets);
     }
+  }
+
+  // §12/§19.4 — the armed control's cancel affordance: a red X over the box.
+  // Tapping the armed control is the standard cancel for every targeted
+  // Function, so the marker is identical for unit and Packet targeting.
+  private drawArmedCancel(r: Rect): void {
+    const ctx = this.ctx;
+    const m = Math.min(r.w, r.h) * 0.26;
+    const cx = r.x + r.w - m - 6;
+    const cy = r.y + r.h / 2;
+    ctx.save();
+    ctx.strokeStyle = '#ff5555';
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(cx - m / 2, cy - m / 2);
+    ctx.lineTo(cx + m / 2, cy + m / 2);
+    ctx.moveTo(cx + m / 2, cy - m / 2);
+    ctx.lineTo(cx - m / 2, cy + m / 2);
+    ctx.stroke();
+    ctx.restore();
   }
 
   // §9 avatar box: identity label, compact B/S totals (values, zero-hidden),
@@ -687,8 +731,12 @@ export class View {
     ctx.fillText(text, r.x + 6, r.y + r.h / 2 + 1);
   }
 
-  private drawUnitBox(r: Rect, u: HudUnit, interactive: boolean, targetable: boolean): void {
+  private drawUnitBox(r: Rect, u: HudUnit, interactive: boolean, targetable: boolean, dimmed = false): void {
     const ctx = this.ctx;
+    ctx.save();
+    // §12 — non-targetable regions recede while targeting is armed, so the
+    // legal target area reads unambiguously without an extra confirm step.
+    if (dimmed) ctx.globalAlpha = 0.35;
     const charged = u.charge >= u.cost;
     ctx.fillStyle = targetable ? '#3c3220' : '#2c2c36';
     ctx.fillRect(r.x, r.y, r.w, r.h);
@@ -731,6 +779,7 @@ export class View {
     ctx.fillRect(r.x + 4, r.y + r.h - 8, bw, 5);
     ctx.fillStyle = charged ? '#f0c040' : '#6080c0';
     ctx.fillRect(r.x + 4, r.y + r.h - 8, bw * Math.min(1, u.charge / u.cost), 5);
+    ctx.restore();
   }
 
   // §7.1 — the Deck Function control. Visually similar to the four Program
@@ -738,6 +787,8 @@ export class View {
   // from resolved Deck content and it carries the Deck's own charge pool.
   private drawDeckBox(r: Rect, hud: Hud): void {
     const ctx = this.ctx;
+    ctx.save();
+    if (hud.targeting && hud.armedSlot !== -1) ctx.globalAlpha = 0.35;
     const charged = hud.deckCharge >= hud.deckCost;
     ctx.fillStyle = '#2c2c36';
     ctx.fillRect(r.x, r.y, r.w, r.h);
@@ -761,6 +812,7 @@ export class View {
     ctx.fillRect(r.x + 4, r.y + r.h - 8, bw, 5);
     ctx.fillStyle = charged ? '#f0c040' : '#6080c0';
     ctx.fillRect(r.x + 4, r.y + r.h - 8, bw * Math.min(1, hud.deckCharge / Math.max(1, hud.deckCost)), 5);
+    ctx.restore();
   }
 
   private drawBoard(now: number, systemTurn = false): void {
@@ -848,6 +900,23 @@ export class View {
     if (systemTurn) {
       ctx.fillStyle = 'rgba(0,0,0,0.10)';
       ctx.fillRect(this.boardX, this.boardY, bw, bh);
+    }
+
+    // §12/§19.4 — targeting treatment for the Datastream. Under UNIT targeting
+    // the board is not a legal target and recedes; under PACKET targeting it
+    // IS the target area and gets a pulsing frame instead. The overlay never
+    // hides Packet identity — this must stay legible enough to pick from.
+    const hud = this.getHud();
+    if (hud?.targeting) {
+      if (hud.targetPackets) {
+        const pulse = 0.35 + 0.25 * (0.5 + 0.5 * Math.sin(now / 260));
+        ctx.strokeStyle = `rgba(255,149,0,${pulse.toFixed(3)})`;
+        ctx.lineWidth = 3;
+        ctx.strokeRect(this.boardX + 1.5, this.boardY + 1.5, bw - 3, bh - 3);
+      } else {
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.fillRect(this.boardX, this.boardY, bw, bh);
+      }
     }
 
     ctx.restore();

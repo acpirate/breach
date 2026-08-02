@@ -267,3 +267,127 @@ canvas {
   line-height: 1.35;
   margin: 4px 0 6px;
 }
+
+/* Alpha 0.4.0 §6.1/§6.2/§7 — portfolio Program chips on the selection screens.
+   Each chip opens the shared read-only inspection modal; they wrap rather than
+   scroll sideways so all three stay reachable on a narrow viewport (§19.2). */
+.prgstrip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 10px;
+  text-align: left;
+}
+
+.prgstrip .prgchip {
+  flex: 1 1 auto;
+  min-width: 46%;
+  margin: 0;
+  padding: 9px 8px;
+  font-size: 14px;
+  text-align: left;
+  background: #2c2c36;
+  color: #ddd;
+  border: 1px solid #666;
+  cursor: pointer;
+}
+
+/* Alpha 0.4.0 §8 — the functional Build screen. Four ordered active slots and
+   the inactive inventory below, each row a wide tap target plus small reorder
+   /inspect controls on the right. No drag input is required (§19.1). */
+.buildslots {
+  display: block;
+  text-align: left;
+  margin: 4px 0 10px;
+}
+
+.buildslots .bslot {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  margin: 6px 0;
+}
+
+.buildslots .bslotmain {
+  flex: 1 1 auto;
+  display: block;
+  width: auto;
+  margin: 0;
+  padding: 9px 10px;
+  text-align: left;
+  font-size: 15px;
+  background: #2c2c36;
+  color: #ddd;
+  border: 1px solid #666;
+  cursor: pointer;
+}
+
+/* active vs inactive must be unmistakable (§19.3) */
+.buildslots .bslot .bslotmain {
+  border-left: 4px solid #e0a040;
+}
+
+.buildslots .bslot.inactive .bslotmain {
+  background: #23232c;
+  color: #9d9dab;
+  border-left: 4px solid #3d3d4a;
+}
+
+/* the armed inactive Program, waiting for a slot to swap into */
+.buildslots .bslot.inactive.sel .bslotmain {
+  background: #34343f;
+  color: #eee;
+  border: 2px solid #4fa3d1;
+  border-left: 4px solid #4fa3d1;
+}
+
+/* while a Program is armed, the active slots read as drop targets */
+.buildslots .bslot.armed .bslotmain {
+  border-color: #4fa3d1;
+}
+
+.buildslots .bslotmoves {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.buildslots .bmove {
+  display: block;
+  width: 44px;
+  margin: 0;
+  padding: 4px 0;
+  font-size: 16px;
+  background: #3a3a48;
+  color: #eee;
+  border: 1px solid #666;
+  cursor: pointer;
+}
+
+.buildslots .bmove:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+/* the Build screen is the tallest panel in the game — give it more of the
+   viewport than the pause/settings panels get, and trim the dialog's own
+   padding so a short phone screen still shows all four slots plus the
+   inventory without hunting (§19.1/§19.3) */
+.panelscroll {
+  max-height: 62vh;
+}
+
+.dialog {
+  padding: 16px;
+}
+
+.dialog h1 {
+  font-size: 22px;
+}
+
+.dialog p {
+  margin: 0 0 10px;
+  font-size: 15px;
+}

@@ -28,11 +28,37 @@ import {
   isStrongColor,
   isStrongShape,
 } from './constants';
-import { AREA_PATTERNS } from './data/areas';
-import { ResolvedSkill, deckById, hackerById, programById, programsFor } from './data/content';
+import { AREA_PATTERNS, AreaPatternId } from './data/areas';
+import type { EffectId } from './data/effects';
+import {
+  GAIN_CHARGE_YES,
+  DEAL_DAMAGE_YES,
+  LINE_DIMENSION_COLUMN,
+  LineSliceParams,
+  ResolvedSkill,
+  SPECIALS_RETAIN_ALL,
+  SPECIALS_RETAIN_OWN,
+  deckById,
+  hackerById,
+  programById,
+} from './data/content';
 import { MatchCondition, Match, computeLineClears, detectMatches, matchMultiplier } from './match';
 import { completesRun, hasAnyValidMove, randomTile, reshuffleBoard } from './board';
-import { Color, GameEvent, GameState, Pt, Side, Tile, UnitState, gridViewOf, opponentOf, tileViewOf } from './types';
+import {
+  ChargeAssignment,
+  ChargeStreamSource,
+  Color,
+  DamageSource,
+  GameEvent,
+  GameState,
+  Pt,
+  Side,
+  Tile,
+  UnitState,
+  gridViewOf,
+  opponentOf,
+  tileViewOf,
+} from './types';
 
 // Sum of the owner's active buff-tile magnitudes (per-tile value from data).
 export function buffBonus(state: GameState, side: Side): number {
@@ -59,12 +85,21 @@ export function shieldValue(state: GameState, side: Side): number {
   return n;
 }
 
-// Per-tile damage for BLAST destruction (not a Sync — no axis): a tile's
-// "own type's normal value" is its color tier / neutral value, resolved
-// against the BOMB OWNER's strong colors (§5.4).
+// Per-Packet damage for COLLATERAL destruction — Bomb blasts and LineSlice
+// rows/columns. Not a Sync, so there is no slicing axis to pay on: the Packet
+// is valued on BOTH axes against the acting side's resolved strong sets and
+// pays the higher tier (§5.4). Neutral Packets pay their flat value.
+//
+// DESIGNER OVERRIDE (2026-08-01), deviating from Alpha 0.4.0 §14.5's
+// "preserve existing Bomb per-Packet collateral valuation": Alpha 0.3 valued
+// blast collateral on COLOR alone. Both collateral Effects now share this one
+// valuation so the two cannot drift, at the cost of a small Bomb buff to be
+// revisited in a balance pass.
 export function baseDamage(t: Tile, state: GameState, owner: Side): number {
   if (t.kind === 'neutral') return DAMAGE_PER_TILE_NEUTRAL;
-  return isStrongColor(state.config, owner, t.color!) ? DAMAGE_PER_TILE_HIGH_COLOR : DAMAGE_PER_TILE_LOW_COLOR;
+  const byColor = isStrongColor(state.config, owner, t.color!) ? DAMAGE_PER_TILE_HIGH_COLOR : DAMAGE_PER_TILE_LOW_COLOR;
+  const byShape = isStrongShape(state.config, owner, t.shape!) ? DAMAGE_PER_TILE_HIGH_SHAPE : DAMAGE_PER_TILE_LOW_SHAPE;
+  return Math.max(byColor, byShape);
 }
 
 // MK6.1 — per-tile damage for SYNC destruction, resolved on the axis(es) that
@@ -140,9 +175,11 @@ function skillQualifies(skill: ResolvedSkill, match: Match): boolean {
 }
 
 export interface DamageInfo {
-  source: 'match' | 'attacker' | 'bomb'; // MK7.3: the CAUSAL bucket
+  source: DamageSource; // MK7.3/§15.3: the disjoint CAUSAL bucket
   label: string;
   programId?: string; // acting Program for Function-caused damage
+  fnId?: string; // §15.3 — detailed attribution always carries FNC_ID…
+  effectId?: EffectId; // …and EFFECT_ID
   critExtra?: number; // portion of `amount` added by the 1.5x multiplier (pre-floor)
   buffBonus?: number; // portion of `amount` contributed by buff tiles
   colorRaw?: number; // MK7.5: pre-floor damage paid via the color axis (Sync cause only)
@@ -195,6 +232,8 @@ export function dealDamage(state: GameState, target: Side, amount: number, info:
     label: info.label,
     source: info.source,
     programId: info.programId,
+    fnId: info.fnId,
+    effectId: info.effectId,
     critExtra: critFinal,
     buffBonus: buffFinal,
     colorRaw: colorFinal,
@@ -209,29 +248,180 @@ export function dealDamage(state: GameState, target: Side, amount: number, info:
   }
 }
 
-// Charge from one sliced Packet in a SYNC step. Owner-scoped: only the
-// event-owning side's Programs gain. Cap overflow accumulates into `waste` per
-// Program (MK2.3 metric). Bindings come from each unit's resolved Program (one
-// or more colors and shapes per Program — a tile pays at most once per axis).
-// Neutral Packets pay the DECK, handled once per step by the caller (§7.3).
-function chargeFromDestroyedTile(
+// ============================================================================
+// Alpha 0.4.0 §10 — CHARGE STREAMS and TOP-TO-BOTTOM ROUTING
+//
+// Alpha 0.3 BROADCAST charge: every compatible Program gained from every
+// qualifying Packet independently. Alpha 0.4 keeps generation identical and
+// changes only ALLOCATION (§10.2): a stream of N charge on one axis token
+// fills the topmost compatible non-full active Program, passes the remainder
+// DOWN, and discards only when no compatible non-full Program remains.
+//
+// A STREAM is one (axis, token) pair within one resolution wave. Grouping by
+// token rather than by Sync blob covers line-clear collateral (which belongs
+// to no blob) and is outcome-identical to per-blob streams, because a greedy
+// fill-from-the-top is associative: routing 3 then 3 lands exactly where
+// routing 6 does. Ordering is fixed and RNG-free (§10.3): all color streams
+// in enum order, then all shape streams in enum order.
+// ============================================================================
+
+export interface ChargeStream {
+  axis: 'color' | 'shape';
+  token: number;
+  amount: number;
+  source: ChargeStreamSource;
+  sourceId?: string;
+}
+
+export type StreamMap = Map<string, ChargeStream>;
+
+const streamKey = (axis: 'color' | 'shape', token: number): string => `${axis}:${token}`;
+
+export function addStream(
+  streams: StreamMap,
+  axis: 'color' | 'shape',
+  token: number,
+  amount: number,
+  source: ChargeStreamSource,
+  sourceId?: string,
+): void {
+  if (amount <= 0) return;
+  const k = streamKey(axis, token);
+  const cur = streams.get(k);
+  if (!cur) {
+    streams.set(k, { axis, token, amount, source, sourceId });
+    return;
+  }
+  cur.amount += amount;
+  // §10.6 — a Skill that inflates an existing qualifying stream re-labels it
+  // rather than opening a second pool that charges every compatible Program.
+  if (source === 'SKILL_MODIFIED_SYNC') {
+    cur.source = source;
+    cur.sourceId = sourceId;
+  }
+}
+
+// §10.3 — deterministic wave order: color axis fully resolved before shape.
+export function orderedStreams(streams: StreamMap): ChargeStream[] {
+  return [...streams.values()].sort((a, b) =>
+    a.axis === b.axis ? a.token - b.token : a.axis === 'color' ? -1 : 1,
+  );
+}
+
+// Charge GENERATED by one sliced Packet. Unchanged from Alpha 0.3 in amount
+// and in which axes pay (`singleAxisPayout` still gates them); the difference
+// is that the charge now lands in a stream instead of in every Program at
+// once. Neutral Packets pay the DECK, handled once per step by the caller
+// (§7.3), and never generate Program charge.
+export function accumulateTileCharge(
   state: GameState,
-  owner: Side,
   t: Tile,
   axes: Set<MatchCondition>,
-  waste: Map<string, number>,
+  streams: StreamMap,
+  source: ChargeStreamSource,
 ): void {
   if (t.kind === 'neutral') return;
   const singleAxis = state.config.singleAxisPayout;
-  const colorPays = !singleAxis || axes.has('color');
-  const shapePays = !singleAxis || axes.has('shape');
-  for (const u of state.units[owner]) {
-    const prog = programById(u.programId);
-    let w = 0;
-    if (colorPays && prog.colors.includes(t.color!)) w += addUnitCharge(state, u, CHARGE_PER_TILE_COLOR_MATCH);
-    if (shapePays && prog.shapes.includes(t.shape!)) w += addUnitCharge(state, u, CHARGE_PER_TILE_SHAPE_MATCH);
-    if (w > 0) waste.set(u.programId, (waste.get(u.programId) ?? 0) + w);
+  if (!singleAxis || axes.has('color')) {
+    addStream(streams, 'color', t.color!, CHARGE_PER_TILE_COLOR_MATCH, source);
   }
+  if (!singleAxis || axes.has('shape')) {
+    addStream(streams, 'shape', t.shape!, CHARGE_PER_TILE_SHAPE_MATCH, source);
+  }
+}
+
+// §10.4 — route ONE stream through the owner's ordered active Program queue.
+// Invariants enforced here: charge never flows upward, a compatible non-full
+// Program is never skipped, no Program exceeds its Function cost, inactive
+// Programs are structurally absent (state.units holds only the active build),
+// the Deck Function is a separate pool entirely, and no RNG is consulted.
+export function routeChargeStream(
+  state: GameState,
+  owner: Side,
+  stream: ChargeStream,
+  events: GameEvent[],
+  waste: Map<string, number>,
+): void {
+  const units = state.units[owner];
+  const order = units.map((u) => u.programId);
+  const eligibleIdx: number[] = [];
+  for (let i = 0; i < units.length; i++) {
+    const prog = programById(units[i].programId);
+    const compatible =
+      stream.axis === 'color' ? prog.colors.includes(stream.token) : prog.shapes.includes(stream.token);
+    if (compatible) eligibleIdx.push(i);
+  }
+
+  let remaining = stream.amount;
+  const assignments: ChargeAssignment[] = [];
+  for (const i of eligibleIdx) {
+    if (remaining <= 0) break;
+    const u = units[i];
+    const cap = programById(u.programId).chargeCap;
+    const room = cap - u.charge;
+    if (room <= 0) continue; // already at its Function cost — skip, keep flowing down
+    const before = u.charge;
+    const assigned = Math.min(room, remaining);
+    u.charge = before + assigned;
+    remaining -= assigned;
+    assignments.push({ programId: u.programId, before, assigned, after: u.charge, overflowOut: remaining });
+  }
+
+  events.push({
+    t: 'chargeRoute',
+    side: owner,
+    axis: stream.axis,
+    token: stream.token,
+    amount: stream.amount,
+    streamSource: stream.source,
+    ...(stream.sourceId ? { sourceId: stream.sourceId } : {}),
+    order,
+    eligible: eligibleIdx.map((i) => order[i]),
+    assignments,
+    discarded: remaining,
+  });
+
+  // The surviving per-Program `chargeWasted` metric: a discard is charged to
+  // the BOTTOM-MOST compatible Program, whose fullness is what ended the
+  // stream. With no compatible Program at all the discard belongs to no
+  // Program and is visible only in the routing event above.
+  if (remaining > 0 && eligibleIdx.length) {
+    const last = order[eligibleIdx[eligibleIdx.length - 1]];
+    waste.set(last, (waste.get(last) ?? 0) + remaining);
+  }
+}
+
+// Route a whole wave's streams in the canonical order (§10.3).
+export function routeStreams(
+  state: GameState,
+  owner: Side,
+  streams: StreamMap,
+  events: GameEvent[],
+  waste: Map<string, number>,
+): void {
+  for (const stream of orderedStreams(streams)) routeChargeStream(state, owner, stream, events, waste);
+}
+
+// §10.7 — charge generated by EXPLICIT Effect destruction (a LineSlice row or
+// a Bomb blast whose tuple says gainCharge=0). Each directly sliced Packet
+// contributes standard owner-scoped charge from its own attributes; colors
+// route before shapes. Returns the total charge that actually landed.
+export function chargeFromEffectSlice(
+  state: GameState,
+  owner: Side,
+  tiles: Tile[],
+  events: GameEvent[],
+): number {
+  const streams: StreamMap = new Map();
+  const bothAxes = new Set<MatchCondition>(['color', 'shape']);
+  for (const t of tiles) accumulateTileCharge(state, t, bothAxes, streams, 'EFFECT_DESTRUCTION');
+  const before = state.units[owner].reduce((n, u) => n + u.charge, 0);
+  const waste = new Map<string, number>();
+  routeStreams(state, owner, streams, events, waste);
+  for (const [programId, amount] of waste) {
+    events.push({ t: 'chargeWaste', side: owner, ownerKind: 'program', programId, amount });
+  }
+  return state.units[owner].reduce((n, u) => n + u.charge, 0) - before;
 }
 
 // MK5.2 cascade cap: when `constrained`, replacement Packets are rejection-
@@ -290,16 +480,18 @@ function refillConstrained(state: GameState, cells: Pt[]): void {
   for (const p of cells) state.board[p.y][p.x] = randomTile(state);
 }
 
-// Tiles bound to a side's Programs (color OR shape) — for the MK5.6
-// contention metric, resolved against the loaded content.
-function boundColors(side: Side): Set<number> {
+// Tiles bound to a side's ACTIVE Programs (color OR shape) — for the MK5.6
+// contention metric. Alpha 0.4: read from the battle's own roster, so a
+// Program sitting in the inventory but not in the build creates no contention
+// (§5.8 — inactive Programs are excluded from every battle system).
+function boundColors(state: GameState, side: Side): Set<number> {
   const out = new Set<number>();
-  for (const p of programsFor(side)) for (const c of p.colors) out.add(c);
+  for (const u of state.units[side]) for (const c of programById(u.programId).colors) out.add(c);
   return out;
 }
-function boundShapes(side: Side): Set<number> {
+function boundShapes(state: GameState, side: Side): Set<number> {
   const out = new Set<number>();
-  for (const p of programsFor(side)) for (const s of p.shapes) out.add(s);
+  for (const u of state.units[side]) for (const s of programById(u.programId).shapes) out.add(s);
   return out;
 }
 
@@ -321,9 +513,11 @@ export function resolveCascades(
   owner: Side,
   events: GameEvent[],
   budget: number | null,
-  cause: 'match' | 'bomb',
+  // MK7.3/§15.3 — everything descended from an initiating action carries THAT
+  // action's causal bucket, not the mechanism that finally dealt the damage.
+  cause: 'match' | 'bomb' | 'lineslice',
   freshIds: Set<number>,
-  causeProgramId?: string, // the initiating bomb's Program (bomb cause only)
+  causeProgramId?: string, // the initiating Function's Program (non-match causes)
 ): { steps: number; stochasticRounds: number } {
   let steps = 0;
   let stochasticRounds = 0;
@@ -402,8 +596,8 @@ export function resolveCascades(
     // sliced in this step still counts toward this step's damage.
     const bonus = buffBonus(state, owner);
     // MK5.6/§5.4: contention is tiles bound to the OPPONENT's Programs.
-    const oppColors = boundColors(opponentOf(owner));
-    const oppShapes = boundShapes(opponentOf(owner));
+    const oppColors = boundColors(state, opponentOf(owner));
+    const oppShapes = boundShapes(state, opponentOf(owner));
 
     let raw = 0; // base Sync damage (pre-floor)
     let skillRaw = 0; // §6.4 Skill-originated damage (pre-floor)
@@ -416,6 +610,11 @@ export function resolveCascades(
     let neutralSliced = 0; // §7.3: neutral Packets sliced this step
     const destroyed: Pt[] = [];
     const waste = new Map<string, number>();
+    // §10.3/§10.5 — charge GENERATED this wave, gathered per axis token and
+    // routed together below, after any Skill has had its chance to inflate a
+    // stream (§10.6). A cascade wave is labelled as such for telemetry.
+    const streams: StreamMap = new Map();
+    const streamSource: ChargeStreamSource = steps > 1 || stochastic.some(Boolean) ? 'CASCADE' : 'SYNC';
     for (const { p, m, axes, stochOnly } of info.values()) {
       const t = state.board[p.y][p.x];
       if (!t) continue;
@@ -429,7 +628,7 @@ export function resolveCascades(
       else if (axis === 'shape') shapeRaw += base * m;
       if (stochOnly) cascadeRaw += base * m;
       if (t.kind === 'standard' && (oppColors.has(t.color!) || oppShapes.has(t.shape!))) contested++;
-      chargeFromDestroyedTile(state, owner, t, axes, waste);
+      accumulateTileCharge(state, t, axes, streams, streamSource);
     }
 
     // ---- §6 Hacker Skills: owner-scoped, once per qualifying Sync event ----
@@ -452,23 +651,26 @@ export function resolveCascades(
             break;
           }
           case 'SKL_EXTRA_MATCH_CHARGE': {
-            // §6.5 — increase this event's normal charge payout, then let the
-            // EXISTING distribution rule place it: a color-axis payout reaches
-            // every Program bound to that color. No separate universal pool.
-            let granted = 0;
-            for (const u of state.units[owner]) {
-              const prog = programById(u.programId);
-              if (!prog.colors.includes(skill.color)) continue;
-              const w = addUnitCharge(state, u, skill.magnitude);
-              if (w > 0) waste.set(u.programId, (waste.get(u.programId) ?? 0) + w);
-              granted += skill.magnitude - w;
-            }
-            events.push({ t: 'skill', side: owner, skillId: skill.id, effect: skill.effectType, charge: granted });
+            // §6.5/§10.6 — increase this event's normal qualifying color-axis
+            // stream BEFORE it is routed, then let the ordinary top-to-bottom
+            // rule place it. It does NOT open a separate pool that
+            // independently charges every compatible Program.
+            //
+            // Alpha 0.4 note: `charge` reports what the Skill contributed to
+            // the stream. Where that charge finally LANDS (and any discard) is
+            // recorded by the chargeRoute event for this stream.
+            addStream(streams, 'color', skill.color, skill.magnitude, 'SKILL_MODIFIED_SYNC', skill.id);
+            events.push({ t: 'skill', side: owner, skillId: skill.id, effect: skill.effectType, charge: skill.magnitude });
             break;
           }
         }
       }
     }
+
+    // §10.3/§10.4 — all generation for this wave is complete (Packets and any
+    // Skill inflation), so route the streams now: colors first, then shapes,
+    // each top-to-bottom through the ordered active build.
+    routeStreams(state, owner, streams, events, waste);
 
     // §7.3 — Deck Function charge from neutral Packets sliced anywhere in this
     // owned resolution: the direct footprint, qualifying line clears, and
@@ -511,7 +713,7 @@ export function resolveCascades(
         {
           source: cause, // MK7.3: bucket = initiating cause, not mechanism
           label: owner === 'player' ? 'Hacker Sync' : 'System Sync',
-          programId: cause === 'bomb' ? causeProgramId : undefined,
+          programId: cause === 'match' ? undefined : causeProgramId,
           // Under suppression the crit cross-cut reports 0: the multiplier's
           // contribution to BASE Sync damage is exactly what is suppressed, and
           // the surviving Skill contribution is reported in its own bucket. This
@@ -544,9 +746,44 @@ export function resolveCascades(
 export function resolveDetonation(state: GameState, p: Pt, events: GameEvent[]): void {
   const bomb = state.board[p.y][p.x];
   if (!bomb || bomb.special?.type !== 'bomb') return;
-  const owner = bomb.special.owner;
-  const programId = bomb.special.programId;
-  const offsets = AREA_PATTERNS[bomb.special.areaPattern ?? 'AREA_SQUARE_3X3'];
+  const sp = bomb.special;
+  // §14.2/§14.5 — the placing Function's typed selections travel with the
+  // overlay, so a bomb that was armed three turns ago still resolves under
+  // ITS OWN contract. Absent values mean the pre-parameterized default.
+  detonateAt(state, p, {
+    owner: sp.owner,
+    areaPattern: sp.areaPattern ?? 'AREA_SQUARE_3X3',
+    programId: sp.programId,
+    fnId: sp.fnId,
+    dealDamage: sp.dealDamage ?? DEAL_DAMAGE_YES,
+    gainCharge: sp.gainCharge ?? GAIN_CHARGE_NO_DEFAULT,
+  }, events);
+}
+
+// Pre-parameterization Bombs granted no charge at all, so an overlay saved
+// without an explicit selection keeps that behavior.
+const GAIN_CHARGE_NO_DEFAULT = 1;
+
+export interface BlastSpec {
+  owner: Side;
+  areaPattern: AreaPatternId;
+  programId?: string;
+  fnId?: string;
+  dealDamage: 0 | 1;
+  gainCharge: 0 | 1;
+}
+
+// §14 — the one Bomb blast implementation, shared by countdown detonations and
+// by immediate (countdown-blank) resolutions such as PLINK. Footprint,
+// clipping, settling, causal ownership, and chain behavior are unchanged; the
+// tuple selects only whether the blast deals damage and whether directly
+// sliced Packets charge.
+// `settle` false leaves gravity/refill/cascades to the caller, so an
+// immediately resolving Bomb can log its target BEFORE the board moves.
+export function detonateAt(state: GameState, p: Pt, spec: BlastSpec, events: GameEvent[], settle = true): void {
+  const owner = spec.owner;
+  const programId = spec.programId;
+  const offsets = AREA_PATTERNS[spec.areaPattern];
 
   const inBounds: Pt[] = [];
   const cells: Pt[] = [];
@@ -563,9 +800,11 @@ export function resolveDetonation(state: GameState, p: Pt, events: GameEvent[]):
   const bonus = buffBonus(state, owner);
   let raw = 0;
   let shieldsRemoved = 0; // MK9.3: shield tiles caught in this blast
+  const sliced: Tile[] = [];
   for (const c of cells) {
     const t = state.board[c.y][c.x]!;
     if (t.special?.type === 'shield') shieldsRemoved++;
+    sliced.push(t);
     raw += baseDamage(t, state, owner);
   }
 
@@ -573,22 +812,153 @@ export function resolveDetonation(state: GameState, p: Pt, events: GameEvent[]):
   for (const c of cells) state.board[c.y][c.x] = null;
   if (shieldsRemoved > 0) events.push({ t: 'shieldRemoved', count: shieldsRemoved });
 
-  dealDamage(
-    state,
-    opponentOf(owner),
-    raw + bonus,
-    { source: 'bomb', label: owner === 'player' ? 'Hacker bomb' : 'System bomb', programId, buffBonus: bonus },
-    events,
-  );
-  if (state.winner) return;
+  // §14.6 — directly sliced blast Packets charge only when the tuple says so.
+  // Current live Bomb content (including PLINK) grants none, preserving the
+  // established rule that Bomb destruction does not charge.
+  if (spec.gainCharge === GAIN_CHARGE_YES) chargeFromEffectSlice(state, owner, sliced, events);
 
-  // MK5.2: a detonation has no "initial Sync" — its entire cascade budget is
-  // the cap itself, and at cap 0 even the blast's own refill is constrained.
-  // MK7.3: everything descended from the blast carries the 'bomb' cause.
+  // §14.5 — dealDamage=1 mutates the board without dealing blast damage;
+  // resulting refill Syncs still resolve normally either way.
+  if (spec.dealDamage === DEAL_DAMAGE_YES) {
+    dealDamage(
+      state,
+      opponentOf(owner),
+      raw + bonus,
+      {
+        source: 'bomb',
+        label: owner === 'player' ? 'Hacker bomb' : 'System bomb',
+        programId,
+        fnId: spec.fnId,
+        effectId: 'EFFECT_BOMB',
+        buffBonus: bonus,
+      },
+      events,
+    );
+  }
+  if (state.winner || !settle) return;
+  settleAfterEffect(state, owner, 'bomb', programId, events);
+}
+
+// MK5.2: an Effect-caused destruction has no "initial Sync" — its entire
+// cascade budget is the cap itself, and at cap 0 even its own refill is
+// constrained. MK7.3/§15.2: everything descended from it carries that
+// Effect's causal bucket and belongs to the initiator.
+export function settleAfterEffect(
+  state: GameState,
+  owner: Side,
+  cause: 'bomb' | 'lineslice',
+  causeProgramId: string | undefined,
+  events: GameEvent[],
+): void {
   const cap = state.config.maxCascadeSteps;
   const freshIds = new Set<number>();
   applyGravityAndRefill(state, events, cap !== null && cap <= 0, freshIds);
-  resolveCascades(state, owner, events, cap, 'bomb', freshIds, programId);
+  resolveCascades(state, owner, events, cap, cause, freshIds, causeProgramId);
+}
+
+// ============================================================================
+// Alpha 0.4.0 §13 — EFFECT_LINESLICE
+// ============================================================================
+
+export interface LineSliceSpec {
+  owner: Side;
+  params: LineSliceParams;
+  programId: string;
+  fnId: string;
+}
+
+export interface LineSliceOutcome {
+  dimension: 'row' | 'column';
+  sliced: Pt[];
+  retained: Pt[];
+  damage: number; // the combined direct Function-damage instance (pre-shield)
+  charge: number; // direct charge that actually landed
+}
+
+// §13.3 — slice the whole row or column through `target`. The line is derived
+// FROM the target coordinate; there is no separate row-target abstraction.
+// Direct line-slice destruction is not a Sync: it never contributes to a B1
+// footprint, never triggers color/shape match Skills, and never earns Deck
+// neutral charge. Refill Syncs it causes do all of those normally (§15.2).
+export function resolveLineSlice(
+  state: GameState,
+  target: Pt,
+  spec: LineSliceSpec,
+  events: GameEvent[],
+): LineSliceOutcome {
+  const { owner, params } = spec;
+  const vertical = params.dimension === LINE_DIMENSION_COLUMN;
+  const lineCells: Pt[] = [];
+  if (vertical) {
+    for (let y = 0; y < BOARD_HEIGHT; y++) lineCells.push({ x: target.x, y });
+  } else {
+    for (let x = 0; x < BOARD_WIDTH; x++) lineCells.push({ x, y: target.y });
+  }
+
+  // §13.2 — retention is decided BEFORE anything is sliced. A retained special
+  // stays a complete tile/special object, is excluded from the direct slice,
+  // and then settles normally (it is not pinned above empty space).
+  const retained: Pt[] = [];
+  const slicedPts: Pt[] = [];
+  const slicedTiles: Tile[] = [];
+  for (const c of lineCells) {
+    const t = state.board[c.y][c.x];
+    if (!t) continue; // out-of-play cell (a concluded board may hold gaps)
+    const sp = t.special;
+    const keep =
+      !!sp &&
+      (params.specialRetention === SPECIALS_RETAIN_ALL ||
+        (params.specialRetention === SPECIALS_RETAIN_OWN && sp.owner === owner));
+    if (keep) {
+      retained.push(c);
+      continue;
+    }
+    slicedPts.push(c);
+    slicedTiles.push(t);
+  }
+
+  // §13.4 — one combined NONCRITICAL damage instance per deployment, valued
+  // through the shared collateral valuation. Buff and Shield apply once, via
+  // the ordinary damage pipeline. Retained specials and out-of-board cells
+  // contribute nothing.
+  let raw = 0;
+  let shieldsRemoved = 0;
+  for (const t of slicedTiles) {
+    if (t.special?.type === 'shield') shieldsRemoved++;
+    raw += baseDamage(t, state, owner);
+  }
+
+  events.push({ t: 'destroy', cells: slicedPts });
+  for (const c of slicedPts) state.board[c.y][c.x] = null;
+  if (shieldsRemoved > 0) events.push({ t: 'shieldRemoved', count: shieldsRemoved });
+
+  // §13.5 — direct charge only when the tuple asks for it.
+  const charge =
+    params.gainCharge === GAIN_CHARGE_YES ? chargeFromEffectSlice(state, owner, slicedTiles, events) : 0;
+
+  let damage = 0;
+  if (params.dealDamage === DEAL_DAMAGE_YES) {
+    const bonus = buffBonus(state, owner);
+    damage = raw + bonus;
+    // §13.4 — Function damage, so Reinforced Connection (which suppresses
+    // BASE SYNC damage only) does not touch it.
+    dealDamage(
+      state,
+      opponentOf(owner),
+      damage,
+      {
+        source: 'lineslice',
+        label: owner === 'player' ? 'Hacker line slice' : 'System line slice',
+        programId: spec.programId,
+        fnId: spec.fnId,
+        effectId: 'EFFECT_LINESLICE',
+        buffBonus: bonus,
+      },
+      events,
+    );
+  }
+
+  return { dimension: vertical ? 'column' : 'row', sliced: slicedPts, retained, damage, charge };
 }
 
 // Run after every settle: if the Datastream has no valid moves, the automatic

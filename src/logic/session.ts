@@ -10,13 +10,20 @@
 
 import { Game } from './game';
 import {
+  ACTIVE_BUILD_SIZE,
   DATA_SCHEMA_VERSION,
   DEFAULT_DECK_ID,
   DEFAULT_HACKER_ID,
+  InventoryEntry,
   deckById,
+  defaultBuild,
   getContent,
   hackerById,
+  inventoryFor,
+  inventoryProgramIds,
+  isValidBuild,
 } from './data/content';
+import { RNG, makeRNG } from './rng';
 import {
   PlainGameState,
   SAVE_VERSION,
@@ -30,6 +37,7 @@ import {
   BattleConfig,
   BattleIdentity,
   BattleSettings,
+  BuildOrigin,
   Mode,
   NaturalOutcome,
   RunStep,
@@ -77,11 +85,18 @@ export function defaultIdentity(): SelectedIdentity {
   return { hackerId: DEFAULT_HACKER_ID, deckId: DEFAULT_DECK_ID, selectionSource: 'QUICK_MATCH_DEFAULT' };
 }
 
-// §5.1/§5.3 — expand a selection into the full explicit battle identity: the
-// ordered Skill IDs of the chosen Hacker, the Deck's Function, and the FIXED
-// ordered Program rosters from the current content contract. Nothing here is
-// inferred from a display name, screen, or row position.
-export function buildIdentity(hackerId: string, deckId: string, selectionSource: SelectionSource): BattleIdentity {
+// §5.1/§5.3 — expand a selection plus its chosen build into the full explicit
+// battle identity: the ordered Skill IDs of the chosen Hacker, the Deck's
+// Function, the ordered ACTIVE build, the inventory it was drawn from, and the
+// System's roster from the current content contract. Nothing here is inferred
+// from a display name, screen, or row position.
+export function buildIdentity(
+  hackerId: string,
+  deckId: string,
+  selectionSource: SelectionSource,
+  build: readonly string[],
+  buildOrigin: BuildOrigin,
+): BattleIdentity {
   const c = getContent();
   const hacker = hackerById(hackerId);
   const deck = deckById(deckId);
@@ -90,10 +105,84 @@ export function buildIdentity(hackerId: string, deckId: string, selectionSource:
     deckId,
     skillIds: [...hacker.skillIds],
     deckFunctionId: deck.fn.id,
-    hackerPrograms: c.hacker.map((p) => p.id),
+    hackerPrograms: [...build],
+    inventory: inventoryProgramIds(hackerId, deckId),
     systemPrograms: c.system.map((p) => p.id),
     selectionSource,
+    buildOrigin,
   };
+}
+
+// ============================================================================
+// Alpha 0.4.0 §5/§8 — BUILD STATE. Every Build screen (initial Run,
+// between-battle, retry, Constructed Quick Match) drives this one model, and
+// every transition below preserves the §5.5 validity invariant: exactly four
+// distinct inventory Programs in explicit order. There is no invalid
+// intermediate state and no empty slot to assemble from.
+// ============================================================================
+
+export type BuildContext = 'INITIAL_RUN' | 'RUN_BETWEEN' | 'RUN_RETRY' | 'CONSTRUCTED_QUICK_MATCH';
+
+export interface BuildState {
+  context: BuildContext;
+  hackerId: string;
+  deckId: string;
+  inventory: InventoryEntry[]; // the fixed six, with portfolio attribution
+  build: string[]; // ordered active four
+  origin: BuildOrigin; // what the screen OPENED with
+  edited: boolean; // §18.3 — changed by the player during this visit
+}
+
+// Open a Build screen. `initial` is used when it is a currently valid build;
+// anything missing, stale, or malformed silently falls back to the default so
+// the screen can never open in a dead end (§19.3).
+export function beginBuild(
+  context: BuildContext,
+  hackerId: string,
+  deckId: string,
+  initial: readonly string[] | null,
+  origin: BuildOrigin,
+): BuildState {
+  const inventory = inventoryFor(hackerId, deckId);
+  const ids = inventory.map((e) => e.programId);
+  const usable = initial && isValidBuild(initial, ids);
+  return {
+    context,
+    hackerId,
+    deckId,
+    inventory,
+    build: usable ? [...initial] : defaultBuild(hackerId, deckId),
+    origin: usable ? origin : 'DEFAULT',
+    edited: false,
+  };
+}
+
+export function inactiveOf(s: BuildState): InventoryEntry[] {
+  return s.inventory.filter((e) => !s.build.includes(e.programId));
+}
+
+// §5.6 — replacement is a SWAP: the incoming inactive Program takes the slot,
+// the displaced one returns to the inventory. All four slots stay occupied and
+// duplicates remain impossible by construction. A no-op (dropping a Program
+// onto the slot it already holds) is not an edit.
+export function replaceInBuild(s: BuildState, slot: number, programId: string): BuildState {
+  if (slot < 0 || slot >= s.build.length) return s;
+  if (s.build[slot] === programId) return s;
+  if (!s.inventory.some((e) => e.programId === programId)) return s;
+  if (s.build.includes(programId)) return s; // already active elsewhere — never duplicate
+  const build = [...s.build];
+  build[slot] = programId;
+  return { ...s, build, edited: true, origin: 'PLAYER_EDITED' };
+}
+
+// §5.7 — reorder by swapping a slot with its neighbour. Preserves all four
+// entries and their uniqueness; top-to-bottom priority is the array order.
+export function moveBuildSlot(s: BuildState, slot: number, delta: -1 | 1): BuildState {
+  const to = slot + delta;
+  if (slot < 0 || slot >= s.build.length || to < 0 || to >= s.build.length) return s;
+  const build = [...s.build];
+  [build[slot], build[to]] = [build[to], build[slot]];
+  return { ...s, build, edited: true, origin: 'PLAYER_EDITED' };
 }
 
 // ---- §10.2 Normal LINK resolution ----
@@ -143,6 +232,11 @@ export function buildBattleConfig(
 export interface QuickMatchInfo {
   mode: 'QUICK_MATCH';
   identity: SelectedIdentity;
+  // §9.5 — the exact resolved build and where it came from, so Continue
+  // restores this battle rather than rerolling a Random build or rereading the
+  // remembered Constructed preset.
+  build: string[];
+  buildOrigin: BuildOrigin;
 }
 
 // Run-only identity (§6.2/§10.4): step, the settings snapshot taken at the
@@ -155,6 +249,15 @@ export interface RunInfo {
   settings: BattleSettings;
   identity: SelectedIdentity;
   hackerMaxLink: number;
+  // §5.2/§8.4 — the Run's fixed six-Program inventory and the ordered build
+  // that carries from one battle to the next. Both are Run-scoped: they are
+  // discarded with the Run save and never leak into a later Run (§8.6).
+  inventory: string[];
+  build: string[];
+  buildOrigin: BuildOrigin;
+  // §17.2 — true while the Run is sitting on a pre-battle Build screen rather
+  // than inside a battle. A committed Run in this phase is fully saveable.
+  pendingBuild?: true;
 }
 
 export type SessionInfo = QuickMatchInfo | RunInfo;
@@ -207,9 +310,77 @@ export function forceWinAvailable(info: SessionInfo, pending: PendingResultInfo 
   return info.step < RUN_LENGTH;
 }
 
+// ============================================================================
+// Alpha 0.4.0 §9.2 — RANDOM QUICK MATCH build generation
+// ============================================================================
+
+// §9.2 — a SETUP-ONLY random source. Deliberately its own RNG instance so
+// generating a build cannot consume or perturb the battle's gameplay stream:
+// the Game seeds its own RNG independently at construction, so the board,
+// refills, and AI sequence for a given gameplay seed are unaffected. The seed
+// is returned so a run can be reproduced from the log (§18.4).
+export function makeSetupRandom(seed?: number): { rng: RNG; seed: number } {
+  const s = seed ?? Math.floor(Math.random() * 2 ** 31);
+  return { rng: makeRNG(s), seed: s };
+}
+
+// §9.2 — four distinct inventory Programs, sampled without replacement, in an
+// explicitly randomized order. One shuffle gives both properties.
+export function randomBuild(inventory: readonly string[], rng: RNG): string[] {
+  const pool = [...inventory];
+  rng.shuffle(pool);
+  return pool.slice(0, ACTIVE_BUILD_SIZE);
+}
+
+// ============================================================================
+// Alpha 0.4.0 §9.4/§17.6 — REMEMBERED CONSTRUCTED BUILD
+//
+// Convenience preference data, NOT an active save: it is versioned separately,
+// never competes for the single save slot, survives Run completion and
+// abandonment, and is revalidated-then-defaulted rather than being allowed to
+// block startup.
+// ============================================================================
+
+export const PREFERENCE_SCHEMA_VERSION = 1;
+
+export interface ConstructedPreset {
+  v: number;
+  hackerId: string;
+  deckId: string;
+  build: string[];
+}
+
+export function serializeConstructedPreset(hackerId: string, deckId: string, build: readonly string[]): string {
+  return JSON.stringify({ v: PREFERENCE_SCHEMA_VERSION, hackerId, deckId, build: [...build] } satisfies ConstructedPreset);
+}
+
+// §9.4 — returns the remembered build only if it is still coherent with
+// CURRENT content: both identities resolve, the inventory resolves, and the
+// four IDs are distinct members of it. Anything else yields null, which the
+// caller treats as "open with the default build". A content-fingerprint
+// change alone does not invalidate it — only unresolvable references do.
+export function deserializeConstructedPreset(json: string | null): ConstructedPreset | null {
+  if (!json) return null;
+  try {
+    const p = JSON.parse(json) as Partial<ConstructedPreset>;
+    if (p.v !== PREFERENCE_SCHEMA_VERSION) return null;
+    if (typeof p.hackerId !== 'string' || typeof p.deckId !== 'string') return null;
+    if (!Array.isArray(p.build) || p.build.some((id) => typeof id !== 'string')) return null;
+    const c = getContent();
+    if (!c.hackers.has(p.hackerId) || !c.decks.has(p.deckId)) return null;
+    const inventory = inventoryProgramIds(p.hackerId, p.deckId);
+    if (!isValidBuild(p.build, inventory)) return null;
+    return { v: p.v, hackerId: p.hackerId, deckId: p.deckId, build: [...p.build] };
+  } catch {
+    return null;
+  }
+}
+
 // ---- §12 pending New Run setup state ----
 
-export type SetupStep = 'HACKER' | 'DECK' | 'REVIEW';
+// Alpha 0.4.0 §8 — the third step is now the FUNCTIONAL Build screen; the
+// Alpha 0.3 fixed Build Review no longer exists.
+export type SetupStep = 'HACKER' | 'DECK' | 'BUILD';
 
 // Ephemeral UI/application state, NOT an active save (§12.2). Entering setup
 // does not modify the existing save; only Start Run commits.
@@ -229,21 +400,21 @@ export function chooseHacker(s: PendingSetup, hackerId: string): PendingSetup {
 }
 
 export function chooseDeck(s: PendingSetup, deckId: string): PendingSetup {
-  return { ...s, deckId, step: 'REVIEW' };
+  return { ...s, deckId, step: 'BUILD' };
 }
 
-// Back navigation RETAINS current pending choices (§12.2). Backing out of the
-// first screen returns null, meaning "return to Title and discard pending setup
-// only" — the resident save is untouched.
+// Back navigation RETAINS current pending choices (§12.2/§6.3). Backing out of
+// the first screen returns null, meaning "return to Title and discard pending
+// setup only" — the resident save is untouched.
 export function setupBack(s: PendingSetup): PendingSetup | null {
-  if (s.step === 'REVIEW') return { ...s, step: 'DECK' };
+  if (s.step === 'BUILD') return { ...s, step: 'DECK' };
   if (s.step === 'DECK') return { ...s, step: 'HACKER' };
   return null;
 }
 
-// The setup is committable once both choices exist and Build Review is showing.
+// The setup is committable once both choices exist and Build is showing.
 export function setupComplete(s: PendingSetup): boolean {
-  return s.step === 'REVIEW' && s.hackerId !== null && s.deckId !== null;
+  return s.step === 'BUILD' && s.hackerId !== null && s.deckId !== null;
 }
 
 // ---- Battle creation (§4.2/§4.3/§10.5) ----
@@ -274,10 +445,16 @@ export function effectiveRunConfig(info: RunInfo, step: RunStep): BattleConfig {
   return buildBattleConfig(info.settings, info.identity.hackerId, info.hackerMaxLink, resolveRunIce(info.settings, step));
 }
 
-export function createQuickMatchBattle(settings: BattleSettings, ids: SelectedIdentity, seed?: number): Game {
+export function createQuickMatchBattle(
+  settings: BattleSettings,
+  ids: SelectedIdentity,
+  build: readonly string[],
+  buildOrigin: BuildOrigin,
+  seed?: number,
+): Game {
   const hackerMaxLink = resolveHackerMaxLink(settings, ids.hackerId, ids.deckId);
   const config = buildBattleConfig(settings, ids.hackerId, hackerMaxLink, resolveQuickMatchIce(settings, hackerMaxLink));
-  return new Game(config, buildIdentity(ids.hackerId, ids.deckId, ids.selectionSource), seed);
+  return new Game(config, buildIdentity(ids.hackerId, ids.deckId, ids.selectionSource, build, buildOrigin), seed);
 }
 
 // Quick Match "Reset" restarts under the concluded battle's OWN config and
@@ -286,9 +463,14 @@ export function recreateBattleFromConfig(config: BattleConfig, identity: BattleI
   return new Game(cloneConfig(config), { ...identity }, seed);
 }
 
+// §5.8/§8.4 — the upcoming battle snapshots the Run's CURRENT ordered build.
 export function createRunBattle(info: RunInfo, step: RunStep, seed?: number): Game {
   const config = effectiveRunConfig(info, step);
-  return new Game(config, buildIdentity(info.identity.hackerId, info.identity.deckId, info.identity.selectionSource), seed);
+  return new Game(
+    config,
+    buildIdentity(info.identity.hackerId, info.identity.deckId, info.identity.selectionSource, info.build, info.buildOrigin),
+    seed,
+  );
 }
 
 // ---- Log/record context (§21.2) ----
@@ -321,40 +503,72 @@ export function contextLabel(info: SessionInfo): string {
 // fake Run values to satisfy a broad nullable interface). Alpha 0.2 saves are
 // rejected by the version/schema check: there is no migration path (§17.1).
 
+type SavePhase = 'ACTIVE_BATTLE' | 'PENDING_RESULT' | 'PENDING_BUILD';
+
+interface SavedRun {
+  step: RunStep;
+  settings: BattleSettings;
+  hackerMaxLink: number;
+  inventory: string[];
+  build: string[];
+  buildOrigin: BuildOrigin;
+}
+
 interface SavedSession {
   version: string;
   schema: number;
   fp: string;
   mode: Mode;
-  identity: BattleIdentity; // §17.2 explicit Hacker/Deck/Skill/Program identity
-  run?: { step: RunStep; settings: BattleSettings; hackerMaxLink: number };
-  phase: 'ACTIVE_BATTLE' | 'PENDING_RESULT';
+  identity: BattleIdentity; // §17.2 explicit Hacker/Deck/Skill/build identity
+  run?: SavedRun;
+  phase: SavePhase;
   result?: { natural: NaturalOutcome; forcedWin?: true; metricsLogged: boolean };
-  state: PlainGameState;
+  // §17.2/§17.4 — absent exactly when the Run is parked on a pre-battle Build
+  // screen: there is no battle yet, and inventing an empty one would be a
+  // second source of truth for "what is the player looking at".
+  state?: PlainGameState;
 }
 
 export interface RestoredSession {
   info: SessionInfo;
-  game: Game;
+  game: Game | null; // null iff the Run is in its pre-battle Build phase
   pending: PendingResultInfo | null;
 }
 
-export function serializeSession(info: SessionInfo, game: Game, pending: PendingResultInfo | null): string {
+const savedRunOf = (info: RunInfo): SavedRun => ({
+  step: info.step,
+  settings: cloneSettings(info.settings),
+  hackerMaxLink: info.hackerMaxLink,
+  inventory: [...info.inventory],
+  build: [...info.build],
+  buildOrigin: info.buildOrigin,
+});
+
+export function serializeSession(info: SessionInfo, game: Game | null, pending: PendingResultInfo | null): string {
   const content = getContent();
+  // §17.4 — a committed Run parked on Build has no battle state; its identity
+  // is still explicit, derived from the same authority a battle would use.
+  const identity =
+    game?.state.identity ??
+    buildIdentity(
+      info.identity.hackerId,
+      info.identity.deckId,
+      info.identity.selectionSource,
+      info.mode === 'RUN' ? info.build : info.build,
+      info.buildOrigin,
+    );
   const env: SavedSession = {
     version: SAVE_VERSION,
     schema: DATA_SCHEMA_VERSION,
     fp: content.fingerprint,
     mode: info.mode,
-    identity: { ...game.state.identity },
-    ...(info.mode === 'RUN'
-      ? { run: { step: info.step, settings: cloneSettings(info.settings), hackerMaxLink: info.hackerMaxLink } }
-      : {}),
-    phase: pending ? 'PENDING_RESULT' : 'ACTIVE_BATTLE',
+    identity: { ...identity },
+    ...(info.mode === 'RUN' ? { run: savedRunOf(info) } : {}),
+    phase: !game ? 'PENDING_BUILD' : pending ? 'PENDING_RESULT' : 'ACTIVE_BATTLE',
     ...(pending
       ? { result: { natural: pending.natural, ...(pending.forcedWin ? { forcedWin: true as const } : {}), metricsLogged: pending.metricsLogged } }
       : {}),
-    state: plainGameState(game.state),
+    ...(game ? { state: plainGameState(game.state) } : {}),
   };
   return JSON.stringify(env);
 }
@@ -376,21 +590,32 @@ export function deserializeSession(json: string | null): RestoredSession | null 
     // the battle state must carry exactly the same identity.
     if (!isValidIdentity(env.identity)) return null;
     const envId = env.identity as BattleIdentity;
+    const sameOrder = (a: readonly string[], b: readonly string[]): boolean =>
+      a.length === b.length && a.every((v, i) => v === b[i]);
 
-    const game = restoreGameState(env.state, env.phase === 'PENDING_RESULT');
-    if (!game) return null;
-    const stateId = game.state.identity;
-    const sameOrder = (a: string[], b: readonly string[]): boolean => a.length === b.length && a.every((v, i) => v === b[i]);
-    if (
-      stateId.hackerId !== envId.hackerId ||
-      stateId.deckId !== envId.deckId ||
-      stateId.deckFunctionId !== envId.deckFunctionId ||
-      stateId.selectionSource !== envId.selectionSource ||
-      !sameOrder(envId.skillIds, stateId.skillIds) ||
-      !sameOrder(envId.hackerPrograms, stateId.hackerPrograms) ||
-      !sameOrder(envId.systemPrograms, stateId.systemPrograms)
-    ) {
-      return null;
+    if (env.phase !== 'ACTIVE_BATTLE' && env.phase !== 'PENDING_RESULT' && env.phase !== 'PENDING_BUILD') return null;
+    // §17.4 — the pre-battle Build phase is Run-only and carries no battle.
+    const inBuild = env.phase === 'PENDING_BUILD';
+    if (inBuild && (env.mode !== 'RUN' || env.state !== undefined || env.result !== undefined)) return null;
+
+    let game: Game | null = null;
+    if (!inBuild) {
+      game = restoreGameState(env.state, env.phase === 'PENDING_RESULT');
+      if (!game) return null;
+      const stateId = game.state.identity;
+      if (
+        stateId.hackerId !== envId.hackerId ||
+        stateId.deckId !== envId.deckId ||
+        stateId.deckFunctionId !== envId.deckFunctionId ||
+        stateId.selectionSource !== envId.selectionSource ||
+        stateId.buildOrigin !== envId.buildOrigin ||
+        !sameOrder(envId.skillIds, stateId.skillIds) ||
+        !sameOrder(envId.hackerPrograms, stateId.hackerPrograms) ||
+        !sameOrder(envId.inventory, stateId.inventory) ||
+        !sameOrder(envId.systemPrograms, stateId.systemPrograms)
+      ) {
+        return null;
+      }
     }
 
     let info: SessionInfo;
@@ -399,22 +624,37 @@ export function deserializeSession(json: string | null): RestoredSession | null 
       if (!run || !Number.isInteger(run.step) || run.step < 1 || run.step > RUN_LENGTH) return null;
       if (!isValidSettingsShape(run.settings)) return null;
       if (!Number.isInteger(run.hackerMaxLink) || run.hackerMaxLink < 1 || run.hackerMaxLink > 9999) return null;
+      // §17.2 — an active save whose Program references disagree with the
+      // current content is INCOMPATIBLE. It is never silently repaired by
+      // substituting the default build.
+      if (!Array.isArray(run.inventory) || !sameOrder(run.inventory, envId.inventory)) return null;
+      if (!Array.isArray(run.build) || !isValidBuild(run.build, run.inventory)) return null;
+      if (!inBuild && !sameOrder(run.build, envId.hackerPrograms)) return null;
+      if (!isBuildOrigin(run.buildOrigin)) return null;
       info = {
         mode: 'RUN',
         step: run.step as RunStep,
         settings: cloneSettings(run.settings),
         identity: { hackerId: envId.hackerId, deckId: envId.deckId, selectionSource: envId.selectionSource },
         hackerMaxLink: run.hackerMaxLink,
+        inventory: [...run.inventory],
+        build: [...run.build],
+        buildOrigin: run.buildOrigin,
+        ...(inBuild ? { pendingBuild: true as const } : {}),
       };
     } else {
       if (env.run !== undefined) return null; // Quick Match never carries Run values
+      // §9.5/§17.5 — restore the EXACT saved build and its source. Continue
+      // never rerolls a Random build and never rereads the Constructed preset.
+      if (!isValidBuild(envId.hackerPrograms, envId.inventory)) return null;
       info = {
         mode: 'QUICK_MATCH',
         identity: { hackerId: envId.hackerId, deckId: envId.deckId, selectionSource: envId.selectionSource },
+        build: [...envId.hackerPrograms],
+        buildOrigin: envId.buildOrigin,
       };
     }
 
-    if (env.phase !== 'ACTIVE_BATTLE' && env.phase !== 'PENDING_RESULT') return null;
     let pending: PendingResultInfo | null = null;
     if (env.phase === 'PENDING_RESULT') {
       const r = env.result;
@@ -426,19 +666,26 @@ export function deserializeSession(json: string | null): RestoredSession | null 
       return null; // an active battle cannot carry a result
     }
 
-    if (!isValidConfigShape(game.state.config)) return null;
-    // concluded-state winner must agree with the recorded natural outcome
-    if (pending && naturalOf(game.state.winner as 'player' | 'enemy') !== pending.natural) return null;
-    // §10.4 — the battle's effective LINK/ICE must agree with the saved rule,
-    // so a tampered or stale envelope cannot resume under different maxima.
-    if (info.mode === 'RUN') {
-      if (game.state.config.playerHp !== info.hackerMaxLink) return null;
-      if (game.state.config.enemyHp !== resolveRunIce(info.settings, info.step)) return null;
+    if (game) {
+      if (!isValidConfigShape(game.state.config)) return null;
+      // concluded-state winner must agree with the recorded natural outcome
+      if (pending && naturalOf(game.state.winner as 'player' | 'enemy') !== pending.natural) return null;
+      // §10.4 — the battle's effective LINK/ICE must agree with the saved rule,
+      // so a tampered or stale envelope cannot resume under different maxima.
+      if (info.mode === 'RUN') {
+        if (game.state.config.playerHp !== info.hackerMaxLink) return null;
+        if (game.state.config.enemyHp !== resolveRunIce(info.settings, info.step)) return null;
+      }
     }
     return { info, game, pending };
   } catch {
     return null;
   }
+}
+
+const BUILD_ORIGINS: BuildOrigin[] = ['DEFAULT', 'RANDOM', 'REMEMBERED_CONSTRUCTED', 'CARRIED_RUN', 'PLAYER_EDITED'];
+function isBuildOrigin(v: unknown): v is BuildOrigin {
+  return typeof v === 'string' && (BUILD_ORIGINS as string[]).includes(v);
 }
 
 export type { WizardAction };
