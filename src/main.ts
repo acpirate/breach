@@ -23,8 +23,10 @@ import {
   ResolvedDeck,
   ResolvedHacker,
   ResolvedProgram,
+  ResolvedSystem,
   allDecks,
   allHackers,
+  allSystems,
   contentStamp,
   deckById,
   defaultBuild,
@@ -36,6 +38,7 @@ import {
   programById,
   programsFor,
   setActiveContent,
+  systemById,
   targetKindOf,
 } from './logic/data/content';
 import type { TargetKind } from './logic/data/effects';
@@ -54,12 +57,14 @@ import {
   setLoggingLevel,
 } from './logic/logger';
 import { BattleMetrics } from './logic/metrics';
+import { isPendingSpecial } from './logic/resolve';
 import {
   BuildContext,
   BuildState,
   PendingResultInfo,
   PendingSetup,
   RunInfo,
+  SelectedSystem,
   SessionInfo,
   battleContext,
   beginBuild,
@@ -83,9 +88,12 @@ import {
   nextStep,
   progressesAsVictory,
   randomBuild,
+  randomSystem,
   recreateBattleFromConfig,
   replaceInBuild,
   resolveHackerMaxLink,
+  resolveQuickMatchIce,
+  resolveRunIce,
   serializeConstructedPreset,
   serializeSession,
   setupBack,
@@ -155,6 +163,10 @@ const DECK_SLOT = -1;
 let targeting: { slot: number; kind: TargetKind } | null = null;
 // §8 — the Build screen's state while it is open (null at every other time).
 let build: BuildState | null = null;
+// Alpha 0.5.0 §12.3 — the System chosen for a Constructed Quick Match that has
+// NOT started yet. Ephemeral pending setup exactly like `setup` above: it does
+// not touch the resident save until the battle actually begins.
+let pendingQuickSystem: SelectedSystem | null = null;
 // §20.2 — true exactly while Hacker input is locked for the System turn.
 let systemTurnActive = false;
 // MK5.4: the menu's chosen settings — persisted, never implicitly reset.
@@ -194,14 +206,18 @@ function canAct(): boolean {
   return !!game && !busy && !game.state.winner && game.state.phase === 'playerPre';
 }
 
-// Sum of active special-tile magnitudes for a side (§9.2 — Effect value from
+// Sum of LIVE special-tile magnitudes for a side (§9.2 — Effect value from
 // authoritative logic state, not tile count, not render objects).
+// Alpha 0.5.0 §28.1 — an armed (pending) overlay contributes nothing yet, so
+// the HUD must not promise a bonus that is not being applied. This mirrors
+// resolve.buffBonus exactly; the two must never disagree.
 function specialMagnitude(kind: 'buff' | 'shield', side: Side): number {
   if (!game) return 0;
   let n = 0;
   for (const row of game.state.board) {
     for (const t of row) {
-      if (t?.special?.type === kind && t.special.owner === side) n += t.special.magnitude ?? 0;
+      const sp = t?.special;
+      if (sp?.type === kind && sp.owner === side && !isPendingSpecial(sp)) n += sp.magnitude ?? 0;
     }
   }
   return n;
@@ -327,6 +343,10 @@ function metricsElement(m: BattleMetrics): HTMLElement {
     row(`Total damage dealt: ${fmt(sm.totalDamage)}`);
     row(`  Sync-caused (incl. its cascades): ${fmt(sm.matchDamage)}`);
     row(`  bomb-caused (incl. its cascades): ${fmt(sm.bombDamage)}`);
+    row(`  line-slice-caused (incl. its cascades): ${fmt(sm.linesliceDamage)}`);
+    // Alpha 0.5.0 — Syncs an EFFECT_TRANSFORM created, credited to the Effect
+    // so its contribution is legible next to the others.
+    row(`  transform-caused (incl. its cascades): ${fmt(sm.transformDamage)}`);
     row(`  Attack: ${fmt(sm.attackerDamage)}`);
     row(`  Buffer added: ${fmt(sm.bufferDamageAdded)}`);
     row(`  Skill damage: ${fmt(sm.skillDamage)}`);
@@ -342,15 +362,16 @@ function metricsElement(m: BattleMetrics): HTMLElement {
     row(`Line clears: ${sm.lineClears}`);
     const contPct = sm.tilesDestroyed > 0 ? ((sm.contentionTiles / sm.tilesDestroyed) * 100).toFixed(1) : '0.0';
     row(`Opponent-bound Packets sliced: ${sm.contentionTiles} of ${sm.tilesDestroyed} (${contPct}%)`);
-    // §8.4 — charge that outran the whole active queue, counted once for the
-    // side rather than blamed on the bottom-most Program.
-    row(`Charge discarded (no Program could take it): ${fmt(sm.chargeDiscardedTotal)}`);
+    // Alpha 0.5.0 §39.1 — ONE side-level total covering every source of
+    // unstorable Program charge (routing discard and flat/timer overflow).
+    // §39.2 — there is deliberately no per-Program waste row any more.
+    row(`Charge wasted (no Program could take it): ${fmt(sm.chargeWastedTotal)}`);
     for (const p of programsFor(side)) {
       const u = sm.units[p.id];
       if (!u) continue;
       const placed = u.bombsPlaced > 0 ? `, bombs placed ${u.bombsPlaced}` : '';
       const fizz = u.fizzles > 0 ? `, fizzles ${u.fizzles}` : '';
-      row(`${p.name} [${p.id}]: fired ${u.fires}, effect ${fmt(u.effect)}, charge wasted ${fmt(u.chargeWasted)}${placed}${fizz}`);
+      row(`${p.name} [${p.id}]: fired ${u.fires}, effect ${fmt(u.effect)}${placed}${fizz}`);
     }
     // §21.3 — Deck-owned metrics stay separate from the Program rows
     if (side === 'player' && game) {
@@ -695,20 +716,36 @@ function showProgramInspection(programId: string, source: PortfolioSource | null
   showDialog('PROGRAM', '', [['Back', back]], panels, true);
 }
 
-// A tappable row of portfolio Programs — used by both selection screens. Each
-// chip opens the shared inspection modal and nothing else (§19.2).
-function portfolioStrip(programIds: ReadonlyArray<string>, source: PortfolioSource, back: () => void): HTMLElement {
+// A tappable row of Programs — used by the Hacker/Deck selection screens and
+// (Alpha 0.5.0 §15/§16) by System Selection and the Run Build opponent panel.
+// Each chip opens the SHARED inspection modal and nothing else (§19.2), so
+// there is exactly one Program-inspection component in the application.
+// `source` is null for System Programs: they come from a System's fixed
+// PRG_SET, not from a Hacker/Deck portfolio, and labelling them otherwise
+// would be false.
+function portfolioStrip(
+  programIds: ReadonlyArray<string>,
+  source: PortfolioSource | null,
+  back: () => void,
+  numbered = false,
+): HTMLElement {
   const wrap = document.createElement('div');
   wrap.className = 'prgstrip';
-  for (const id of programIds) {
+  programIds.forEach((id, i) => {
     const p = programById(id);
     const b = document.createElement('button');
     b.className = 'prgchip';
-    b.textContent = `${p.name} — ${p.fn.name} (${p.cost})`;
+    b.textContent = `${numbered ? `${i + 1}. ` : ''}${p.name} — ${p.fn.name} (${p.cost})`;
     b.addEventListener('click', () => showProgramInspection(id, source, back));
     wrap.appendChild(b);
-  }
+  });
   return wrap;
+}
+
+// §15/§16/§17 — a System's ordered Programs. Numbered, because the order IS
+// the charge-routing priority the player is being asked to read (§30).
+function systemProgramStrip(programIds: ReadonlyArray<string>, back: () => void): HTMLElement {
+  return portfolioStrip(programIds, null, back, true);
 }
 
 // ---- character sheets (§20.3 — per side, opened from the avatar boxes) ----
@@ -722,8 +759,9 @@ function characterSheetSide(cfg: BattleConfig, side: Side, identity: BattleIdent
     d.textContent = text;
     wrap.appendChild(d);
   };
-  // §20.3 — strong/weak sets come from RESOLVED state (the selected Hacker's
-  // authored sets, complemented for the System), never from prose or constants.
+  // §20.3, revised by Alpha 0.5.0 §17 — strong/weak sets come from RESOLVED
+  // state: each side's OWN authored identity, never prose, constants, or (as
+  // through Alpha 0.4) the other side's complement.
   const strongC = cfg.strongColors[side];
   const strongS = cfg.strongShapes[side];
   const weakC = ([0, 1, 2, 3, 4, 5] as Color[]).filter((c) => !strongC.includes(c));
@@ -733,7 +771,9 @@ function characterSheetSide(cfg: BattleConfig, side: Side, identity: BattleIdent
     row(`HACKER — ${hacker.name}`, true);
     row(`LINK ${cfg.playerHp}`);
   } else {
-    row('SYSTEM', true);
+    // §17 — the sheet now names the System it is describing. BIO and GRAPHICS
+    // stay unused placeholders and are deliberately not displayed.
+    row(`SYSTEM — ${systemById(identity.systemId).name}`, true);
     row(`ICE ${cfg.enemyHp}`);
   }
   row(`Strong colors (${DAMAGE_PER_TILE_HIGH_COLOR} dmg): ${colorList(strongC)}`);
@@ -753,6 +793,8 @@ function characterSheetSide(cfg: BattleConfig, side: Side, identity: BattleIdent
   }
   // §5.3/§19.4 — the ACTIVE build in battle order, numbered so the charge
   // priority the player is looking at is unambiguous.
+  // §17 — for the System this is the selected System's ordered PRG_SET, with
+  // each Program's Function named, exactly as the Hacker's active build is.
   row('PROGRAMS (active, top to bottom)', true);
   const roster = side === 'player' ? identity.hackerPrograms : identity.systemPrograms;
   roster.forEach((id, i) => row(`${i + 1}. ${programLine(programById(id))}`));
@@ -773,9 +815,18 @@ function characterSheetSide(cfg: BattleConfig, side: Side, identity: BattleIdent
 
 function showCharacterSheet(side: Side): void {
   if (!game) return;
+  const identity = game.state.identity;
   const panels = document.createElement('div');
   panels.className = 'panelscroll';
-  panels.appendChild(characterSheetSide(game.state.config, side, game.state.identity));
+  panels.appendChild(characterSheetSide(game.state.config, side, identity));
+  // §17 — shared Program inspection from the sheet, so a player can read what
+  // the opponent's Programs actually do mid-battle without a second component.
+  const head = document.createElement('div');
+  head.className = 'cfghead';
+  head.textContent = 'INSPECT';
+  panels.appendChild(head);
+  const roster = side === 'player' ? identity.hackerPrograms : identity.systemPrograms;
+  panels.appendChild(portfolioStrip(roster, null, () => showCharacterSheet(side), true));
   showDialog(side === 'player' ? 'HACKER' : 'SYSTEM', '', [['Close', hideDialog]], panels);
 }
 
@@ -822,6 +873,24 @@ function logSelection(
     ...(opts.extra ?? {}),
   };
   appendSelectionLog(entry);
+}
+
+// Alpha 0.5.0 §36 — one record per COMMITTED opponent resolution. Emitted at
+// the moment the System is resolved (Run roll, Random Quick Match roll, or an
+// explicit Constructed choice), never once per turn: System identity is
+// battle-static and joins to turn records through the battle-level record.
+function logSystemSelected(system: SelectedSystem, context: SelectionLogEntry['buildContext']): void {
+  const s = systemById(system.systemId);
+  logSelection('SYSTEM_SELECTED', {
+    extra: {
+      systemId: s.id,
+      systemSelectionSource: system.source,
+      systemStrongColors: [...s.strongColors],
+      systemStrongShapes: [...s.strongShapes],
+      systemPrograms: [...s.programIds],
+      ...(context ? { buildContext: context } : {}),
+    },
+  });
 }
 
 // §18.2 — the portfolio/inventory context every setup and build record carries.
@@ -1123,8 +1192,15 @@ function showDeckSelection(s: PendingSetup): void {
       ['Choose', () => {
         if (!preselect) return;
         logSelection('DECK_SELECTED', { identity: { hackerId: s.hackerId ?? undefined, deckId: preselect } });
-        const next = chooseDeck({ ...s, deckId: preselect }, preselect);
+        // Alpha 0.5.0 §11.2/§11.3 — entering Build resolves the Battle 1
+        // opponent, so the player can react to it while editing the build. The
+        // roll uses an isolated SETUP random source (§14): it must not consume
+        // or perturb the gameplay RNG the battle will seed independently.
+        // chooseDeck keeps any System already rolled during this pending setup,
+        // so Back/forward navigation cannot reroll the encounter (§11.3).
+        const next = chooseDeck({ ...s, deckId: preselect }, preselect, makeSetupRandom().rng);
         setup = next;
+        if (!s.system && next.system) logSystemSelected(next.system, 'INITIAL_RUN');
         // §8.3 — a newly initiated Run always opens Build on the DEFAULT
         // build, whatever any prior Run or remembered preset held.
         openBuild(beginBuild('INITIAL_RUN', s.hackerId!, preselect, null, 'DEFAULT'));
@@ -1172,6 +1248,16 @@ function openBuild(s: BuildState): void {
   showBuild();
 }
 
+// Alpha 0.5.0 §16 — which System this Build screen is preparing against. Each
+// context reads it from the authority that already owns it, so the Build
+// screen never re-resolves or rerolls an opponent: pending New Run setup, the
+// committed Run's persisted selection, or the pending Constructed choice.
+function upcomingSystemFor(s: BuildState): SelectedSystem | null {
+  if (s.context === 'CONSTRUCTED_QUICK_MATCH') return pendingQuickSystem;
+  if (s.context === 'INITIAL_RUN') return setup?.system ?? null;
+  return session?.mode === 'RUN' ? session.system : null;
+}
+
 function showBuild(): void {
   const s = build;
   if (!s) return;
@@ -1211,6 +1297,45 @@ function showBuild(): void {
   idRow(`Deck Function: ${deck.fn.name} costs ${deck.fn.cost}, ${startChargeText(deck.fn.startCharged, deck.fn.cost)}`);
   idBox.appendChild(details);
   panels.appendChild(idBox);
+
+  // ---- Alpha 0.5.0 §16 — the UPCOMING OPPONENT ----
+  // The System is selected before Build precisely so the player can build
+  // against it, so it has to be legible here. Collapsed by default like the
+  // identity summary above, for the same narrow-screen reason (§16 — use a
+  // compact/expandable presentation); it is INFORMATIONAL only, with no reroll
+  // or replace interaction anywhere in a Run.
+  const upcoming = upcomingSystemFor(s);
+  if (upcoming) {
+    const sys = systemById(upcoming.systemId);
+    const ice =
+      s.context === 'CONSTRUCTED_QUICK_MATCH'
+        ? resolveQuickMatchIce(menuSettings, sys.id)
+        : session?.mode === 'RUN'
+          ? resolveRunIce(session.settings, sys.id, session.step)
+          : resolveQuickMatchIce(menuSettings, sys.id);
+    const sysBox = document.createElement('div');
+    sysBox.className = 'config readonly';
+    const sysDetails = document.createElement('details');
+    sysDetails.className = 'cfgsection';
+    const sysSummary = document.createElement('summary');
+    sysSummary.textContent = `SYSTEM: ${sys.name} — ICE ${ice}`;
+    sysDetails.appendChild(sysSummary);
+    const sysRow = (text: string, head = false): void => {
+      const d = document.createElement('div');
+      if (head) d.className = 'cfghead';
+      d.textContent = text;
+      sysDetails.appendChild(d);
+    };
+    sysRow(`${sys.name} [${sys.id}] — ICE ${ice}`, true);
+    sysRow(`Strong colors: ${colorList(sys.strongColors)}`);
+    sysRow(`Weak colors: ${colorList(sys.weakColors)}`);
+    sysRow(`Strong shapes: ${shapeList(sys.strongShapes)}`);
+    sysRow(`Weak shapes: ${shapeList(sys.weakShapes)}`);
+    sysRow('PROGRAMS (top to bottom — charge priority)', true);
+    sysDetails.appendChild(systemProgramStrip(sys.programIds, showBuild));
+    sysBox.appendChild(sysDetails);
+    panels.appendChild(sysBox);
+  }
 
   // ---- four ordered active slots (§8.1/§5.7) ----
   const activeHead = document.createElement('div');
@@ -1336,9 +1461,13 @@ function showBuild(): void {
     const restored = deserializeSession(loadBattleJson());
     buttons.push([startLabel, () => confirmReplace(restored ? restored.info : null, () => void startConstructedQuickMatch(), showBuild)]);
     // §9.3 — backing out neither writes the preset nor replaces the save.
+    // Alpha 0.5.0 §12.2 — Back from Build returns to System Selection (the
+    // screen that now precedes it), with the previous pick still showing.
     buttons.push(['Back', () => {
       build = null;
-      showQuickMatchMenu();
+      systemPick = pendingQuickSystem?.systemId ?? null;
+      pendingQuickSystem = null;
+      showSystemSelection();
     }]);
   } else {
     buttons.push([startLabel, () => void startRunBattleFromBuild()]);
@@ -1363,9 +1492,12 @@ function showBuild(): void {
 // identity, record the derived inventory and the final ordered build, create
 // Battle 1, and enter it.
 async function commitRun(): Promise<void> {
-  if (!setup || !setupComplete(setup) || !setup.hackerId || !setup.deckId || !build) return;
+  if (!setup || !setupComplete(setup) || !setup.hackerId || !setup.deckId || !setup.system || !build) return;
   const hackerId = setup.hackerId;
   const deckId = setup.deckId;
+  // §11.3 — the opponent rolled when setup reached Build is the one committed
+  // here; Start Run never re-resolves it.
+  const system = setup.system;
   // §10.4 — snapshot the settings (including Normal LINK) and resolve the
   // effective Hacker maximum LINK now; the whole Run uses these saved values.
   const settings = snapshotRunSettings(menuSettings);
@@ -1383,6 +1515,7 @@ async function commitRun(): Promise<void> {
     inventory: inventoryProgramIds(hackerId, deckId),
     build: finalBuild,
     buildOrigin: origin,
+    system,
   };
   pending = null;
   setup = null;
@@ -1458,17 +1591,90 @@ function showQuickMatchMenu(): void {
         const restored = deserializeSession(loadBattleJson());
         confirmReplace(restored ? restored.info : null, () => void startRandomQuickMatch(), showQuickMatchMenu);
       }],
-      // §9.3 — Constructed opens Build FIRST; the save is replaced only when
-      // the battle actually starts.
-      ['Constructed Quick Match', openConstructedQuickMatchBuild],
+      // Alpha 0.5.0 §12.1 — Constructed now opens SYSTEM SELECTION first, then
+      // Build, so the opponent is known while the build is edited (§2.10). The
+      // save is still replaced only when the battle actually starts (§12.3).
+      ['Constructed Quick Match', () => {
+        systemPick = null;
+        showSystemSelection();
+      }],
       ['Back', showTitle],
     ],
   );
 }
 
+// ============================================================================
+// Alpha 0.5.0 §12/§15 — CONSTRUCTED QUICK MATCH SYSTEM SELECTION.
+//
+// The opponent is chosen BEFORE Build so the player can build against it
+// (§2.10). Whitebox and mobile-first: every valid loaded System, enough
+// resolved data to make the choice meaningful, shared Program inspection, one
+// final action and no confirmation modal (§12.2). There is no remembered
+// System preference in Alpha 0.5 (§12.4).
+// ============================================================================
+
+// Which System the selection screen is currently showing as picked. Pure
+// presentation state: nothing is committed until Choose.
+let systemPick: string | null = null;
+
+function showSystemSelection(): void {
+  build = null;
+  const systems = allSystems();
+  const preselect = systemPick ?? (systems.length === 1 ? systems[0].id : null);
+  const list = optionList(
+    systems.map((s: ResolvedSystem) => ({
+      id: s.id,
+      title: `${s.name} [${s.id}]`,
+      lines: [
+        // §15 — Quick Match ICE is the System's own BASE_ICE (§10.1), so the
+        // number shown here is the number the battle will actually use.
+        `ICE ${resolveQuickMatchIce(menuSettings, s.id)}`,
+        `Strong: ${colorList(s.strongColors)} / ${shapeList(s.strongShapes)}`,
+        `Weak: ${colorList(s.weakColors)} / ${shapeList(s.weakShapes)}`,
+      ],
+    })),
+    preselect,
+    (id) => {
+      systemPick = id;
+      showSystemSelection();
+    },
+  );
+  const panels = document.createElement('div');
+  panels.className = 'panelscroll';
+  panels.appendChild(list);
+  // §15 — the ordered four-Program build, with shared Program inspection.
+  if (preselect) {
+    const head = document.createElement('div');
+    head.className = 'cfghead';
+    head.textContent = 'PROGRAMS (top to bottom — charge priority)';
+    panels.appendChild(head);
+    panels.appendChild(systemProgramStrip(systemById(preselect).programIds, showSystemSelection));
+  }
+  showDialog(
+    'SELECT SYSTEM',
+    'Choose the System you will breach',
+    [
+      ['Choose', () => {
+        if (!preselect) return;
+        const system: SelectedSystem = { systemId: preselect, source: 'QUICK_CONSTRUCTED' };
+        logSystemSelected(system, 'CONSTRUCTED_QUICK_MATCH');
+        openConstructedQuickMatchBuild(system);
+      }, undefined, !preselect],
+      // §12.2 — Back from System Selection returns to the Quick Match submenu.
+      ['Back', () => {
+        systemPick = null;
+        showQuickMatchMenu();
+      }],
+    ],
+    panels,
+    true,
+  );
+}
+
 // §9.3 — open the Constructed Build screen: the last valid remembered build
 // when one exists, otherwise the default.
-function openConstructedQuickMatchBuild(): void {
+function openConstructedQuickMatchBuild(system: SelectedSystem): void {
+  pendingQuickSystem = system;
   const ids = defaultIdentity();
   // §9.4 — an unusable preference is discarded quietly and falls back to the
   // default; it never blocks startup or the mode.
@@ -1491,13 +1697,19 @@ async function startRandomQuickMatch(): Promise<void> {
   // §9.2 — an isolated setup random source. The Game seeds its gameplay RNG
   // separately at construction, so this cannot perturb the board, refills, or
   // AI sequence for a given gameplay seed.
+  // Alpha 0.5.0 §13/§14 — the opponent is drawn from that SAME setup stream:
+  // one isolated source for all setup randomness, never a second one and never
+  // the gameplay stream. No System Selection screen opens (§13).
   const { rng, seed } = makeSetupRandom();
   const chosen = randomBuild(inventory, rng);
+  const system = randomSystem(rng, 'QUICK_RANDOM');
   clearBattleSave(); // confirmed replacement
-  session = { mode: 'QUICK_MATCH', identity: ids, build: chosen, buildOrigin: 'RANDOM' };
+  session = { mode: 'QUICK_MATCH', identity: ids, system, build: chosen, buildOrigin: 'RANDOM' };
   pending = null;
   setup = null;
   build = null;
+  pendingQuickSystem = null;
+  logSystemSelected(system, 'RANDOM_QUICK_MATCH');
   // §18.4 — logged BEFORE battle creation.
   logSelection('BUILD_OPENED', {
     identity: { hackerId: ids.hackerId, deckId: ids.deckId },
@@ -1510,7 +1722,7 @@ async function startRandomQuickMatch(): Promise<void> {
       gameplayRngIndependent: true,
     },
   });
-  const g = createQuickMatchBattle(menuSettings, ids, chosen, 'RANDOM');
+  const g = createQuickMatchBattle(menuSettings, ids, system, chosen, 'RANDOM');
   logSelection('QUICK_MATCH_CREATED', { g, extra: { buildContext: 'RANDOM_QUICK_MATCH', buildEdited: false } });
   await enterBattle(g);
 }
@@ -1518,17 +1730,21 @@ async function startRandomQuickMatch(): Promise<void> {
 // §9.3 — start the Constructed battle and remember the build. The preset is
 // written ONLY here, never on Back.
 async function startConstructedQuickMatch(): Promise<void> {
-  if (!build) return;
+  if (!build || !pendingQuickSystem) return;
   const ids = defaultIdentity();
+  const system = pendingQuickSystem;
   const chosen = [...build.build];
   const edited = build.edited;
+  // §12.4 — the remembered preset stays a HACKER build preference. The chosen
+  // System is deliberately NOT part of it: Alpha 0.5 adds no remembered System.
   saveConstructedPreset(serializeConstructedPreset(ids.hackerId, ids.deckId, chosen));
   clearBattleSave();
-  session = { mode: 'QUICK_MATCH', identity: ids, build: chosen, buildOrigin: build.origin };
+  session = { mode: 'QUICK_MATCH', identity: ids, system, build: chosen, buildOrigin: build.origin };
   pending = null;
   setup = null;
   build = null;
-  const g = createQuickMatchBattle(menuSettings, ids, chosen, session.buildOrigin);
+  pendingQuickSystem = null;
+  const g = createQuickMatchBattle(menuSettings, ids, system, chosen, session.buildOrigin);
   logSelection('QUICK_MATCH_CREATED', { g, extra: { buildContext: 'CONSTRUCTED_QUICK_MATCH', buildEdited: edited } });
   await enterBattle(g);
 }
@@ -1541,6 +1757,9 @@ async function resetQuickMatch(config: BattleConfig, identity: BattleIdentity): 
   session = {
     mode: 'QUICK_MATCH',
     identity: { hackerId: identity.hackerId, deckId: identity.deckId, selectionSource: identity.selectionSource },
+    // §18.3/§14 — Reset replays the concluded battle's OWN encounter. It never
+    // rerolls the opponent, exactly as it never rerolls a Random build.
+    system: { systemId: identity.systemId, source: identity.systemSelectionSource },
     build: [...identity.hackerPrograms],
     buildOrigin: identity.buildOrigin,
   };
@@ -1644,7 +1863,14 @@ function advanceRun(): void {
   if (!session || session.mode !== 'RUN') return;
   const n = nextStep(session.step);
   if (n === null) return; // step 4 concludes via Run Complete, not advance
-  session = { ...session, step: n };
+  // Alpha 0.5.0 §11.4 — successful progression creates the next pre-battle
+  // state, so the next opponent is resolved EXACTLY ONCE, here, from an
+  // isolated setup random source (§14). Reopening Build, saving and quitting,
+  // or resuming all reuse the persisted value rather than rolling again.
+  // Repeats across battles are allowed (§11.1 — sampling with replacement).
+  const system = randomSystem(makeSetupRandom().rng, 'RUN_RANDOM');
+  session = { ...session, step: n, system };
+  logSystemSelected(system, 'RUN_BETWEEN');
   openRunBuild('RUN_BETWEEN');
 }
 
@@ -1671,6 +1897,10 @@ function forceWin(): void {
 function wizardRestartLostBattle(): void {
   if (!session || session.mode !== 'RUN') return;
   appendWizard('WIZARD_RESTART_LOST_BATTLE');
+  // Alpha 0.5.0 §11.5 — a retry is the SAME encounter: the System is not
+  // rerolled merely because the player lost. `session.system` is left untouched
+  // and openRunBuild reuses it, so the player may re-plan the Hacker build
+  // against a known opponent.
   openRunBuild('RUN_RETRY');
 }
 
@@ -1681,7 +1911,12 @@ function wizardRestartRun(): void {
   if (!session || session.mode !== 'RUN') return;
   appendWizard('WIZARD_RESTART_RUN');
   const ids = session.identity;
-  session = { ...session, step: 1, build: defaultBuild(ids.hackerId, ids.deckId), buildOrigin: 'DEFAULT', pendingBuild: true };
+  // §11.4 — Restart Run creates a fresh Battle 1 pre-battle state, so it
+  // resolves a new opponent like any other new step. (A RETRY of the same step
+  // does not; that path is wizardRestartLostBattle above.)
+  const system = randomSystem(makeSetupRandom().rng, 'RUN_RANDOM');
+  session = { ...session, step: 1, build: defaultBuild(ids.hackerId, ids.deckId), buildOrigin: 'DEFAULT', system, pendingBuild: true };
+  logSystemSelected(system, 'RUN_BETWEEN');
   pending = null;
   game = null;
   view.clearBoard();

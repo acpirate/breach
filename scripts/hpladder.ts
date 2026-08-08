@@ -5,12 +5,20 @@
 // Normal LINK OFF (§10.2), which is exactly what the manual settings are for.
 // Run with `npm run hpladder`.
 
+import { systemById } from '../src/logic/data/content';
 import { BattleSettings } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { initContentOrExit } from './dataNode';
-import { D, manualLink, newBattle } from './harness';
+import { D, headlessSystem, manualLink, newBattle } from './harness';
 
 initContentOrExit();
+
+// Alpha 0.5.0 §44 — the ladder pins its opponent, so tier-to-tier and
+// run-to-run comparisons measure tempo rather than a changing System.
+{
+  const s = systemById(headlessSystem().systemId);
+  console.log(`system: ${s.id} ${s.name} | build: ${s.programIds.join(', ')}`);
+}
 
 const N = 100;
 const TIERS = [100, 500, 2000];

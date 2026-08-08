@@ -4,13 +4,13 @@
 // from the same CSV datasets as the browser; the summary header stamps the
 // content identity (§13.2). Run with `npm run batch`.
 
-import { contentStamp, deckById, getContent, programsFor } from '../src/logic/data/content';
+import { contentStamp, deckById, getContent, programsFor, systemById } from '../src/logic/data/content';
 import { BattleMetrics } from '../src/logic/metrics';
 import { defaultIdentity } from '../src/logic/session';
 import { BattleSettings } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { initContentOrExit } from './dataNode';
-import { D, defaultActiveBuild, defaultInventory, newBattle } from './harness';
+import { D, defaultActiveBuild, defaultInventory, headlessSystem, newBattle } from './harness';
 
 initContentOrExit();
 
@@ -46,11 +46,13 @@ function report(label: string, group: BattleMetrics[]): void {
     const s = group.map((m) => m.sides[side]);
     console.log(`--- ${side.toUpperCase()} (averages per battle) ---`);
     const abilityPcts = s.map((x) =>
-      x.totalDamage > 0 ? ((x.attackerDamage + x.bombDamage + x.linesliceDamage) / x.totalDamage) * 100 : 0,
+      x.totalDamage > 0
+        ? ((x.attackerDamage + x.bombDamage + x.linesliceDamage + x.transformDamage) / x.totalDamage) * 100
+        : 0,
     );
     // MK7.3/7.4 + §11.3 + §15.3: SIX DISJOINT causal buckets
     // (sync + bomb + atk + slice + buffer + skill = total)
-    console.log(`  Total damage: ${f1(avg(s.map((x) => x.totalDamage)))}  [sync ${f1(avg(s.map((x) => x.matchDamage)))} | bomb ${f1(avg(s.map((x) => x.bombDamage)))} | atk ${f1(avg(s.map((x) => x.attackerDamage)))} | slice ${f1(avg(s.map((x) => x.linesliceDamage)))} | buffer ${f1(avg(s.map((x) => x.bufferDamageAdded)))} | skill ${f1(avg(s.map((x) => x.skillDamage)))}]  Function share ${f1(avg(abilityPcts))}%`);
+    console.log(`  Total damage: ${f1(avg(s.map((x) => x.totalDamage)))}  [sync ${f1(avg(s.map((x) => x.matchDamage)))} | bomb ${f1(avg(s.map((x) => x.bombDamage)))} | atk ${f1(avg(s.map((x) => x.attackerDamage)))} | slice ${f1(avg(s.map((x) => x.linesliceDamage)))} | xform ${f1(avg(s.map((x) => x.transformDamage)))} | buffer ${f1(avg(s.map((x) => x.bufferDamageAdded)))} | skill ${f1(avg(s.map((x) => x.skillDamage)))}]  Function share ${f1(avg(abilityPcts))}%`);
     console.log(`  Cascade (RNG-refill) damage, any cause: ${f1(avg(s.map((x) => x.cascadeDamage)))}`);
     console.log(`  Sync dmg by axis: color ${f1(avg(s.map((x) => x.matchDamageColor)))} / shape ${f1(avg(s.map((x) => x.matchDamageShape)))}`);
     // §9.5 — line-clear frequency, so B1 board churn is observable
@@ -62,8 +64,9 @@ function report(label: string, group: BattleMetrics[]): void {
     console.log(`  Deepest cascade: avg ${f1(avg(s.map((x) => x.deepestCascade)))}, max ${max(s.map((x) => x.deepestCascade))}`);
     const contPcts = s.map((x) => (x.tilesDestroyed > 0 ? (x.contentionTiles / x.tilesDestroyed) * 100 : 0));
     console.log(`  Contention: ${f1(avg(s.map((x) => x.contentionTiles)))} opp-bound tiles of ${f1(avg(s.map((x) => x.tilesDestroyed)))} destroyed (avg ${f1(avg(contPcts))}%)`);
-    // Alpha 0.4.1 §8.4 — charge generated that no active Program could absorb.
-    console.log(`  Charge discarded by routing: ${f1(avg(s.map((x) => x.chargeDiscardedTotal)))}`);
+    // Alpha 0.5.0 §39.1 — one total for every source of unstorable Program
+    // charge (routing discard plus flat/timer overflow).
+    console.log(`  Charge wasted (all sources): ${f1(avg(s.map((x) => x.chargeWastedTotal)))}`);
     // Alpha §21.3: per-Program rows by stable ID, display name joined here
     for (const p of programsFor(side)) {
       // Alpha 0.4.0 §5.8 — an inactive inventory Program has no metrics slot in
@@ -72,9 +75,8 @@ function report(label: string, group: BattleMetrics[]): void {
       if (!s.some((x) => x.units[p.id])) continue;
       const fires = avg(s.map((x) => x.units[p.id]?.fires ?? 0));
       const effect = avg(s.map((x) => x.units[p.id]?.effect ?? 0));
-      const wasted = avg(s.map((x) => x.units[p.id]?.chargeWasted ?? 0));
       const fizzles = avg(s.map((x) => x.units[p.id]?.fizzles ?? 0));
-      console.log(`  ${p.name} [${p.id}]: fires ${f1(fires)}, effect ${f1(effect)}, charge wasted ${f1(wasted)}, fizzles ${f1(fizzles)}`);
+      console.log(`  ${p.name} [${p.id}]: fires ${f1(fires)}, effect ${f1(effect)}, fizzles ${f1(fizzles)}`);
     }
     // §21.3 — the Deck-owned Function and Hacker Skills report separately from
     // the Programs; only the Hacker side carries them.
@@ -125,7 +127,13 @@ const stamp = contentStamp();
 const ids = defaultIdentity();
 console.log(`build ${stamp.gameVersion} | schema ${stamp.schemaVersion} | content ${stamp.fingerprint}`);
 console.log(`hacker programs: ${stamp.hackerPrograms.join(', ')}`);
-console.log(`system programs: ${stamp.systemPrograms.join(', ')}`);
+console.log(`system programs (loaded): ${stamp.systemPrograms.join(', ')}`);
+// Alpha 0.5.0 §44 — the opponent is PINNED for simulations, and its ordered
+// build is what actually fights, so both are reported: batch numbers are only
+// comparable between runs against the same System.
+const sim = systemById(headlessSystem().systemId);
+console.log(`system: ${sim.id} ${sim.name} | base ICE ${sim.baseIce} | build: ${sim.programIds.join(', ')}`);
+console.log(`system strong: colors=[${sim.strongColors.join(',')}] shapes=[${sim.strongShapes.join(',')}]`);
 console.log(`functions: ${stamp.functions.map((f) => `${f.id}=${f.cost}`).join(', ')}`);
 console.log(`identity: ${ids.hackerId}/${ids.deckId} (${ids.selectionSource}) skills=[${stamp.skills.join(', ')}]`);
 console.log(`fingerprint: ${getContent().fingerprint}`);

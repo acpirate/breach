@@ -15,12 +15,13 @@ import { EffectId, EffectParamName, TargetKind } from './effects';
 import { SkillEffectId } from './skills';
 import type { Color, Shape, Side } from '../types';
 
-export const GAME_VERSION = 'alpha-0.4.0';
-// Alpha 0.4.0 §17.1 — schema 3: ordered Hacker/Deck Program portfolios, the
-// derived six-Program inventory, the ordered four-Program active build, the
-// pre-battle Build phase, and the parameterized Bomb/LineSlice contracts.
-// Alpha 0.3 saves (schema 2) are rejected, never migrated.
-export const DATA_SCHEMA_VERSION = 3;
+export const GAME_VERSION = 'alpha-0.5.0';
+// Alpha 0.5.0 §31 — schema 4: authored System identity (`SYS`) as the System-
+// side authority for ICE, strong/weak axes, and the ordered System Program
+// build, plus the selected System persisted in battle identity and pending Run
+// build state. Alpha 0.4.x saves (schema 3) lack an authoritative SYS_ID and
+// are rejected, never migrated (§31.1).
+export const DATA_SCHEMA_VERSION = 4;
 
 // §5.1/§4.4/§4.5 — every Hacker and every Deck contributes exactly this many
 // ordered Programs; the two portfolios combine into the Run inventory.
@@ -34,6 +35,18 @@ export const ACTIVE_BUILD_SIZE = 4;
 // first dataset row, and a missing/invalid default blocks startup.
 export const DEFAULT_HACKER_ID = 'HAK_01';
 export const DEFAULT_DECK_ID = 'DEK_01';
+
+// Alpha 0.5.0 §5.4 — every authored System fields exactly this many ordered
+// active Programs. Deliberately its own constant rather than a reuse of
+// ACTIVE_BUILD_SIZE: the two are equal today by content design, not by rule,
+// and the System has no inventory to draw from (§5.4 — no System Build screen).
+export const SYSTEM_BUILD_SIZE = 4;
+
+// Alpha 0.5.0 §44/§14 — headless simulations pin ONE System so balance output
+// stays comparable between runs; random selection is a gameplay/setup behavior
+// and does not belong in a measurement instrument. Designer note (2026-08-07):
+// a purpose-built TESTER System should replace this in a future build.
+export const HEADLESS_SYSTEM_ID = 'SYS_01';
 
 // ---- EFFECT_SHAKE typed parameters (§8.2-8.6) ----
 
@@ -88,6 +101,27 @@ export interface BombParams {
   gainCharge: 0 | 1;
 }
 
+// ---- Alpha 0.5.0 §23 EFFECT_TRANSFORM typed parameters ----
+// `specialPacketTreatment` shares the SPECIALS_* enum above; retaining a
+// special preserves its ownership and Effect-specific state while the
+// underlying Packet's color/shape changes (§22.3).
+export interface TransformParams {
+  targeting: 0 | 1;
+  specialPacketTreatment: 0 | 1 | 2;
+}
+
+// §22.1 — the authored source axis. Alpha 0.5 supports exactly one value; a
+// future build may generalize the field without changing its shape here.
+export const AXIS_TARGET_NEUTRAL = 'NEU';
+export type AxisTarget = typeof AXIS_TARGET_NEUTRAL;
+
+// §22.2 — the resolved `<COLOR>:<SHAPE>` result identity, parsed once at
+// startup into typed enum values. Runtime never re-parses the authored string.
+export interface AxisResult {
+  color: Color;
+  shape: Shape;
+}
+
 // One validated leaf operation of a Function's payload plan. A leaf Function
 // has exactly one op (its own Effect); a composite Function has one op per
 // child Function reference, in payload order (§7.2 — repeats allowed and
@@ -115,6 +149,10 @@ export interface EffectParams {
   shake?: ShakeParams;
   bomb?: BombParams; // §14.2
   line?: LineSliceParams; // §13.2
+  transform?: TransformParams; // Alpha 0.5.0 §23
+  // §22 — the resolved Transform axes, present iff the Effect declares them.
+  axisTarget?: AxisTarget;
+  axisResult?: AxisResult;
 }
 
 export interface ResolvedFunction {
@@ -178,6 +216,33 @@ export interface ResolvedHacker {
   graphics: string;
 }
 
+// Alpha 0.5.0 §5/§9 — an authored System. This is the SINGLE System-side
+// authority for base ICE, strong/weak axes, and the ordered active Program
+// build. The Alpha 0.4 behavior of deriving System strengths as the selected
+// Hacker's complement is gone: each System now carries its own independent
+// profile (§2.4).
+export interface ResolvedSystem {
+  id: string;
+  name: string;
+  baseIce: number;
+  // §5.3 — strong sets are authored; weak sets are calculated complements over
+  // the recognized enum vocabularies, in enum order. No 3/3 partition required.
+  strongColors: ReadonlyArray<Color>;
+  weakColors: ReadonlyArray<Color>;
+  strongShapes: ReadonlyArray<Shape>;
+  weakShapes: ReadonlyArray<Shape>;
+  // §5.4 — the complete ordered System battle build. Authoritative for battle
+  // initialization, charge-routing priority, display order, save identity, and
+  // fingerprinting. It is NOT Function-activation priority (§2.11).
+  programIds: ReadonlyArray<string>;
+  // §2.2 — reserved for future System passives. Alpha 0.5 requires it blank;
+  // a nonblank value is unsupported content and a startup error, so this is
+  // always empty here and exists to keep the schema honest.
+  skillIds: ReadonlyArray<string>;
+  bio: string; // §5.2 placeholder only — never displayed in Alpha 0.5
+  graphics: string; // §5.2 placeholder only — no asset loading
+}
+
 export interface ResolvedDeck {
   id: string;
   name: string;
@@ -202,9 +267,11 @@ export interface ResolvedContent {
   hackers: ReadonlyMap<string, ResolvedHacker>;
   skills: ReadonlyMap<string, ResolvedSkill>;
   decks: ReadonlyMap<string, ResolvedDeck>;
+  systems: ReadonlyMap<string, ResolvedSystem>; // Alpha 0.5.0 §5
   // Authored row order, for deterministic selection-screen presentation.
   hackerOrder: ReadonlyArray<string>;
   deckOrder: ReadonlyArray<string>;
+  systemOrder: ReadonlyArray<string>; // §15 — System Selection listing order
 }
 
 // ---- active-content registry (set once at startup, read-only afterwards) ----
@@ -241,6 +308,22 @@ export function deckById(id: string): ResolvedDeck {
   const d = getContent().decks.get(id);
   if (!d) throw new Error(`unknown deck id: ${id}`);
   return d;
+}
+
+// §41 — an unknown SYS_ID THROWS. There is deliberately no fallback to a
+// default System, to the first row, or to the old Hacker-complement profile:
+// a missing System is a broken save or broken content, not a playable state.
+export function systemById(id: string): ResolvedSystem {
+  const s = getContent().systems.get(id);
+  if (!s) throw new Error(`unknown system id: ${id}`);
+  return s;
+}
+
+// §11.1/§13 — the complete valid System catalog in authored order. Random
+// encounter selection samples from exactly this list.
+export function allSystems(): ResolvedSystem[] {
+  const c = getContent();
+  return c.systemOrder.map((id) => c.systems.get(id)!);
 }
 
 // Ordered selection lists for the setup screens (§13.1/§14.1 — every loaded
@@ -355,6 +438,11 @@ export interface ContentStamp {
   // §4.12/§18.2 — ordered portfolios, so a record identifies the content that
   // produced its inventory and default build.
   portfolios: { id: string; programs: string[] }[];
+  // Alpha 0.5.0 §36 — the authored System catalog, so an exported battle record
+  // identifies the opponent content it was played against. Battle-level only:
+  // System identity is battle-static and is never copied into turn records
+  // (§35).
+  systems: { id: string; baseIce: number; programs: string[] }[];
 }
 
 export function contentStamp(): ContentStamp {
@@ -373,7 +461,19 @@ export function contentStamp(): ContentStamp {
     hackers: [...c.hackerOrder],
     decks: [...c.deckOrder],
     skills: [...c.skills.keys()],
+    systems: c.systemOrder.map((id) => {
+      const s = c.systems.get(id)!;
+      return { id: s.id, baseIce: s.baseIce, programs: [...s.programIds] };
+    }),
   };
+}
+
+// Alpha 0.5.0 §19.4 — the System never spends charge on a Function that cannot
+// do anything. This is the shared shape of that answer; the board-aware
+// implementation lives in the combat layer, which owns Datastream state.
+export interface ActivationEligibility {
+  eligible: boolean;
+  reason?: string; // why it was withheld, for COMPLETE-level telemetry
 }
 
 export type { EffectParamName, TargetKind };

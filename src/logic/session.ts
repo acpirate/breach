@@ -15,6 +15,7 @@ import {
   DEFAULT_DECK_ID,
   DEFAULT_HACKER_ID,
   InventoryEntry,
+  allSystems,
   deckById,
   defaultBuild,
   getContent,
@@ -22,6 +23,7 @@ import {
   inventoryFor,
   inventoryProgramIds,
   isValidBuild,
+  systemById,
 } from './data/content';
 import { RNG, makeRNG } from './rng';
 import {
@@ -42,23 +44,31 @@ import {
   NaturalOutcome,
   RunStep,
   SelectionSource,
+  SystemSelectionSource,
   WizardAction,
+  isSystemSelectionSource,
 } from './types';
 
 // ---- Run encounter table (§4.1 — explicit definition, NOT a formula) ----
+//
+// Alpha 0.5.0 §10.1 — the table now holds ADDITIVE modifiers rather than
+// absolute ICE. Effective ICE is `selected System BASE_ICE + modifier`, so a
+// BASE_ICE=100 System still produces the established 100/150/200/250 ladder
+// while a future System with different durability escalates correctly without
+// redesigning Run progression.
 
 export interface RunEncounter {
   step: RunStep;
-  systemHp: number;
+  iceModifier: number;
 }
 
 export const RUN_LENGTH = 4;
 
 export const RUN_ENCOUNTERS: ReadonlyArray<RunEncounter> = [
-  { step: 1, systemHp: 100 },
-  { step: 2, systemHp: 150 },
-  { step: 3, systemHp: 200 },
-  { step: 4, systemHp: 250 },
+  { step: 1, iceModifier: 0 },
+  { step: 2, iceModifier: 50 },
+  { step: 3, iceModifier: 100 },
+  { step: 4, iceModifier: 150 },
 ];
 
 export function encounterFor(step: RunStep): RunEncounter {
@@ -93,24 +103,53 @@ export function defaultIdentity(): SelectedIdentity {
 export function buildIdentity(
   hackerId: string,
   deckId: string,
+  system: SelectedSystem,
   selectionSource: SelectionSource,
   build: readonly string[],
   buildOrigin: BuildOrigin,
 ): BattleIdentity {
-  const c = getContent();
   const hacker = hackerById(hackerId);
   const deck = deckById(deckId);
+  // Alpha 0.5.0 §5.4/§9 — the System roster is the SELECTED System's ordered
+  // PRG_SET, not "every loaded PRG_S_*" as it was through Alpha 0.4.
+  const sys = systemById(system.systemId);
   return {
     hackerId,
     deckId,
+    systemId: sys.id,
+    systemSelectionSource: system.source,
     skillIds: [...hacker.skillIds],
     deckFunctionId: deck.fn.id,
     hackerPrograms: [...build],
     inventory: inventoryProgramIds(hackerId, deckId),
-    systemPrograms: c.system.map((p) => p.id),
+    systemPrograms: [...sys.programIds],
     selectionSource,
     buildOrigin,
   };
+}
+
+// ---- Alpha 0.5.0 §11/§13/§14 — System (encounter) selection ----
+
+// A resolved opponent choice plus how it was made. Carried through pending
+// setup, saved state, battle identity, and logs as one unit so the two can
+// never disagree.
+export interface SelectedSystem {
+  systemId: string;
+  source: SystemSelectionSource;
+}
+
+// §11.1/§13 — one valid loaded System, sampled with replacement. Repeats
+// across Run battles are allowed; there is no shuffle bag and no anti-repeat
+// rule in Alpha 0.5.
+//
+// §14 — the caller supplies a SETUP RNG (makeSetupRandom), never the battle's
+// gameplay stream: selecting an opponent must not perturb the board, refills,
+// or AI sequence for a given gameplay seed.
+export function randomSystem(rng: RNG, source: SystemSelectionSource): SelectedSystem {
+  const catalog = allSystems();
+  // The loader guarantees a nonempty catalog (§41), so this cannot pick from
+  // nothing; a content bug would surface as a thrown error, not a silent default.
+  return { systemId: rng.pick(catalog).id, source };
 }
 
 // ============================================================================
@@ -194,36 +233,46 @@ export function resolveHackerMaxLink(settings: BattleSettings, hackerId: string,
   return hackerById(hackerId).baseLink + deckById(deckId).addLink;
 }
 
-// Quick Match System maximum ICE. Normal LINK ON: mirrors the resolved Hacker
-// maximum LINK. OFF: the manual System ICE setting.
-export function resolveQuickMatchIce(settings: BattleSettings, hackerMaxLink: number): number {
-  return settings.normalLink ? hackerMaxLink : settings.manualSystemIce;
+// Quick Match System maximum ICE. Alpha 0.5.0 §10.1 CHANGES this: under Normal
+// LINK it is the selected System's own BASE_ICE, not a mirror of the Hacker's
+// resolved maximum LINK. With the current authored content that moves Quick
+// Match System ICE from 150 (100 BASE_LINK + 50 Deck ADD_LINK) to 100.
+// Designer-approved 2026-08-07 as the correct "System identity owns System
+// durability" rule, accepting the difficulty delta. OFF: the manual setting.
+export function resolveQuickMatchIce(settings: BattleSettings, systemId: string): number {
+  return settings.normalLink ? systemById(systemId).baseIce : settings.manualSystemIce;
 }
 
-// Run System maximum ICE per encounter. Normal LINK ON: the 100/150/200/250
-// encounter table. OFF: the manual System ICE value for EVERY encounter — the
-// manual setting intentionally overrides the Run sequence (§10.2).
-export function resolveRunIce(settings: BattleSettings, step: RunStep): number {
-  return settings.normalLink ? encounterFor(step).systemHp : settings.manualSystemIce;
+// Run System maximum ICE per encounter. Normal LINK ON: the selected System's
+// BASE_ICE plus that step's additive modifier (§10.1) — a BASE_ICE=100 System
+// still yields 100/150/200/250. OFF: the manual System ICE value for EVERY
+// encounter; the manual setting intentionally overrides both the base and the
+// Run sequence, and the two are never silently combined (§10.2).
+export function resolveRunIce(settings: BattleSettings, systemId: string, step: RunStep): number {
+  if (!settings.normalLink) return settings.manualSystemIce;
+  return systemById(systemId).baseIce + encounterFor(step).iceModifier;
 }
 
-// §5.4 — assemble the per-battle config: the chosen settings plus the values
-// resolved from identity. The selected Hacker's authored strong sets are
-// authoritative for the Hacker; the System's are their complements. There is no
-// competing hardcoded HIGH/LOW authority anywhere.
+// §5.4, revised by Alpha 0.5.0 §9 — assemble the per-battle config: the chosen
+// settings plus the values resolved from identity. Each side's authored strong
+// sets are authoritative for that side: the selected Hacker's for the player,
+// the selected System's for the enemy. The Alpha 0.4 complement rule is gone.
+// There is no competing hardcoded HIGH/LOW authority anywhere.
 export function buildBattleConfig(
   settings: BattleSettings,
   hackerId: string,
+  systemId: string,
   hackerMaxLink: number,
   systemMaxIce: number,
 ): BattleConfig {
   const h = hackerById(hackerId);
+  const s = systemById(systemId);
   return {
     ...settings,
     playerHp: hackerMaxLink,
     enemyHp: systemMaxIce,
-    strongColors: { player: [...h.strongColors], enemy: [...h.weakColors] },
-    strongShapes: { player: [...h.strongShapes], enemy: [...h.weakShapes] },
+    strongColors: { player: [...h.strongColors], enemy: [...s.strongColors] },
+    strongShapes: { player: [...h.strongShapes], enemy: [...s.strongShapes] },
   };
 }
 
@@ -232,6 +281,10 @@ export function buildBattleConfig(
 export interface QuickMatchInfo {
   mode: 'QUICK_MATCH';
   identity: SelectedIdentity;
+  // Alpha 0.5.0 §12/§13 — the resolved opponent for this Quick Match, chosen
+  // before the battle (explicitly in Constructed, rolled in Random) and
+  // restored verbatim by Continue rather than rerolled (§14).
+  system: SelectedSystem;
   // §9.5 — the exact resolved build and where it came from, so Continue
   // restores this battle rather than rerolling a Random build or rereading the
   // remembered Constructed preset.
@@ -255,6 +308,12 @@ export interface RunInfo {
   inventory: string[];
   build: string[];
   buildOrigin: BuildOrigin;
+  // Alpha 0.5.0 §11.2/§33 — the UPCOMING battle's opponent, resolved exactly
+  // once when the pre-battle state is created and then persisted. Reopening
+  // Build, saving and quitting, resuming, or retrying after a defeat all reuse
+  // this value; only successful progression to a new step rolls a new one
+  // (§11.4/§11.5).
+  system: SelectedSystem;
   // §17.2 — true while the Run is sitting on a pre-battle Build screen rather
   // than inside a battle. A committed Run in this phase is fully saveable.
   pendingBuild?: true;
@@ -388,10 +447,16 @@ export interface PendingSetup {
   step: SetupStep;
   hackerId: string | null;
   deckId: string | null;
+  // Alpha 0.5.0 §11.3 — the pending Battle 1 opponent. It belongs to pending
+  // setup (not to the save) until Start Run commits, and it is rolled EXACTLY
+  // ONCE, when setup first reaches the pre-battle Build state. Backing out to
+  // Deck/Hacker Selection and returning must not reroll it; abandoning setup
+  // to Title discards it with the rest of pending setup.
+  system: SelectedSystem | null;
 }
 
 export function beginSetup(): PendingSetup {
-  return { step: 'HACKER', hackerId: null, deckId: null };
+  return { step: 'HACKER', hackerId: null, deckId: null, system: null };
 }
 
 // Choosing updates pending setup ONLY (§13.2/§14.2).
@@ -399,8 +464,12 @@ export function chooseHacker(s: PendingSetup, hackerId: string): PendingSetup {
   return { ...s, hackerId, step: 'DECK' };
 }
 
-export function chooseDeck(s: PendingSetup, deckId: string): PendingSetup {
-  return { ...s, deckId, step: 'BUILD' };
+// §11.3 — advancing into Build is the moment the pre-battle state exists, so
+// the Battle 1 System resolves here. `?? existing` is what makes back-and-forth
+// navigation stable: a second pass through Deck Selection keeps the opponent
+// the player already saw.
+export function chooseDeck(s: PendingSetup, deckId: string, rng: RNG): PendingSetup {
+  return { ...s, deckId, step: 'BUILD', system: s.system ?? randomSystem(rng, 'RUN_RANDOM') };
 }
 
 // Back navigation RETAINS current pending choices (§12.2/§6.3). Backing out of
@@ -412,9 +481,10 @@ export function setupBack(s: PendingSetup): PendingSetup | null {
   return null;
 }
 
-// The setup is committable once both choices exist and Build is showing.
+// The setup is committable once both choices exist, the opponent has been
+// resolved, and Build is showing.
 export function setupComplete(s: PendingSetup): boolean {
-  return s.step === 'BUILD' && s.hackerId !== null && s.deckId !== null;
+  return s.step === 'BUILD' && s.hackerId !== null && s.deckId !== null && s.system !== null;
 }
 
 // ---- Battle creation (§4.2/§4.3/§10.5) ----
@@ -440,21 +510,36 @@ export function snapshotRunSettings(menuSettings: BattleSettings): BattleSetting
   return cloneSettings(menuSettings);
 }
 
-// The effective per-battle config for a Run step, from the Run's snapshot.
+// The effective per-battle config for a Run step, from the Run's snapshot and
+// its already-selected opponent (§10.3 — never rederived from current menu
+// Settings, never rerolled).
 export function effectiveRunConfig(info: RunInfo, step: RunStep): BattleConfig {
-  return buildBattleConfig(info.settings, info.identity.hackerId, info.hackerMaxLink, resolveRunIce(info.settings, step));
+  return buildBattleConfig(
+    info.settings,
+    info.identity.hackerId,
+    info.system.systemId,
+    info.hackerMaxLink,
+    resolveRunIce(info.settings, info.system.systemId, step),
+  );
 }
 
 export function createQuickMatchBattle(
   settings: BattleSettings,
   ids: SelectedIdentity,
+  system: SelectedSystem,
   build: readonly string[],
   buildOrigin: BuildOrigin,
   seed?: number,
 ): Game {
   const hackerMaxLink = resolveHackerMaxLink(settings, ids.hackerId, ids.deckId);
-  const config = buildBattleConfig(settings, ids.hackerId, hackerMaxLink, resolveQuickMatchIce(settings, hackerMaxLink));
-  return new Game(config, buildIdentity(ids.hackerId, ids.deckId, ids.selectionSource, build, buildOrigin), seed);
+  const config = buildBattleConfig(
+    settings,
+    ids.hackerId,
+    system.systemId,
+    hackerMaxLink,
+    resolveQuickMatchIce(settings, system.systemId),
+  );
+  return new Game(config, buildIdentity(ids.hackerId, ids.deckId, system, ids.selectionSource, build, buildOrigin), seed);
 }
 
 // Quick Match "Reset" restarts under the concluded battle's OWN config and
@@ -468,7 +553,14 @@ export function createRunBattle(info: RunInfo, step: RunStep, seed?: number): Ga
   const config = effectiveRunConfig(info, step);
   return new Game(
     config,
-    buildIdentity(info.identity.hackerId, info.identity.deckId, info.identity.selectionSource, info.build, info.buildOrigin),
+    buildIdentity(
+      info.identity.hackerId,
+      info.identity.deckId,
+      info.system,
+      info.identity.selectionSource,
+      info.build,
+      info.buildOrigin,
+    ),
     seed,
   );
 }
@@ -483,7 +575,11 @@ export interface BattleContext {
 
 export function battleContext(info: SessionInfo): BattleContext {
   if (info.mode === 'RUN') {
-    return { mode: 'RUN', runStep: info.step, encounterSystemHp: resolveRunIce(info.settings, info.step) };
+    return {
+      mode: 'RUN',
+      runStep: info.step,
+      encounterSystemHp: resolveRunIce(info.settings, info.system.systemId, info.step),
+    };
   }
   return { mode: 'QUICK_MATCH' }; // no fake Run values on Quick Match records
 }
@@ -512,6 +608,11 @@ interface SavedRun {
   inventory: string[];
   build: string[];
   buildOrigin: BuildOrigin;
+  // Alpha 0.5.0 §33 — the upcoming (or in-progress) encounter's System. Stored
+  // as a stable ID plus its selection source, never as a copy of the System
+  // definition: identity resolves through the matching content fingerprint
+  // (§32 — no redundant serialization of immutable content).
+  system: SelectedSystem;
 }
 
 interface SavedSession {
@@ -542,6 +643,7 @@ const savedRunOf = (info: RunInfo): SavedRun => ({
   inventory: [...info.inventory],
   build: [...info.build],
   buildOrigin: info.buildOrigin,
+  system: { ...info.system },
 });
 
 export function serializeSession(info: SessionInfo, game: Game | null, pending: PendingResultInfo | null): string {
@@ -553,8 +655,9 @@ export function serializeSession(info: SessionInfo, game: Game | null, pending: 
     buildIdentity(
       info.identity.hackerId,
       info.identity.deckId,
+      info.system,
       info.identity.selectionSource,
-      info.mode === 'RUN' ? info.build : info.build,
+      info.build,
       info.buildOrigin,
     );
   const env: SavedSession = {
@@ -609,6 +712,9 @@ export function deserializeSession(json: string | null): RestoredSession | null 
         stateId.deckFunctionId !== envId.deckFunctionId ||
         stateId.selectionSource !== envId.selectionSource ||
         stateId.buildOrigin !== envId.buildOrigin ||
+        // Alpha 0.5.0 §32 — the battle's opponent must round-trip exactly.
+        stateId.systemId !== envId.systemId ||
+        stateId.systemSelectionSource !== envId.systemSelectionSource ||
         !sameOrder(envId.skillIds, stateId.skillIds) ||
         !sameOrder(envId.hackerPrograms, stateId.hackerPrograms) ||
         !sameOrder(envId.inventory, stateId.inventory) ||
@@ -631,6 +737,13 @@ export function deserializeSession(json: string | null): RestoredSession | null 
       if (!Array.isArray(run.build) || !isValidBuild(run.build, run.inventory)) return null;
       if (!inBuild && !sameOrder(run.build, envId.hackerPrograms)) return null;
       if (!isBuildOrigin(run.buildOrigin)) return null;
+      // §33/§41 — the saved upcoming System must still resolve, and (once a
+      // battle exists) must be the very System that battle was built against.
+      // A missing or unresolvable SYS_ID rejects the save; it is NEVER replaced
+      // with a default or a fresh roll, which would silently change the
+      // encounter the player saved.
+      if (!isSelectedSystem(run.system)) return null;
+      if (!inBuild && run.system.systemId !== envId.systemId) return null;
       info = {
         mode: 'RUN',
         step: run.step as RunStep,
@@ -640,6 +753,7 @@ export function deserializeSession(json: string | null): RestoredSession | null 
         inventory: [...run.inventory],
         build: [...run.build],
         buildOrigin: run.buildOrigin,
+        system: { ...run.system },
         ...(inBuild ? { pendingBuild: true as const } : {}),
       };
     } else {
@@ -650,6 +764,9 @@ export function deserializeSession(json: string | null): RestoredSession | null 
       info = {
         mode: 'QUICK_MATCH',
         identity: { hackerId: envId.hackerId, deckId: envId.deckId, selectionSource: envId.selectionSource },
+        // §14 — the opponent comes from the saved battle identity, so Continue
+        // never rerolls a Random Quick Match's System.
+        system: { systemId: envId.systemId, source: envId.systemSelectionSource },
         build: [...envId.hackerPrograms],
         buildOrigin: envId.buildOrigin,
       };
@@ -674,7 +791,7 @@ export function deserializeSession(json: string | null): RestoredSession | null 
       // so a tampered or stale envelope cannot resume under different maxima.
       if (info.mode === 'RUN') {
         if (game.state.config.playerHp !== info.hackerMaxLink) return null;
-        if (game.state.config.enemyHp !== resolveRunIce(info.settings, info.step)) return null;
+        if (game.state.config.enemyHp !== resolveRunIce(info.settings, info.system.systemId, info.step)) return null;
       }
     }
     return { info, game, pending };
@@ -686,6 +803,15 @@ export function deserializeSession(json: string | null): RestoredSession | null 
 const BUILD_ORIGINS: BuildOrigin[] = ['DEFAULT', 'RANDOM', 'REMEMBERED_CONSTRUCTED', 'CARRIED_RUN', 'PLAYER_EDITED'];
 function isBuildOrigin(v: unknown): v is BuildOrigin {
   return typeof v === 'string' && (BUILD_ORIGINS as string[]).includes(v);
+}
+
+// §33 — a persisted opponent choice: a SYS_ID that still resolves against the
+// current content, plus a recognized selection source.
+function isSelectedSystem(v: unknown): v is SelectedSystem {
+  const s = v as SelectedSystem | undefined;
+  if (!s || typeof s !== 'object') return false;
+  if (typeof s.systemId !== 'string' || !getContent().systems.has(s.systemId)) return false;
+  return isSystemSelectionSource(s.source);
 }
 
 export type { WizardAction };

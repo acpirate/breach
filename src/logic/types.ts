@@ -24,6 +24,28 @@ export type WizardAction = 'WIZARD_FORCE_WIN' | 'WIZARD_RESTART_LOST_BATTLE' | '
 // Match records defaulted identity; New Run records an explicit selection.
 export type SelectionSource = 'EXPLICIT_SELECTION' | 'QUICK_MATCH_DEFAULT';
 
+// Alpha 0.5.0 §32 — how the battle's opponent System was chosen. Recorded on
+// the battle and in logs so an analyst can separate a rolled encounter from a
+// deliberately chosen one without inferring it from the mode.
+export type SystemSelectionSource =
+  | 'RUN_RANDOM' // §11 — rolled for a Run battle before its Build screen
+  | 'QUICK_RANDOM' // §13 — rolled by Random Quick Match
+  | 'QUICK_CONSTRUCTED' // §12 — explicitly picked on the System Selection screen
+  | 'HEADLESS_PINNED'; // §44 — pinned by a simulation harness, never in play
+
+export const SYSTEM_SELECTION_SOURCES: ReadonlyArray<SystemSelectionSource> = [
+  'RUN_RANDOM',
+  'QUICK_RANDOM',
+  'QUICK_CONSTRUCTED',
+  'HEADLESS_PINNED',
+];
+
+// Lives here with the type (not in save.ts or session.ts) so both the save
+// validator and the session envelope can use it without an import cycle.
+export function isSystemSelectionSource(v: unknown): v is SystemSelectionSource {
+  return typeof v === 'string' && (SYSTEM_SELECTION_SOURCES as readonly string[]).includes(v);
+}
+
 // Alpha 0.4.0 §18.3 — where the ordered active build came from. Recorded on
 // the battle and in logs so an analyst can separate a default build from an
 // edited one without diffing Program lists.
@@ -44,20 +66,38 @@ export enum Shape { Circle = 0, Square, Triangle, Diamond, Star, Cross }
 // behavior — bombs their countdown/footprint, buff/shield tiles their per-tile
 // magnitude — plus the placing Program's stable ID for metrics attribution.
 // Nothing about a special's behavior is looked up from hardcoded tables.
+// Alpha 0.5.0 §27 — the countdown behavioral contract, generalized one step:
+//
+//   activation/deployment now -> countdown persists -> payload delivered later
+//
+// An ARMED overlay carries `countdown` plus `delivers`, the Effect whose result
+// is produced at expiry. Alpha 0.4 hardcoded "a countdown means a bomb"; naming
+// the payload lets a future delayed Effect reuse this exact machinery by adding
+// ONE delivery branch. It is deliberately NOT a generalized delayed-Function
+// graph or a second scheduler (§27.1) — there is one countdown, one tick, and
+// one delivery switch.
 export interface Special {
+  // The overlay's board identity: what it looks like and how the rest of the
+  // engine treats it. A `buff` whose countdown is still positive is PENDING and
+  // contributes no magnitude until it is delivered (§28.1).
   type: 'bomb' | 'buff' | 'shield';
   owner: Side;
-  countdown?: number; // bombs only
+  countdown?: number; // armed overlays only (bombs; pending Buffs)
+  // §27.2 — what this overlay delivers when its countdown reaches zero.
+  // Present iff `countdown` is. Absent means the overlay is already live.
+  delivers?: EffectId;
   areaPattern?: AreaPatternId; // bombs only — blast footprint from Function data
-  magnitude?: number; // buff/shield only — per-tile bonus/shield points from data
+  magnitude?: number; // buff/shield — per-tile bonus/shield points from data
   programId?: string; // placing Program (metrics/logging attribution)
-  // Alpha 0.4.0 §14.2 — a countdown bomb detonates turns after it was placed,
-  // so its Function's typed damage/charge selections travel WITH the overlay
-  // rather than being looked up from whatever is firing at detonation time.
-  fnId?: string; // bombs only — the Function that placed it (attribution)
+  // Alpha 0.4.0 §14.2 / Alpha 0.5.0 §27.2 — a delayed overlay resolves turns
+  // after it was armed, so the arming Function's typed selections travel WITH
+  // the overlay rather than being looked up from whatever is firing at delivery
+  // time. This is what makes "resolved parameters must not silently change
+  // while the object is armed" true by construction.
+  fnId?: string; // the Function that placed it (attribution)
   dealDamage?: 0 | 1; // bombs only
   gainCharge?: 0 | 1; // bombs only
-  seq: number; // global placement order — bombs tick oldest-first
+  seq: number; // global placement order — armed overlays tick oldest-first
 }
 
 export interface Tile {
@@ -117,11 +157,14 @@ export interface BattleConfig extends BattleSettings {
   // persisted fields would create migration risk for no behavioral gain.
   playerHp: number;
   enemyHp: number;
-  // §5.4 — per-side STRONG bindings, RESOLVED from the selected Hacker: the
-  // Hacker's authored strong sets, and the System's as their complements. A
-  // tile whose color is in a side's strongColors deals the HIGH color value for
-  // that side's own Sync/blast damage (LOW otherwise); likewise strongShapes.
-  // Charge bindings (Program data) remain independent of these (§5.4).
+  // §5.4, revised by Alpha 0.5.0 §9 — per-side STRONG bindings, RESOLVED from
+  // each side's OWN authored identity: the selected Hacker's strong sets for
+  // the player, the selected System's for the enemy. The Alpha 0.4 rule that
+  // made the System's sets the Hacker's complements is gone — each System now
+  // carries an independent profile (§2.4). A tile whose color is in a side's
+  // strongColors deals the HIGH color value for that side's own Sync/blast
+  // damage (LOW otherwise); likewise strongShapes. Charge bindings (Program
+  // data) remain independent of these (§5.4).
   strongColors: Record<Side, Color[]>;
   strongShapes: Record<Side, Shape[]>;
 }
@@ -133,6 +176,12 @@ export interface BattleConfig extends BattleSettings {
 export interface BattleIdentity {
   hackerId: string;
   deckId: string;
+  // Alpha 0.5.0 §9/§32 — the resolved opponent. This is the authority for
+  // System ICE, strong/weak axes, and the ordered System Program build; it is
+  // selected BEFORE the battle exists and is never rerolled by save/resume
+  // (§14). There is no default and no fallback (§41).
+  systemId: string;
+  systemSelectionSource: SystemSelectionSource;
   skillIds: string[]; // ordered; duplicates are meaningful (§6.4)
   deckFunctionId: string;
   // Alpha 0.4.0 §5.3 — the ACTIVE BUILD: exactly four distinct inventory
@@ -145,6 +194,9 @@ export interface BattleIdentity {
   // battle so a save can be revalidated without re-deriving it from content
   // that may since have changed (§17.2).
   inventory: string[];
+  // Alpha 0.5.0 §5.4 — the selected System's ordered PRG_SET, snapshotted the
+  // same way the Hacker's active build is. Order is charge-routing priority
+  // and display order; it is NOT Function-activation priority (§2.11).
   systemPrograms: string[]; // ordered stable PRG_S_* IDs
   selectionSource: SelectionSource;
   buildOrigin: BuildOrigin; // §18.3
@@ -177,6 +229,8 @@ export interface TileView {
   kind: 'standard' | 'neutral';
   color?: Color;
   shape?: Shape;
+  // `countdown` present means the overlay is still ARMED — the renderer shows
+  // the remaining turns rather than the live badge (§28.1).
   special?: { type: 'bomb' | 'buff' | 'shield'; owner: Side; countdown?: number };
 }
 
@@ -214,7 +268,17 @@ export type ActivationTarget = { kind: 'unit'; idx: number } | { kind: 'packet';
 // Where a routed charge stream came from. Distinguishes an initial Sync from
 // a cascade wave, a Skill-inflated Sync, and explicit Effect destruction, so
 // allocation can be reconstructed per cause (§11).
-export type ChargeStreamSource = 'SYNC' | 'CASCADE' | 'SKILL_MODIFIED_SYNC' | 'EFFECT_DESTRUCTION';
+export type ChargeStreamSource =
+  | 'SYNC'
+  | 'CASCADE'
+  | 'SKILL_MODIFIED_SYNC'
+  | 'EFFECT_DESTRUCTION'
+  // Alpha 0.5.0 — charge from a Sync an EFFECT_TRANSFORM created. ALLOCATION is
+  // the ordinary top-to-bottom queue rule (§30.1 — the BOUNCER synergy must
+  // emerge from bindings and order, never from a hardcoded COERCE->ATTACKER
+  // path); this label only makes the GENERATION attributable so the Effect can
+  // be balanced.
+  | 'EFFECT_TRANSFORM';
 
 export interface ChargeAssignment {
   programId: string;
@@ -231,7 +295,15 @@ export type Readiness = 'READY' | 'CHARGING' | 'EMPTY';
 // own bucket rather than a generic catch-all so DATACUT stays separable from
 // base Sync damage, Bomb damage, and Attack damage; totals must still equal
 // the sum of the attributed contributions.
-export type DamageSource = 'match' | 'attacker' | 'bomb' | 'lineslice';
+// Alpha 0.5.0 (designer ruling, 2026-08-07) — `transform` is its own bucket.
+// The handoff §25 wanted Transform-created Sync damage left in the `match`
+// bucket; the director overrode that so COERCE can be balanced: without
+// attribution its contribution is indistinguishable from ordinary matching.
+//
+// This is ATTRIBUTION, not reclassification. A Transform-created Sync is still
+// mechanically an ordinary Sync — same strong/weak valuation, crit tiers, B1
+// qualification, and Reinforced Connection suppression. Only the ledger differs.
+export type DamageSource = 'match' | 'attacker' | 'bomb' | 'lineslice' | 'transform';
 
 export type GameEvent =
   | { t: 'swap'; a: Pt; b: Pt }
@@ -306,6 +378,28 @@ export type GameEvent =
   // MK9.1/9.2/9.3 — bombs or shield tiles actually placed by one activation
   // (may be fewer than requested if the Datastream lacks legal targets).
   | { t: 'placed'; side: Side; ownerKind: OwnerKind; kind: 'bomb' | 'shield'; count: number; programId: string }
+  // Alpha 0.5.0 §37.1 — one per EFFECT_TRANSFORM activation. Enough to verify
+  // the action without storing a board snapshot: what was asked for, what was
+  // actually converted, and the authored axes. The damage and charge the
+  // resulting Syncs produce stay in their normal event streams and are NOT
+  // duplicated here.
+  | {
+      t: 'transform'; side: Side; ownerKind: OwnerKind; programId: string; fnId: string;
+      axisTarget: string;
+      resultColor: Color;
+      resultShape: Shape;
+      requested: number; // authored quantity (the maximum, §2.5)
+      converted: number; // Packets actually transformed
+      candidates: number; // eligible Packets that existed
+      specialsRetained: number;
+      specialsDestroyed: number;
+      cells: Pt[];
+      resolved: boolean;
+    }
+  // §28.3 — an armed countdown reached zero and delivered its payload on the
+  // same Packet. Bombs already log through `detonate`; this covers the
+  // non-destructive deliveries (currently EBUFF becoming a live Buff).
+  | { t: 'countdownDelivered'; side: Side; p: Pt; effectId: EffectId; programId?: string; fnId?: string; magnitude?: number }
   // MK9.3 — one per shield-affected damage instance. preShield = base+buff
   // before absorption; shield = total active defender shield; prevented =
   // min(preShield, shield); final = preShield - prevented (the dealt amount).
@@ -314,6 +408,12 @@ export type GameEvent =
   // cascaded, or blasted away).
   | { t: 'shieldRemoved'; count: number }
   | { t: 'chargeWaste'; side: Side; ownerKind: OwnerKind; programId: string; amount: number }
+  // Alpha 0.5.0 §19.4/§37.2 — a ready System Program that was NOT activated
+  // because it had no valid target. Deliberately aggregate-only: it is consumed
+  // by metrics as a battle-level count and is never written to the turn or
+  // event streams, because a blocked Program re-reports every turn and §37.2
+  // forbids reintroducing that volume into BASIC/VERBOSE.
+  | { t: 'withhold'; side: Side; programId: string; fnId: string; reason: string }
   | { t: 'autoReshuffle' }
   | { t: 'cascadeDepth'; side: Side; depth: number }
   // MK5.6 — per Sync step: sliced-Packet count and how many of those were

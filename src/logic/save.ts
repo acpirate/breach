@@ -13,7 +13,7 @@ import { isAreaPatternId } from './data/areas';
 import { GAME_VERSION, getContent, inventoryProgramIds, isValidBuild } from './data/content';
 import { Game } from './game';
 import { makeRNG } from './rng';
-import { BattleIdentity, BattleSettings, GameState } from './types';
+import { BattleIdentity, BattleSettings, GameState, isSystemSelectionSource } from './types';
 
 export const SAVE_VERSION = GAME_VERSION;
 
@@ -74,10 +74,16 @@ export function isValidIdentity(raw: unknown): boolean {
   if (!isStringArray(id.inventory)) return false;
   if (id.selectionSource !== 'EXPLICIT_SELECTION' && id.selectionSource !== 'QUICK_MATCH_DEFAULT') return false;
   if (typeof id.buildOrigin !== 'string') return false;
+  // Alpha 0.5.0 §32/§41 — an active save MUST name a System that still
+  // resolves. A missing or unknown SYS_ID is an incompatible save, never an
+  // invitation to substitute a default or reroll the encounter.
+  if (typeof id.systemId !== 'string') return false;
+  if (!isSystemSelectionSource(id.systemSelectionSource)) return false;
   const c = getContent();
   const hacker = c.hackers.get(id.hackerId);
   const deck = c.decks.get(id.deckId);
-  if (!hacker || !deck) return false;
+  const system = c.systems.get(id.systemId);
+  if (!hacker || !deck || !system) return false;
   // ordered Skill IDs must match the referenced Hacker exactly (§17.3)
   if (id.skillIds.length !== hacker.skillIds.length) return false;
   if (id.skillIds.some((s, i) => s !== hacker.skillIds[i])) return false;
@@ -91,8 +97,13 @@ export function isValidIdentity(raw: unknown): boolean {
   if (id.inventory.length !== inventory.length) return false;
   if (id.inventory.some((pid, i) => pid !== inventory[i])) return false;
   if (!isValidBuild(id.hackerPrograms, id.inventory)) return false;
-  // the System roster still comes from the content contract (§5.3)
-  return id.systemPrograms.length === c.system.length && id.systemPrograms.every((pid, i) => pid === c.system[i].id);
+  // Alpha 0.5.0 §5.4/§32 — the System roster is the SELECTED System's ordered
+  // PRG_SET, not the full loaded PRG_S_* catalog as it was through Alpha 0.4.
+  // Order is gameplay-significant (charge routing), so it must match exactly.
+  return (
+    id.systemPrograms.length === system.programIds.length &&
+    id.systemPrograms.every((pid, i) => pid === system.programIds[i])
+  );
 }
 
 export type PlainGameState = Omit<GameState, 'rng'> & { rngState: number };
@@ -141,14 +152,19 @@ export function restoreGameState(raw: unknown, concluded: boolean): Game | null 
     // §17.3 — explicit Hacker/Deck/Skill/build identity, verified against the
     // resolved content contract before anything else is trusted.
     if (!isValidIdentity(s.identity)) return null;
-    // Restore by stable IDs — Alpha 0.4.0 §17.2: the battle's roster is the
-    // ORDERED ACTIVE BUILD (Hacker) and the content contract (System). Slot
-    // order and IDs must round-trip exactly, and each charge must sit within
-    // its own Program's pool.
+    // Restore by stable IDs — Alpha 0.4.0 §17.2 / Alpha 0.5.0 §32: BOTH rosters
+    // now come from the battle's own identity — the Hacker's ordered active
+    // build, and the selected System's ordered PRG_SET. (Alpha 0.4 could read
+    // the System side straight off the content contract because every loaded
+    // System Program was in play; with eight loaded and four fielded, that is
+    // no longer the same list.) isValidIdentity above has already checked the
+    // saved PRG_SET against the named System, so this compares against a
+    // verified roster. Slot order and IDs must round-trip exactly, and each
+    // charge must sit within its own Program's pool.
     const content = getContent();
     const sides = [
       { units: s.units?.player, programIds: s.identity.hackerPrograms },
-      { units: s.units?.enemy, programIds: content.system.map((p) => p.id) },
+      { units: s.units?.enemy, programIds: s.identity.systemPrograms },
     ];
     for (const { units, programIds } of sides) {
       if (!Array.isArray(units) || units.length !== programIds.length) return null;

@@ -21,12 +21,12 @@ export interface UnitMetrics {
   ops: number; // expanded payload operations attempted (Effect executions)
   fizzles: number; // ops that legally fizzled (no valid target/placement)
   // "effect" per Program (aggregate of its Function-caused contribution):
-  //   EFFECT_ATTACK  → direct damage dealt (incl. its share after shields)
-  //   EFFECT_BOMB    → detonation damage from this Program's bombs (+ chains)
-  //   EFFECT_BUFF    → bonus damage its buff tiles added to damage events
-  //   EFFECT_DRAIN   → total charge drained from opponent Programs
+  //   EFFECT_ATTACK    → direct damage dealt (incl. its share after shields)
+  //   EFFECT_BOMB      → detonation damage from this Program's bombs (+ chains)
+  //   EFFECT_BUFF      → bonus damage its buff tiles added to damage events
+  //   EFFECT_DRAIN     → total charge drained from opponent Programs
+  //   EFFECT_TRANSFORM → damage from the Syncs its transformation created
   effect: number;
-  chargeWasted: number; // charge granted but discarded at the cap
   bombsPlaced: number; // EFFECT_BOMB deployments that actually placed a bomb
 }
 
@@ -60,6 +60,11 @@ export interface SideMetrics {
   attackerDamage: number;
   bombDamage: number;
   linesliceDamage: number; // §13.4 direct row/column slices AND their cascades
+  // Alpha 0.5.0 (director ruling, 2026-08-07) — damage from Syncs an
+  // EFFECT_TRANSFORM created, credited to the Effect so it can be balanced.
+  // Disjoint from matchDamage: a transform-created Sync lands here INSTEAD of
+  // there, never in both, so the buckets still sum to totalDamage.
+  transformDamage: number;
   skillDamage: number; // §6.4 Hacker-Skill damage, never folded into matchDamage
   // MK7.3 cross-cutting (overlaps the buckets, does NOT sum with them)
   cascadeDamage: number;
@@ -76,11 +81,19 @@ export interface SideMetrics {
   // MK5.6 — charge-source contention
   tilesDestroyed: number;
   contentionTiles: number;
-  // Alpha 0.4.1 §8.4 — total charge generated for this side that no active
-  // Program could absorb, summed across every routed stream. Replaces the old
-  // per-Program attribution of end-of-stream discard, which blamed whichever
-  // Program happened to sit at the bottom of the queue.
-  chargeDiscardedTotal: number;
+  // Alpha 0.4.1 §8.4, completed by Alpha 0.5.0 §39 — THE canonical charge-waste
+  // figure for this side: every unit of Program-pool charge generated for it
+  // that could not be stored, whatever the source. That is end-of-stream
+  // routing discard (the queue ran out of compatible non-full Programs) PLUS
+  // flat/timer overflow that Alpha 0.4.1 still reported per Program.
+  //
+  // §39.2 — per-Program `chargeWasted` is GONE as an analytical authority: it
+  // invited "which Program wasted charge", a question the routing rules make
+  // meaningless. §39.4 — no color/shape split; axis-specific waste is deferred.
+  //
+  // Director ruling (2026-08-07): PROGRAM POOLS ONLY. The Deck Function's pool
+  // keeps its own `deck.chargeWasted` bucket and is deliberately not folded in.
+  chargeWastedTotal: number;
   // MK6.7 — buffer damage added (disjoint bucket)
   bufferDamageAdded: number;
   // §9.5 — line-clear frequency, so board churn under the B1 rule is observable
@@ -102,6 +115,12 @@ export interface BattleMetrics {
   winner: Side | null;
   thinkTimesMs: number[];
   hintsShown: number;
+  // Alpha 0.5.0 §19.4/§37.2 — how many times a ready System Program was NOT
+  // activated because it had no valid target (COERCE with no neutral Packets,
+  // a placement Function with nowhere to place, Drain with nothing charged).
+  // A compact battle-level count is exactly what §37.2 asks for instead of
+  // per-turn decision logging.
+  systemWithholds: number;
   // MK9.3 — Shielder instrumentation. Alpha data places shields only on the
   // System side; these track SYSTEM-owned shields (prevention is NOT damage
   // dealt and never enters a damage-source bucket).
@@ -112,7 +131,7 @@ export interface BattleMetrics {
   sides: Record<Side, SideMetrics>;
 }
 
-const emptyUnit = (): UnitMetrics => ({ fires: 0, ops: 0, fizzles: 0, effect: 0, chargeWasted: 0, bombsPlaced: 0 });
+const emptyUnit = (): UnitMetrics => ({ fires: 0, ops: 0, fizzles: 0, effect: 0, bombsPlaced: 0 });
 
 const emptyDeck = (): DeckMetrics => ({
   fires: 0,
@@ -138,6 +157,7 @@ function emptySide(programIds: readonly string[]): SideMetrics {
     attackerDamage: 0,
     bombDamage: 0,
     linesliceDamage: 0,
+    transformDamage: 0,
     skillDamage: 0,
     cascadeDamage: 0,
     matchDamageColor: 0,
@@ -150,7 +170,7 @@ function emptySide(programIds: readonly string[]): SideMetrics {
     deepestCascade: 0,
     tilesDestroyed: 0,
     contentionTiles: 0,
-    chargeDiscardedTotal: 0,
+    chargeWastedTotal: 0,
     bufferDamageAdded: 0,
     lineClears: 0,
     units,
@@ -167,6 +187,7 @@ export function createBattleMetrics(
     turns: 0,
     autoReshuffles: 0,
     detonations: 0,
+    systemWithholds: 0,
     winner: null,
     thinkTimesMs: [],
     hintsShown: 0,
@@ -227,6 +248,12 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
         } else if (ev.source === 'lineslice') {
           sm.linesliceDamage += base; // §13.4: direct slice + its cascades
           if (ev.programId) unitOf(sm, ev.programId).effect += base;
+        } else if (ev.source === 'transform') {
+          // Alpha 0.5.0 — the Syncs COERCE created, credited to COERCE. The
+          // per-Program `effect` credit is what makes the Effect's contribution
+          // legible next to ATTACK/BOMB damage in the same units.
+          sm.transformDamage += base;
+          if (ev.programId) unitOf(sm, ev.programId).effect += base;
         } else {
           sm.bombDamage += base; // MK7.3: includes bomb-caused settling + cascades
           if (ev.programId) unitOf(sm, ev.programId).effect += base;
@@ -282,21 +309,27 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
       case 'lineClear':
         m.sides[ev.side].lineClears++;
         break;
-      // Alpha 0.4.1 §8.4 — routing discard no longer arrives here. What
-      // remains is GENUINE per-owner waste: the System's flat timer charge
-      // overflowing a Program's pool, and Deck charge overflowing its own.
+      // Alpha 0.5.0 §39.1 — flat/timer overflow now joins routing discard in
+      // the ONE canonical side-level total instead of being attributed to the
+      // Program whose pool happened to be full. The Deck keeps its own bucket
+      // (director ruling: the side total covers Program pools only).
       case 'chargeWaste': {
         const sm = m.sides[ev.side];
         if (ev.ownerKind === 'deck') sm.deck.chargeWasted += ev.amount;
-        else unitOf(sm, ev.programId).chargeWasted += ev.amount;
+        else sm.chargeWastedTotal += ev.amount;
         break;
       }
-      // §8.4 — one battle-level total, read straight off each routed stream.
+      // §39.1/§39.3 — the other half of the same total, read straight off each
+      // routed stream so the figure stays verifiable against the routing events.
       case 'chargeRoute':
-        m.sides[ev.side].chargeDiscardedTotal += ev.discarded;
+        m.sides[ev.side].chargeWastedTotal += ev.discarded;
         break;
       case 'detonate':
         m.detonations++;
+        break;
+      // §37.2 — aggregate only. The event is never persisted to a log stream.
+      case 'withhold':
+        m.systemWithholds++;
         break;
       case 'placed':
         if (ev.kind === 'bomb') {

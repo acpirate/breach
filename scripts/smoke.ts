@@ -5,7 +5,7 @@
 
 import { findValidMove, swap } from '../src/logic/board';
 import { BOARD_HEIGHT, BOARD_WIDTH } from '../src/logic/constants';
-import { getContent, programsFor } from '../src/logic/data/content';
+import { getContent, programById } from '../src/logic/data/content';
 import { Game } from '../src/logic/game';
 import { detectMatches } from '../src/logic/match';
 import { SAVE_VERSION } from '../src/logic/save';
@@ -13,7 +13,7 @@ import { defaultIdentity, deserializeSession, serializeSession } from '../src/lo
 import { BattleSettings } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { initContentOrExit } from './dataNode';
-import { D, deckCost, defaultHackerLink, manualLink, newBattle } from './harness';
+import { D, deckCost, defaultHackerLink, headlessSystem, manualLink, newBattle } from './harness';
 
 initContentOrExit();
 
@@ -33,12 +33,18 @@ function checkInvariants(g: Game): void {
       }
     }
   }
-  // charge caps respected (Alpha: against each Program's data cost)
+  // charge caps respected (Alpha: against each Program's data cost).
+  // Alpha 0.5.0 — the expected roster comes from the BATTLE'S OWN identity, not
+  // from the loaded content roster: the Hacker side is an ordered four drawn
+  // from a six-Program inventory, and the System side is the selected System's
+  // ordered PRG_SET drawn from eight loaded System Programs. (Indexing the
+  // loaded roster used to agree with the player's build by coincidence.)
   for (const side of ['player', 'enemy'] as const) {
-    const programs = programsFor(side);
+    const roster = side === 'player' ? s.identity.hackerPrograms : s.identity.systemPrograms;
+    assert(s.units[side].length === roster.length, `${side} roster size ${s.units[side].length} != ${roster.length}`);
     s.units[side].forEach((u, i) => {
-      const cap = programs[i].chargeCap;
-      assert(u.programId === programs[i].id, `${side} slot ${i} program mismatch`);
+      assert(u.programId === roster[i], `${side} slot ${i} program mismatch`);
+      const cap = programById(u.programId).chargeCap;
       assert(u.charge >= 0 && u.charge <= cap, `${side} ${u.programId} charge ${u.charge} out of [0,${cap}]`);
     });
   }
@@ -145,10 +151,19 @@ function runBattle(label: string, settings: BattleSettings, seed: number): void 
   assert(m.winner === g.state.winner, 'metrics winner must match game winner');
   assert(m.turns === g.state.turn, 'metrics turn count must match game state');
   assert(m.sides[g.state.winner].totalDamage > 0, 'winning side must have dealt damage');
-  // MK7.3/7.4 + §11.3: the FIVE DISJOINT causal buckets must sum EXACTLY to total
+  // MK7.3/7.4 + §11.3 + Alpha 0.5.0: the DISJOINT causal buckets must sum
+  // EXACTLY to total. `lineslice` and `transform` are their own buckets, so
+  // omitting either would silently under-count rather than fail loudly.
   for (const side of ['player', 'enemy'] as const) {
     const sm = m.sides[side];
-    const tallied = sm.matchDamage + sm.bombDamage + sm.attackerDamage + sm.bufferDamageAdded + sm.skillDamage;
+    const tallied =
+      sm.matchDamage +
+      sm.bombDamage +
+      sm.attackerDamage +
+      sm.linesliceDamage +
+      sm.transformDamage +
+      sm.bufferDamageAdded +
+      sm.skillDamage;
     assert(
       Math.abs(tallied - sm.totalDamage) < 1e-9,
       `${side} causal buckets (${tallied}) must sum to total (${sm.totalDamage})`,
@@ -203,6 +218,9 @@ function testSaveRoundTrip(): void {
   const info = {
     mode: 'QUICK_MATCH' as const,
     identity: defaultIdentity(),
+    // Alpha 0.5.0 §32 — the session's opponent must agree with the battle's own
+    // identity, or the envelope legitimately fails its consistency check.
+    system: { systemId: g.state.identity.systemId, source: g.state.identity.systemSelectionSource },
     build: [...g.state.identity.hackerPrograms],
     buildOrigin: g.state.identity.buildOrigin,
   };
@@ -257,8 +275,11 @@ function testSaveRoundTrip(): void {
   console.log('save round-trip OK');
 }
 
-assert(SAVE_VERSION === 'alpha-0.4.0', 'save version must be alpha-0.4.0');
+assert(SAVE_VERSION === 'alpha-0.5.0', 'save version must be alpha-0.5.0');
 console.log(`content fingerprint: ${getContent().fingerprint}`);
+// §44 — every simulation in this file runs against the PINNED headless System,
+// so results stay comparable between runs.
+console.log(`headless System: ${headlessSystem().systemId}`);
 console.log(`default identity LINK: ${defaultHackerLink()} (deck function cost ${DECK_COST})`);
 
 // defaults (cap-0, Normal LINK on) — standard and low-LINK

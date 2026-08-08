@@ -27,6 +27,7 @@ import {
   RunStep,
   SelectionSource,
   Side,
+  SystemSelectionSource,
   TileView,
   WizardAction,
   opponentOf,
@@ -55,11 +56,14 @@ export function isLoggingLevel(v: unknown): v is LoggingLevel {
 }
 
 // §17 — the browser logging schema, versioned INDEPENDENTLY of the active save
-// schema (which stays at 3; this patch changes no gameplay persistence).
-export const LOGGING_SCHEMA_VERSION = 1;
-// §8.4 — bumped because per-Program `chargeWasted` no longer absorbs routing
-// discard; that now aggregates into a battle-level total.
-export const METRICS_SCHEMA_VERSION = 2;
+// schema. Alpha 0.5.0 bumps it to 2: records gained System identity, the
+// Transform/countdown event kinds, and the renamed charge-waste total.
+export const LOGGING_SCHEMA_VERSION = 2;
+// §8.4 — bumped to 2 because per-Program `chargeWasted` stopped absorbing
+// routing discard. Alpha 0.5.0 §39 bumps it to 3: per-Program `chargeWasted` is
+// GONE and `chargeDiscardedTotal` is now `chargeWastedTotal`, covering routing
+// discard AND flat/timer overflow for that side's Program pools.
+export const METRICS_SCHEMA_VERSION = 3;
 
 // §12.1 — every cap and budget is a named constant here, never a scattered
 // literal. Retention is governed FIRST by the byte budget and second by these.
@@ -96,6 +100,7 @@ interface SideDamage {
   attacker: number;
   bomb: number;
   lineslice: number; // Alpha 0.4.0 §15.3 — its own disjoint bucket
+  transform: number; // Alpha 0.5.0 — Syncs an EFFECT_TRANSFORM created
   total: number;
 }
 
@@ -105,11 +110,17 @@ interface SideDamage {
 export interface IdentityStamp {
   hackerId: string;
   deckId: string;
+  // Alpha 0.5.0 §36 — the opponent this battle was fought against, and how it
+  // was chosen. Battle-static: it lives here on the battle-level record and
+  // joins to turn/event records by `battleId` rather than being repeated
+  // (§35 — do not copy the System definition into every turn).
+  systemId: string;
+  systemSelectionSource: SystemSelectionSource;
   skillIds: string[];
   deckFunctionId: string;
   hackerPrograms: string[]; // Alpha 0.4.0 — the ordered ACTIVE build
   inventory: string[]; // §18.2 — the ordered six-Program inventory
-  systemPrograms: string[];
+  systemPrograms: string[]; // §5.4 — the selected System's ordered PRG_SET
   selectionSource: SelectionSource;
   buildOrigin: BuildOrigin; // §18.3
 }
@@ -118,6 +129,8 @@ export function identityStamp(id: BattleIdentity): IdentityStamp {
   return {
     hackerId: id.hackerId,
     deckId: id.deckId,
+    systemId: id.systemId,
+    systemSelectionSource: id.systemSelectionSource,
     skillIds: [...id.skillIds],
     deckFunctionId: id.deckFunctionId,
     hackerPrograms: [...id.hackerPrograms],
@@ -224,7 +237,38 @@ export interface TurnLogEntry {
 // turn stream at all, so targeted-Function, Drain, and interesting charge-route
 // telemetry had to be promoted OUT of the turn record to survive there. One
 // stream, written at every level; the level tag records how it was produced.
-export type BattleEventKind = 'ROUTE' | 'TARGETED' | 'DRAIN';
+export type BattleEventKind = 'ROUTE' | 'TARGETED' | 'DRAIN' | 'TRANSFORM' | 'COUNTDOWN';
+
+// Alpha 0.5.0 §37.1 — an EFFECT_TRANSFORM activation. Enough to verify what
+// happened without a board snapshot. The damage and charge its Syncs produced
+// stay in the normal damage/route streams and are NOT duplicated here; SYS_ID
+// joins from the battle-level record rather than being repeated (§35).
+export interface TransformRecord {
+  side: Side;
+  programId: string;
+  fnId: string;
+  axisTarget: string;
+  resultColor: number;
+  resultShape: number;
+  requested: number;
+  converted: number;
+  candidates: number; // whether valid targets existed, and how many
+  specialsRetained: number;
+  specialsDestroyed: number;
+  cells?: Pt[]; // COMPLETE-only reconstruction detail
+}
+
+// §37.3 — a delayed payload actually landing, so "armed" and "delivered" are
+// distinguishable in analysis. Removal before delivery needs no record of its
+// own: the overlay is gone from the board and no delivery event ever appears.
+export interface CountdownRecord {
+  side: Side;
+  effectId: EffectId;
+  programId?: string;
+  fnId?: string;
+  magnitude?: number;
+  p: Pt;
+}
 
 export interface BattleEventEntry {
   v: string;
@@ -238,6 +282,8 @@ export interface BattleEventEntry {
   route?: ChargeRouteRecord;
   targeted?: TargetedRecord;
   drain?: DrainRecord;
+  transform?: TransformRecord;
+  countdown?: CountdownRecord;
 }
 
 // Alpha 0.4.1 §4.1 — the battle-level record is the AUTHORITY for everything
@@ -283,6 +329,10 @@ export interface SelectionLogEntry {
   event:
     | 'HACKER_SELECTED'
     | 'DECK_SELECTED'
+    // Alpha 0.5.0 §36 — one record per RESOLVED opponent, whether rolled or
+    // explicitly chosen. Emitted once when the selection is committed, never
+    // repeated per turn (System identity is battle-static, §35).
+    | 'SYSTEM_SELECTED'
     | 'RUN_CREATED'
     | 'QUICK_MATCH_CREATED'
     | 'BUILD_OPENED'
@@ -296,6 +346,15 @@ export interface SelectionLogEntry {
   identity: Partial<IdentityStamp>;
   hackerMaxLink?: number;
   systemMaxIce?: number;
+  // Alpha 0.5.0 §36 — resolved opponent identity on selection/creation
+  // records. Strong sets are included because they are the analytically
+  // interesting half of a System's profile; weak sets are their complement and
+  // are derivable, so they are deliberately not duplicated here.
+  systemId?: string;
+  systemSelectionSource?: SystemSelectionSource;
+  systemStrongColors?: number[];
+  systemStrongShapes?: number[];
+  systemPrograms?: string[];
   // §18.2/§18.3 — portfolio, inventory and build context.
   hackerPortfolio?: string[];
   deckPortfolio?: string[];
@@ -326,8 +385,8 @@ export interface WizardLogEntry {
 }
 
 const freshDamage = (): Record<Side, SideDamage> => ({
-  player: { match: 0, attacker: 0, bomb: 0, lineslice: 0, total: 0 },
-  enemy: { match: 0, attacker: 0, bomb: 0, lineslice: 0, total: 0 },
+  player: { match: 0, attacker: 0, bomb: 0, lineslice: 0, transform: 0, total: 0 },
+  enemy: { match: 0, attacker: 0, bomb: 0, lineslice: 0, transform: 0, total: 0 },
 });
 
 export class TurnLogger {
@@ -453,6 +512,44 @@ export class TurnLogger {
             `${ev.side} ${ev.effectId} ${ev.resolved ? `targeted (${ev.target!.x},${ev.target!.y})` : `fizzled — ${ev.reason ?? 'no target'}`}` +
               (ev.resolved ? ` — sliced ${ev.sliced.length}, retained ${ev.retained.length}` : ''),
           );
+          break;
+        // Alpha 0.5.0 §37.1 — promoted to the battle-event stream like other
+        // high-value events, so it survives at BASIC where there is no turn
+        // record to carry it.
+        case 'transform':
+          this.pushEvent(e.turn, 'TRANSFORM', {
+            transform: {
+              side: ev.side,
+              programId: ev.programId,
+              fnId: ev.fnId,
+              axisTarget: ev.axisTarget,
+              resultColor: ev.resultColor,
+              resultShape: ev.resultShape,
+              requested: ev.requested,
+              converted: ev.converted,
+              candidates: ev.candidates,
+              specialsRetained: ev.specialsRetained,
+              specialsDestroyed: ev.specialsDestroyed,
+              ...(atLeast('COMPLETE') ? { cells: ev.cells } : {}),
+            },
+          });
+          act(
+            `${ev.side} EFFECT_TRANSFORM ${ev.resolved ? `converted ${ev.converted}/${ev.candidates} ${ev.axisTarget}` : 'withheld — no valid Packet'}`,
+          );
+          break;
+        // §37.3 — a countdown delivering its payload.
+        case 'countdownDelivered':
+          this.pushEvent(e.turn, 'COUNTDOWN', {
+            countdown: {
+              side: ev.side,
+              effectId: ev.effectId,
+              programId: ev.programId,
+              fnId: ev.fnId,
+              magnitude: ev.magnitude,
+              p: ev.p,
+            },
+          });
+          act(`${ev.side} countdown delivered ${ev.effectId} at (${ev.p.x},${ev.p.y})`);
           break;
         case 'shake':
           act(`${ev.side} EFFECT_SHAKE ${ev.resolved ? 'resolved' : 'fizzled (legal)'}`);

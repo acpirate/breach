@@ -15,8 +15,10 @@ import { BOARD_HEIGHT, BOARD_WIDTH, ENEMY_TIMER_CHARGE_RATE } from './constants'
 import { AREA_PATTERNS, AreaPatternId } from './data/areas';
 import type { TargetKind } from './data/effects';
 import {
+  ActivationEligibility,
   PlanOp,
   ResolvedFunction,
+  ResolvedProgram,
   SHAKE_ALLOW_MATCHES,
   SHAKE_CASCADE_NONE,
   SHAKE_CASCADE_UNTIL_STABLE,
@@ -34,6 +36,7 @@ import { detectMatches } from './match';
 import { consumeEvents, createBattleMetrics } from './metrics';
 import {
   addUnitCharge,
+  applyTransform,
   buffBonus,
   dealDamage,
   detonateAt,
@@ -41,6 +44,7 @@ import {
   resolveDetonation,
   resolveLineSlice,
   settleAfterEffect,
+  transformCandidates,
 } from './resolve';
 import { makeRNG } from './rng';
 import {
@@ -245,7 +249,7 @@ export class Game {
     if (s.winner) return events;
     s.phase = 'resolving';
     events.push({ t: 'msg', text: `Turn ${s.turn} — your move` });
-    this.tickBombs('player', events);
+    this.tickCountdowns('player', events);
     if (!s.winner) s.phase = 'playerPre';
     return this.collect(events);
   }
@@ -260,14 +264,20 @@ export class Game {
     return null;
   }
 
-  private tickBombs(owner: Side, events: GameEvent[]): void {
+  // Alpha 0.5.0 §27/§28.2 — ONE countdown tick for every armed overlay this
+  // side owns, in placement order. Alpha 0.4 ticked bombs only; the loop now
+  // selects on "has a countdown" and dispatches on what the overlay DELIVERS,
+  // so EBUFF reuses the established timing rather than getting a second
+  // scheduler (§28.5). Bomb countdown timing is unchanged (§28.2).
+  private tickCountdowns(owner: Side, events: GameEvent[]): void {
     const s = this.state;
     // Snapshot placement order up front; an earlier detonation may slice a
-    // later bomb outright (as a normal tile), in which case it is skipped.
+    // later overlay outright (as a normal tile), in which case it is skipped.
     const seqs: number[] = [];
     for (const row of s.board) {
       for (const t of row) {
-        if (t?.special?.type === 'bomb' && t.special.owner === owner) seqs.push(t.special.seq);
+        const sp = t?.special;
+        if (sp && sp.countdown !== undefined && sp.owner === owner) seqs.push(sp.seq);
       }
     }
     seqs.sort((a, b) => a - b);
@@ -276,9 +286,48 @@ export class Game {
       const p = this.findBySeq(seq);
       if (!p) continue; // sliced earlier this tick
       const tile = s.board[p.y][p.x]!;
-      tile.special!.countdown! -= 1;
-      events.push({ t: 'countdown', p, value: tile.special!.countdown! });
-      if (tile.special!.countdown! <= 0) resolveDetonation(s, p, events);
+      const sp = tile.special!;
+      sp.countdown! -= 1;
+      events.push({ t: 'countdown', p, value: sp.countdown! });
+      if (sp.countdown! > 0) continue;
+      this.deliverCountdown(p, events);
+    }
+  }
+
+  // §27.2 — deliver an expired overlay's payload, using the parameters STAMPED
+  // on it when it was armed. Adding a future delayed Effect means adding one
+  // branch here; it does not mean a new countdown framework (§27.1).
+  private deliverCountdown(p: Pt, events: GameEvent[]): void {
+    const s = this.state;
+    const tile = s.board[p.y][p.x];
+    const sp = tile?.special;
+    if (!sp) return;
+    // An overlay armed before `delivers` existed can only have been a bomb.
+    switch (sp.delivers ?? 'EFFECT_BOMB') {
+      case 'EFFECT_BUFF': {
+        // §28.3 — the countdown BECOMES a live Buff on the SAME Packet, using
+        // the magnitude the arming Function stamped. Clearing `countdown` is
+        // exactly what makes it live: buffBonus() counts it from this moment,
+        // so it contributes to every subsequent damage instance (§28.3).
+        delete sp.countdown;
+        delete sp.delivers;
+        events.push({ t: 'setTile', p, view: tileViewOf(tile!) });
+        events.push({
+          t: 'countdownDelivered',
+          side: sp.owner,
+          p,
+          effectId: 'EFFECT_BUFF',
+          programId: sp.programId,
+          fnId: sp.fnId,
+          magnitude: sp.magnitude,
+        });
+        events.push({ t: 'msg', text: `${sp.owner === 'player' ? 'Hacker' : 'System'} buff came online` });
+        break;
+      }
+      default:
+        // Bombs already carry their own detonation telemetry.
+        resolveDetonation(s, p, events);
+        break;
     }
   }
 
@@ -539,14 +588,92 @@ export class Game {
         break;
       }
       case 'EFFECT_BUFF': {
+        // Alpha 0.5.0 §28 — a positive countdown ARMS the Buff instead of
+        // placing it live: the overlay sits on the Packet contributing nothing
+        // (§28.1) and becomes the authored Buff on that SAME Packet at expiry
+        // (§28.3). Blank/zero keeps the established immediate behavior. The
+        // placement rules, candidate pool, and quantity semantics are shared
+        // with every other placement Effect — only the arming differs.
+        const countdown = op.params.countdown ?? 0;
         const placed = this.placeSpecials({
           type: 'buff',
           owner,
           count: op.params.quantity ?? 1,
           magnitude: op.params.magnitude,
+          ...(countdown > 0 ? { countdown, delivers: 'EFFECT_BUFF' as const } : {}),
+          fnId: op.fnId,
           actor,
         }, events);
         events.push(opEvent(placed > 0));
+        break;
+      }
+      // Alpha 0.5.0 §20-§26 — EFFECT_TRANSFORM. The Effect changes the
+      // underlying identity of Packets and deals NO damage and grants NO charge
+      // of its own (§25); everything that follows comes from the Syncs the new
+      // board state creates, resolved through the ordinary pipeline.
+      case 'EFFECT_TRANSFORM': {
+        const tp = op.params.transform!;
+        const outcome = applyTransform(
+          s,
+          {
+            owner,
+            params: tp,
+            axisResult: op.params.axisResult!,
+            quantity: op.params.quantity ?? 1,
+            programId: actor.id,
+            fnId: op.fnId,
+          },
+          events,
+        );
+        events.push({
+          t: 'transform',
+          side: owner,
+          ownerKind: actor.kind,
+          programId: actor.id,
+          fnId: op.fnId,
+          axisTarget: op.params.axisTarget!,
+          resultColor: op.params.axisResult!.color,
+          resultShape: op.params.axisResult!.shape,
+          requested: op.params.quantity ?? 1,
+          converted: outcome.cells.length,
+          candidates: outcome.candidates,
+          specialsRetained: outcome.specialsRetained,
+          specialsDestroyed: outcome.specialsDestroyed,
+          cells: outcome.cells,
+          resolved: outcome.cells.length > 0,
+        });
+        if (!outcome.cells.length) {
+          // §26 — normal System preflight withholds a Transform with no valid
+          // targets, so reaching here means a mixed composite or a targeted
+          // player activation: the established legal-fizzle semantics apply
+          // rather than a second rollback model.
+          events.push(opEvent(false));
+          events.push({ t: 'msg', text: `${who} ${actor.name} found nothing to coerce` });
+          break;
+        }
+        events.push(opEvent(true));
+        events.push({ t: 'msg', text: `${who} coerced ${outcome.cells.length} Packet${outcome.cells.length === 1 ? '' : 's'}` });
+        // §24/§25 — detection runs only AFTER every selected Packet has
+        // changed. Any Sync this creates is owned by the activating side and
+        // resolves through the normal owner-scoped pipeline: normal strong/weak
+        // damage from that side's profile, normal B1 qualification, normal
+        // charge routed top-to-bottom through its ordered Programs, normal
+        // cascades. Budget matches an ordinary Sync (initial wave + the
+        // configured cascade cap) because the created Sync IS the initial wave.
+        //
+        // The `transform` cause credits the resulting damage to this Function
+        // (director ruling, 2026-08-07) without changing any of the mechanics
+        // above — see DamageSource in types.ts.
+        resolveCascades(
+          s,
+          owner,
+          events,
+          this.matchBudget(),
+          'transform',
+          new Set(),
+          actor.id,
+          { streamSource: 'EFFECT_TRANSFORM', sourceId: op.fnId },
+        );
         break;
       }
       case 'EFFECT_SHIELD': {
@@ -681,8 +808,10 @@ export class Game {
       countdown?: number;
       areaPattern?: AreaPatternId;
       magnitude?: number;
-      // §14.2 — stamped onto each bomb overlay so a later detonation resolves
-      // under the Function that armed it, not under current global behavior.
+      // §14.2 / Alpha 0.5.0 §27.2 — stamped onto each armed overlay so a later
+      // delivery resolves under the Function that armed it, not under whatever
+      // is firing at delivery time.
+      delivers?: 'EFFECT_BOMB' | 'EFFECT_BUFF';
       dealDamage?: 0 | 1;
       gainCharge?: 0 | 1;
       fnId?: string;
@@ -708,6 +837,11 @@ export class Game {
         type: opts.type,
         owner: opts.owner,
         countdown: opts.countdown,
+        // §27.2 — an overlay is ARMED iff it carries a countdown, and then it
+        // must say what it delivers. Bombs default to their own detonation.
+        ...(opts.countdown !== undefined && opts.countdown > 0
+          ? { delivers: opts.delivers ?? ('EFFECT_BOMB' as const) }
+          : {}),
         areaPattern: opts.areaPattern,
         magnitude: opts.magnitude,
         programId: opts.actor.id,
@@ -724,8 +858,11 @@ export class Game {
       events.push({ t: 'placed', side: opts.owner, ownerKind: opts.actor.kind, kind: opts.type, count: placed, programId: opts.actor.id });
     }
     const who = opts.owner === 'player' ? 'Hacker' : 'System';
+    // §28.1 — an armed overlay is not yet doing anything, so the player-facing
+    // line says so rather than claiming a live Buff was placed.
+    const verb = opts.countdown !== undefined && opts.countdown > 0 && opts.type === 'buff' ? 'armed' : 'placed';
     if (placed === 0) events.push({ t: 'msg', text: 'No valid Packet — Effect wasted' });
-    else events.push({ t: 'msg', text: `${who} placed ${placed === 1 ? `a ${noun}` : `${placed} ${noun}s`}` });
+    else events.push({ t: 'msg', text: `${who} ${verb} ${placed === 1 ? `a ${noun}` : `${placed} ${noun}s`}` });
     return placed;
   }
 
@@ -752,13 +889,142 @@ export class Game {
     return { matched: true, events: this.collect(events) };
   }
 
-  // 1.6.2 — System phase. Two modes (MK5.1):
-  //  - ENEMY_MATCHING off (default): tick own countdowns, cast all charged
-  //    Programs in randomized order, then every Program gains the flat
+  // ==========================================================================
+  // Alpha 0.5.0 §19 — THE DYNAMIC SYSTEM FUNCTION PHASE
+  //
+  // Alpha 0.4 snapshotted readiness once at phase start and fired that list.
+  // Readiness is now recomputed after every FULLY resolved Function, so charge
+  // a Function creates (an Effect-made Sync, a SPAM detonation, a cascade) can
+  // make another Program ready and let it act in the SAME phase (§19.1).
+  //
+  // Termination is guaranteed by `activatedThisPhase`, not by an iteration
+  // budget: each active Program may activate at most once per phase, so the
+  // loop can run at most once per Program however much charge is generated
+  // (§19.2). A Program that fires, is recharged, and fills again waits for the
+  // next System turn.
+  // ==========================================================================
+
+  // §19.4 — "a ready Function that currently has no valid target must not be
+  // selected and must not spend charge". Director ruling (2026-08-07): this
+  // applies to EVERY Effect, not just Drain, and is re-evaluated per charged
+  // Program after each activation, because a previous Function may have changed
+  // the Datastream and thus the answer.
+  //
+  // It answers ONLY for effects whose validity is cheaply and exactly knowable
+  // before paying. An Effect not named here is always eligible and keeps the
+  // established "fires, then legally fizzles" behavior.
+  private activationEligibility(prog: ResolvedProgram): ActivationEligibility {
+    const s = this.state;
+    // A composite mixing drain with other work still fires: only the fully
+    // useless case is withheld (the established Alpha 0.4 rule, kept).
+    if (planIsAllDrain(prog)) {
+      return s.units.player.some((p) => p.charge > 0)
+        ? { eligible: true }
+        : { eligible: false, reason: 'no charged Hacker Program to drain' };
+    }
+    for (const op of prog.fn.plan) {
+      switch (op.effectId) {
+        case 'EFFECT_TRANSFORM':
+          // §26 — COERCE with zero eligible Packets keeps its charge and
+          // mutates nothing.
+          if (transformCandidates(s).length === 0) {
+            return { eligible: false, reason: 'no valid Packet to transform' };
+          }
+          break;
+        case 'EFFECT_BUFF':
+        case 'EFFECT_SHIELD':
+          // §19.4 — a placement Function with zero legal deployment locations.
+          // Deliberate change from Alpha 0.4.1, where these fired into a full
+          // board and legally fizzled with the charge already spent.
+          if (this.placementCandidateCount() === 0) {
+            return { eligible: false, reason: 'no valid Packet for placement' };
+          }
+          break;
+        case 'EFFECT_BOMB':
+          // Countdown Bombs need a placeable Packet; immediate Bombs only need
+          // an occupied coordinate, which a live board always has.
+          if ((op.params.countdown ?? 0) > 0 && this.placementCandidateCount() === 0) {
+            return { eligible: false, reason: 'no valid Packet for placement' };
+          }
+          break;
+        default:
+          break;
+      }
+    }
+    return { eligible: true };
+  }
+
+  // The placement pool shared by placeSpecials: standard, non-special Packets.
+  // Kept in one place so eligibility and placement can never disagree.
+  private placementCandidateCount(): number {
+    const s = this.state;
+    let n = 0;
+    for (const row of s.board) {
+      for (const t of row) {
+        if (t && t.kind === 'standard' && !t.special) n++;
+      }
+    }
+    return n;
+  }
+
+  private runSystemFunctionPhase(events: GameEvent[]): void {
+    const s = this.state;
+    const activatedThisPhase = new Set<number>();
+    // Bounded by construction: every iteration either activates a Program
+    // (permanently consuming its one activation) or ends the phase.
+    for (;;) {
+      if (s.winner) return;
+      // §19.3 — readiness, validity, and the unfired set are ALL recomputed
+      // here, after the previous Function resolved completely (its Effects, its
+      // Effect-created Syncs, its B1 clears and cascades, its damage, and its
+      // charge routing have all already happened).
+      const choices: { u: UnitState; i: number }[] = [];
+      const withheld: GameEvent[] = [];
+      s.units.enemy.forEach((u, i) => {
+        if (activatedThisPhase.has(i)) return; // §19.2 at-most-once
+        const prog = programById(u.programId);
+        if (u.charge < prog.cost) return; // not ready — not a withhold
+        const verdict = this.activationEligibility(prog);
+        if (verdict.eligible) choices.push({ u, i });
+        // §19.4 — ready but with nothing to act on: the charge is PRESERVED,
+        // not spent on a no-op. §37.2 — recorded as an aggregate count rather
+        // than a per-turn event, so a Program blocked for many turns cannot
+        // flood the logs.
+        else withheld.push({ t: 'withhold', side: 'enemy', programId: prog.id, fnId: prog.fn.id, reason: verdict.reason ?? 'no valid target' });
+      });
+      // §19.4 — no ready AND valid unfired Program remains: the phase ends.
+      // The withholds are reported only on the final pass, so a Program that
+      // was blocked early and became eligible later is not counted as withheld.
+      if (!choices.length) {
+        events.push(...withheld);
+        return;
+      }
+
+      // §19.5 — the Alpha 0.4.1 activation-choice policy is preserved: pick at
+      // random among the currently eligible. PRG_SET order is charge-routing
+      // priority and must NOT acquire implicit activation priority (§2.11), so
+      // this deliberately does not take the first eligible Program.
+      const pick = choices[s.rng.int(choices.length)];
+      const prog = programById(pick.u.programId);
+      activatedThisPhase.add(pick.i);
+      pick.u.charge -= prog.cost;
+      this.castActor('enemy', { kind: 'program', id: prog.id, name: prog.name, fn: prog.fn }, events);
+    }
+  }
+
+  // 1.6.2 — System phase. Two modes (MK5.1). Alpha 0.5.0 §18 keeps this OUTER
+  // order exactly as it was; only readiness handling INSIDE the Function phase
+  // changed (§19).
+  //  - ENEMY_MATCHING off (default): tick own countdowns, run the dynamic
+  //    Function phase, then every Program gains the flat
   //    ENEMY_TIMER_CHARGE_RATE (the original timer-clock System).
   //  - ENEMY_MATCHING on: a REAL turn, structurally identical to the
-  //    Hacker's — tick, fire charged Functions pre-Sync, then make exactly
-  //    one Sync which resolves under the same rules.
+  //    Hacker's — tick, run the Function phase, then make exactly one Sync
+  //    which resolves under the same rules.
+  // §19.6 — charge from that turn-ending Sync (or from the flat timer) does NOT
+  // reopen the Function phase: both happen after it has returned, so the charge
+  // is available on the NEXT System turn. This mirrors the Hacker lifecycle,
+  // where Functions are used before the turn-ending match.
   runEnemyPhase(): GameEvent[] {
     const s = this.state;
     const events: GameEvent[] = [];
@@ -766,32 +1032,10 @@ export class Game {
     s.phase = 'enemy';
     events.push({ t: 'msg', text: 'System turn' });
 
-    this.tickBombs('enemy', events);
+    this.tickCountdowns('enemy', events);
     if (s.winner) return this.collect(events);
 
-    const readyIdx = s.units.enemy
-      .map((u, i) => ({ u, i }))
-      .filter(({ u }) => u.charge >= programById(u.programId).cost)
-      .map(({ i }) => i);
-    s.rng.shuffle(readyIdx);
-    for (const i of readyIdx) {
-      if (s.winner) break;
-      const u = s.units.enemy[i];
-      const prog = programById(u.programId);
-      if (u.charge < prog.cost) continue; // defensive (charge cannot drop mid-cast today)
-      // Approved Alpha deviation — SYSTEM DRAIN WITHHOLD: a Function whose
-      // expanded plan is entirely Drain ops does not activate when no Hacker
-      // Program holds any charge. The charge is preserved (not spent on a
-      // no-op) and the check re-runs next System turn. This is deliberately a
-      // pre-payment check in the Cast step — the one exception to the
-      // "fires and legally fizzles" pattern every other Effect follows.
-      if (planIsAllDrain(prog) && !s.units.player.some((p) => p.charge > 0)) {
-        events.push({ t: 'msg', text: `System ${prog.name} holds — nothing to drain` });
-        continue;
-      }
-      u.charge -= prog.cost;
-      this.castActor('enemy', { kind: 'program', id: prog.id, name: prog.name, fn: prog.fn }, events);
-    }
+    this.runSystemFunctionPhase(events);
     if (s.winner) return this.collect(events);
 
     if (s.config.enemyMatching) {

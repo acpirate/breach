@@ -77,18 +77,30 @@ const modeStr = (entry) =>
 // Normal LINK, and the HP pair reads as effective LINK/ICE. Historical records
 // with the old field names still format (missing values show as '?') — prior
 // logs are never rewritten (§21.5).
+// Alpha 0.4.1 §6.1 normalized turn records intentionally OMIT config, so
+// `cfgStr` is only ever called where config is genuinely expected (the
+// battle-level record). Alpha 0.5.0 §38.2 removes the misleading
+// `cfg[missing]` marker that normalized turn lines used to print: an absent
+// value that is absent BY DESIGN is not a defect and must not read as one.
 const cfgStr = (c) =>
   c
     ? `cfg[em:${c.enemyMatching ? 1 : 0} sa:${c.singleAxisPayout ? 1 : 0} rc:${(c.reinforcedConnection ?? c.noMatchDamage) ? 1 : 0}` +
       ` nl:${c.normalLink ? 1 : 0} cap:${c.maxCascadeSteps === null ? 'inf' : c.maxCascadeSteps} link:${c.playerHp ?? '?'} ice:${c.enemyHp ?? '?'}` +
       ` strongC:P[${arr(c.strongColors && c.strongColors.player)}]E[${arr(c.strongColors && c.strongColors.enemy)}]` +
       ` strongS:P[${arr(c.strongShapes && c.strongShapes.player)}]E[${arr(c.strongShapes && c.strongShapes.enemy)}]]`
-    : 'cfg[missing]';
+    : '';
 // Alpha 0.3.0 §21.2 — selection/build identity on battle, turn, and Run records.
+// Alpha 0.5.0 §36 — plus the opponent System and how it was chosen.
 const idStr = (i) =>
   i
-    ? `id[${i.hackerId ?? '?'}/${i.deckId ?? '?'} fn:${i.deckFunctionId ?? '?'} skills:[${arr(i.skillIds)}] src:${i.selectionSource ?? '?'}]`
+    ? `id[${i.hackerId ?? '?'}/${i.deckId ?? '?'} vs ${i.systemId ?? '?'}${i.systemSelectionSource ? `(${i.systemSelectionSource})` : ''}` +
+      ` fn:${i.deckFunctionId ?? '?'} skills:[${arr(i.skillIds)}] src:${i.selectionSource ?? '?'}]`
     : '';
+
+// §38.1 — the battle-level context every child record joins to by `battleId`.
+// Turn lines resolve their config from HERE rather than repeating it, which is
+// exactly what makes omitting it from the turn record correct.
+const battleContextById = new Map();
 
 // ---- build the readable body from all raw source lines ----
 const rawParts = [];
@@ -97,16 +109,48 @@ let metrics = 0;
 let turns = 0;
 let wizards = 0;
 let selections = 0;
+let events = 0;
+let omitted = 0;
+let unsupported = 0;
 let bad = 0;
 
+// §38.1 — every valid record is classified as rendered / summarized /
+// intentionally omitted / unsupported. `bad` is now reserved for records that
+// genuinely could not be parsed (malformed JSON or a missing envelope), so the
+// session header stops describing structurally valid logs as "unparsable".
+const parsed = [];
 for (const file of files) {
-  bodyLines.push(`----- ${path.basename(file)} -----`);
   const content = fs.readFileSync(file, 'utf8');
   rawParts.push(content);
   const lines = content.split('\n').filter(Boolean);
+  const records = [];
   for (const line of lines) {
+    let rec = null;
     try {
-      const { kind, at, entry } = JSON.parse(line);
+      rec = JSON.parse(line);
+    } catch {
+      bad++; // malformed JSON is still legitimately unparsable
+      continue;
+    }
+    if (!rec || typeof rec !== 'object' || typeof rec.kind !== 'string' || !('entry' in rec)) {
+      bad++; // valid JSON, but not a log envelope at all
+      continue;
+    }
+    records.push(rec);
+    // Pass 1: index battle-level context so turn/event lines can JOIN to it
+    // (§38.2) instead of carrying a repeated copy of the config.
+    if (rec.kind === 'metrics' && rec.entry && rec.entry.battleId) {
+      battleContextById.set(rec.entry.battleId, rec.entry);
+    }
+  }
+  parsed.push({ file, records });
+}
+
+// Pass 2: render.
+for (const { file, records } of parsed) {
+  bodyLines.push(`----- ${path.basename(file)} -----`);
+  for (const { kind, at, entry } of records) {
+    try {
       if (kind === 'metrics') {
         metrics++;
         const m = entry.metrics;
@@ -126,15 +170,27 @@ for (const file of files) {
             // §11.3/§6.4 — five DISJOINT buckets: base Sync + bomb + atk +
             // buffer + skill == total. `skill` is Hacker-Skill damage and is
             // never folded into base Sync damage.
-            `  ${side}: dmg ${s.totalDamage} [sync ${s.matchDamage} | bomb ${s.bombDamage} | atk ${s.attackerDamage} | buffer ${s.bufferDamageAdded ?? 0} | skill ${s.skillDamage ?? 0}]` +
+            // §11.3/§6.4 — DISJOINT buckets: base Sync + bomb + atk + slice +
+            // transform + buffer + skill == total. `skill` is Hacker-Skill
+            // damage and is never folded into base Sync damage; `xform`
+            // (Alpha 0.5.0) is damage from Syncs an EFFECT_TRANSFORM created,
+            // credited to the Effect rather than left in the Sync bucket.
+            `  ${side}: dmg ${s.totalDamage} [sync ${s.matchDamage} | bomb ${s.bombDamage} | atk ${s.attackerDamage}` +
+              ` | slice ${s.linesliceDamage ?? 0} | xform ${s.transformDamage ?? 0} | buffer ${s.bufferDamageAdded ?? 0} | skill ${s.skillDamage ?? 0}]` +
               ` cascadeDmg ${s.cascadeDamage ?? 0} axis(c/s) ${s.matchDamageColor ?? 0}/${s.matchDamageShape ?? 0}` +
               ` critExtra ${s.critExtra} contention ${s.contentionTiles ?? 0}/${s.tilesDestroyed ?? 0}` +
               ` largestHit ${s.largestHit} biggestRound ${s.biggestRound ?? 0} avgRound ${avgRound} deepestCascade ${s.deepestCascade}` +
-              ` lineClears ${s.lineClears ?? 0}`,
+              ` lineClears ${s.lineClears ?? 0}` +
+              // §39.1/§39.2 — ONE side-level total. `chargeDiscardedTotal` is
+              // the Alpha 0.4.1 field name, read here only so retained older
+              // logs still format (§38.3); it is no longer written.
+              ` chargeWasted ${s.chargeWastedTotal ?? s.chargeDiscardedTotal ?? 0}`,
           );
           for (const [t, u] of Object.entries(s.units)) {
             const placed = u.bombsPlaced ? `, bombsPlaced ${u.bombsPlaced}` : '';
-            bodyLines.push(`    ${t}: fires ${u.fires}, effect ${u.effect}, chargeWasted ${u.chargeWasted}${placed}`);
+            // §39.2 — per-Program chargeWasted is deliberately NOT printed: it
+            // is no longer the analytical authority for waste.
+            bodyLines.push(`    ${t}: fires ${u.fires}, effect ${u.effect}${placed}`);
           }
           // §21.3 — the Deck-owned Function has its OWN bucket, never listed
           // among the Programs.
@@ -156,20 +212,94 @@ for (const file of files) {
         if (m.hintsShown) bodyLines.push(`  hintsShown: ${m.hintsShown}`);
       } else if (kind === 'turn') {
         turns++;
+        // §38.2 — config is JOINED from the battle-level record by `battleId`.
+        // A compact turn record that omits it is correct, not deficient; when
+        // no battle record is retained alongside it the marker is simply left
+        // off rather than printing a false `cfg[missing]`.
+        const ctx = battleContextById.get(entry.battleId);
+        const cfg = cfgStr(entry.config ?? (ctx && ctx.config));
         bodyLines.push(
-          `[${at}] turn ${entry.turn} (${entry.battleId} v=${entry.v} ${modeStr(entry)} ${cfgStr(entry.config)})` +
+          `[${at}] turn ${entry.turn} (${entry.battleId} v=${entry.v} ${modeStr(entry)}${cfg ? ` ${cfg}` : ''})` +
             `${entry.thinkMs !== undefined ? ` think=${(entry.thinkMs / 1000).toFixed(1)}s` : ''}` +
             `${entry.hintShown ? ' HINTED' : ''}` +
             `${entry.result ? `  RESULT: ${entry.result} wins` : ''}`,
         );
-        if (entry.actions.length) bodyLines.push(`  actions: ${entry.actions.join('; ')}`);
+        // Alpha 0.4.1 §6.3 — the readable `actions` mirror exists only at
+        // COMPLETE. Reading it unconditionally threw a TypeError on every
+        // VERBOSE record, and the catch below then counted the record as
+        // unparsable; that was the real cause of the misclassification §38.1
+        // describes.
+        if (Array.isArray(entry.actions) && entry.actions.length) {
+          bodyLines.push(`  actions: ${entry.actions.join('; ')}`);
+        }
+        const d = entry.damage || { player: {}, enemy: {} };
+        const hp = entry.hpAfter || {};
+        // Alpha 0.4.1 moved detonations/reshuffles/lineClears to AGGREGATE
+        // counters on the battle record, so they are absent from turn records
+        // by design and are printed only when a legacy record still carries
+        // them (§38.3 — version-aware, never destructive).
+        const legacyAgg =
+          entry.detonations !== undefined || entry.reshuffles !== undefined || entry.lineClears !== undefined
+            ? `  detonations:${entry.detonations ?? 0} reshuffles:${entry.reshuffles ?? 0} lineClears:${entry.lineClears ?? 0}`
+            : '';
         bodyLines.push(
-          `  dmg H:${entry.damage.player.total} S:${entry.damage.enemy.total}  link:${entry.hpAfter.player} ice:${entry.hpAfter.enemy}` +
-            `  detonations:${entry.detonations} reshuffles:${entry.reshuffles} lineClears:${entry.lineClears ?? 0}`,
+          `  dmg H:${(d.player && d.player.total) ?? 0} S:${(d.enemy && d.enemy.total) ?? 0}` +
+            `  link:${hp.player ?? '?'} ice:${hp.enemy ?? '?'}${legacyAgg}`,
         );
+        const ch = entry.chargesAfter || {};
         bodyLines.push(
-          `  charges H:[${entry.chargesAfter.player}] S:[${entry.chargesAfter.enemy}] deck:${entry.chargesAfter.deck ?? entry.chargesAfter.shake ?? '?'}`,
+          `  charges H:[${arr(ch.player)}] S:[${arr(ch.enemy)}] deck:${ch.deck ?? ch.shake ?? '?'}`,
         );
+      } else if (kind === 'event') {
+        // Alpha 0.4.1 §4.3 promoted routes/targeted/drains out of the turn
+        // record into their own stream; Alpha 0.5.0 adds TRANSFORM and
+        // COUNTDOWN. The compact formatter had NO branch for this stream at
+        // all, so every structurally valid event record fell through to the
+        // `bad` counter and was reported as unparsable (§38.1).
+        events++;
+        const e = entry;
+        if (e.kind === 'ROUTE' && e.route) {
+          const r = e.route;
+          const landed = arr(r.assignments)
+            .filter((a) => a.assigned > 0)
+            .map((a) => `${a.programId}+${a.assigned}`)
+            .join(' ');
+          bodyLines.push(
+            `[${at}] route ${e.battleId} t${e.turn} ${r.side} ${r.axis}:${r.token} amount=${r.amount} src=${r.source}` +
+              `${r.sourceId ? `(${r.sourceId})` : ''} -> ${landed || 'nothing'} discarded=${r.discarded}`,
+          );
+        } else if (e.kind === 'TARGETED' && e.targeted) {
+          const t = e.targeted;
+          bodyLines.push(
+            `[${at}] targeted ${e.battleId} t${e.turn} ${t.side} ${t.effectId} [${t.fnId}] by ${t.programId}` +
+              ` ${t.resolved ? `at (${t.target ? `${t.target.x},${t.target.y}` : '?'}) sliced=${t.slicedCount} retained=${t.retainedCount} dmg=${t.directDamage} charge=${t.directCharge}` : `fizzled — ${t.reason ?? 'no target'}`}`,
+          );
+        } else if (e.kind === 'DRAIN' && e.drain) {
+          const dr = e.drain;
+          bodyLines.push(
+            `[${at}] drain ${e.battleId} t${e.turn} ${dr.side} ${dr.programId} [${dr.fnId}] -> ${dr.targetProgramId}` +
+              ` ${dr.readiness} ${dr.chargeBefore}->${dr.chargeAfter} of ${dr.targetCost} (removed ${dr.removed})`,
+          );
+        } else if (e.kind === 'TRANSFORM' && e.transform) {
+          const x = e.transform;
+          bodyLines.push(
+            `[${at}] transform ${e.battleId} t${e.turn} ${x.side} ${x.programId} [${x.fnId}]` +
+              ` ${x.axisTarget} -> c${x.resultColor}/s${x.resultShape} converted=${x.converted}/${x.candidates} (requested ${x.requested})` +
+              ` specials kept=${x.specialsRetained} destroyed=${x.specialsDestroyed}`,
+          );
+        } else if (e.kind === 'COUNTDOWN' && e.countdown) {
+          const c = e.countdown;
+          bodyLines.push(
+            `[${at}] countdown ${e.battleId} t${e.turn} ${c.side} delivered ${c.effectId}` +
+              `${c.fnId ? ` [${c.fnId}]` : ''} at (${c.p.x},${c.p.y})${c.magnitude !== undefined ? ` magnitude=${c.magnitude}` : ''}`,
+          );
+        } else {
+          // A well-formed event of a kind this formatter does not render.
+          // UNSUPPORTED is not a parse failure: the record is valid and is
+          // retained; only this exporter lacks a branch for it (§38.1).
+          unsupported++;
+          bodyLines.push(`[${at}] event ${e.battleId ?? '?'} t${e.turn ?? '?'} kind=${e.kind ?? '?'} (unsupported by this formatter)`);
+        }
       } else if (kind === 'wizard') {
         // Alpha 0.2.0 §5.4/§21.4 — wizard invocation, distinct from the
         // natural battle outcome it acted on (never overwrites it).
@@ -187,11 +317,27 @@ for (const file of files) {
             `${entry.hackerMaxLink !== undefined ? ` link=${entry.hackerMaxLink}` : ''}` +
             `${entry.systemMaxIce !== undefined ? ` ice=${entry.systemMaxIce}` : ''}`,
         );
+        // §36 — the committed opponent resolution.
+        if (entry.systemId) {
+          bodyLines.push(
+            `  system=${entry.systemId}${entry.systemSelectionSource ? ` (${entry.systemSelectionSource})` : ''}` +
+              `${entry.systemPrograms ? ` build=[${arr(entry.systemPrograms)}]` : ''}` +
+              `${entry.systemStrongColors ? ` strongC=[${arr(entry.systemStrongColors)}] strongS=[${arr(entry.systemStrongShapes)}]` : ''}`,
+          );
+        }
       } else {
-        bad++;
+        // §38.1 — a valid envelope of an unrecognized kind is INTENTIONALLY
+        // OMITTED from the readable body, not a parse failure. It stays in the
+        // raw .jsonl untouched (§38.3 — never destructively cleared merely
+        // because this formatter has no branch for it).
+        omitted++;
       }
-    } catch {
-      bad++;
+    } catch (err) {
+      // Reaching here means a rendering bug against a record that DID parse.
+      // Surfacing it as a formatter error keeps it from being silently
+      // miscounted as unparsable source data, which is what §38.1 is about.
+      unsupported++;
+      bodyLines.push(`[${at}] ${kind} record could not be formatted: ${err && err.message ? err.message : err}`);
     }
   }
 }
@@ -203,7 +349,7 @@ const existing = fs.existsSync(out) ? fs.readFileSync(out, 'utf8') : '';
 // written into the header below, so a re-run with identical source finds it)
 if (existing.includes(`SESSION ${sessionId} `)) {
   console.log(
-    `session ${sessionId} already appended to ${out} — nothing to do (${metrics} battle-metrics + ${turns} turns + ${wizards} wizard + ${selections} selection entries in source)`,
+    `session ${sessionId} already appended to ${out} — nothing to do (${metrics} battle-metrics + ${turns} turns + ${events} events + ${wizards} wizard + ${selections} selection entries in source)`,
   );
   process.exit(0);
 }
@@ -216,10 +362,14 @@ if (overThreshold(dir)) {
   process.exit(0);
 }
 
+// §38.1 — the header reports each classification separately, so "this
+// formatter has no branch for it" can never again be read as "the log is
+// corrupt". `unparsable` now means only malformed JSON or a missing envelope.
+const classified =
+  `${metrics} battle-metrics, ${turns} turns, ${events} events, ${wizards} wizard, ${selections} selection` +
+  `${unsupported ? `, ${unsupported} unsupported` : ''}${omitted ? `, ${omitted} omitted` : ''}${bad ? `, ${bad} unparsable` : ''}`;
 const header =
   `\n===== SESSION ${sessionId} | ${new Date().toISOString()} | files: ${files.map((f) => path.basename(f)).join(', ')} ` +
-  `| ${metrics} battle-metrics, ${turns} turns, ${wizards} wizard, ${selections} selection${bad ? `, ${bad} unparsable` : ''} =====`;
+  `| ${classified} =====`;
 fs.appendFileSync(out, `${header}\n${bodyLines.join('\n')}\n`);
-console.log(
-  `appended session ${sessionId}: ${metrics} battle-metrics + ${turns} turn + ${wizards} wizard + ${selections} selection entries from ${files.length} file(s)${bad ? ` (${bad} unparsable)` : ''} -> ${out}`,
-);
+console.log(`appended session ${sessionId}: ${classified} from ${files.length} file(s) -> ${out}`);

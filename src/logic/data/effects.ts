@@ -13,7 +13,11 @@ export type EffectId =
   | 'EFFECT_DRAIN'
   | 'EFFECT_SHIELD'
   | 'EFFECT_SHAKE'
-  | 'EFFECT_LINESLICE';
+  | 'EFFECT_LINESLICE'
+  // Alpha 0.5.0 §20 — changes the underlying color/shape identity of Packets
+  // matching an authored axis. Registered through this same typed contract
+  // mechanism; it is NOT a generalized transformation language (§20).
+  | 'EFFECT_TRANSFORM';
 
 // The discrete Function-CSV parameter columns an effect contract can claim.
 export type EffectParamName = 'quantity' | 'countdown' | 'areaPattern' | 'magnitude' | 'damage';
@@ -25,6 +29,14 @@ export const EFFECT_PARAM_NAMES: ReadonlyArray<EffectParamName> = [
   'magnitude',
   'damage',
 ];
+
+// Alpha 0.5.0 §21/§22 — the axis columns `EFFECT_TRANSFORM` adds. They are
+// their own contract dimension rather than more EffectParamName entries: every
+// other Effect leaves them blank, and treating them as ordinary discrete
+// parameters would make "populated but unused" warnings fire on every row.
+export type EffectAxisName = 'axisTarget' | 'axisResult';
+
+export const EFFECT_AXIS_NAMES: ReadonlyArray<EffectAxisName> = ['axisTarget', 'axisResult'];
 
 // Alpha 0.3.0 §4.6 — one field of an Effect's compound `params` tuple: a small
 // integer enum with an inclusive accepted range. The tuple is validated and
@@ -62,6 +74,10 @@ export interface EffectContract {
   // populated `params` column is unused (a warning, per §9's convention for
   // populated-but-unused parameters).
   tuple?: ReadonlyArray<EffectTupleField>;
+  // Alpha 0.5.0 §21 — the axis columns this Effect REQUIRES. Any axis column
+  // not listed here is unused by that Effect and warns when populated, exactly
+  // as an unused discrete parameter does.
+  axes?: ReadonlyArray<EffectAxisName>;
 }
 
 const registry = new Map<EffectId, EffectContract>();
@@ -113,7 +129,12 @@ registerEffect({
   targetKind: 'packet',
   tuple: BOMB_TUPLE,
 });
-registerEffect({ id: 'EFFECT_BUFF', required: ['quantity', 'magnitude'], targeted: false });
+// Alpha 0.5.0 §28 — `countdown` is OPTIONAL for Buffs on exactly the terms it
+// is optional for Bombs: blank/zero places a live Buff immediately (FNC_002),
+// a positive integer arms a countdown overlay that DELIVERS the Buff on the
+// same Packet at expiry (FNC_014 EBUFF). No second Effect ID, no second
+// scheduler (§28.5).
+registerEffect({ id: 'EFFECT_BUFF', required: ['quantity', 'magnitude'], optional: ['countdown'], targeted: false });
 registerEffect({ id: 'EFFECT_ATTACK', required: ['damage'], targeted: false });
 registerEffect({ id: 'EFFECT_DRAIN', required: [], targeted: true, targetKind: 'unit' });
 registerEffect({ id: 'EFFECT_SHIELD', required: ['quantity', 'magnitude'], targeted: false });
@@ -138,3 +159,25 @@ export const SHAKE_TUPLE: ReadonlyArray<EffectTupleField> = [
 ];
 
 registerEffect({ id: 'EFFECT_SHAKE', required: [], targeted: false, tuple: SHAKE_TUPLE });
+
+// Alpha 0.5.0 §23 — EFFECT_TRANSFORM takes exactly two colon-delimited integer
+// enum values:  targeting:specialPacketTreatment
+// `specialPacketTreatment` reuses the established SPECIALS_* enum the
+// LineSlice tuple already uses (0 destroy / 1 retain all / 2 retain own), so
+// the two Effects cannot drift apart on special handling.
+export const TRANSFORM_TUPLE: ReadonlyArray<EffectTupleField> = [
+  { name: 'targeting', min: 0, max: 1 },
+  { name: 'specialPacketTreatment', min: 0, max: 2 },
+];
+
+// §21 — `quantity` plus both axis columns are required; damage, magnitude,
+// countdown, and areaPattern are not part of the Transform contract and warn
+// when populated, under the established unused-parameter policy.
+registerEffect({
+  id: 'EFFECT_TRANSFORM',
+  required: ['quantity'],
+  targeted: false,
+  targetKind: 'packet',
+  tuple: TRANSFORM_TUPLE,
+  axes: ['axisTarget', 'axisResult'],
+});

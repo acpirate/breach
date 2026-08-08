@@ -969,8 +969,19 @@ export class View {
       ctx.font = `bold ${Math.max(10, Math.floor(br * 1.5))}px sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      // MK9.3: shield badge 'S'; bomb shows countdown; buff shows '+'
-      const badge = view.special.type === 'bomb' ? String(view.special.countdown ?? '?') : view.special.type === 'shield' ? 'S' : '+';
+      // MK9.3: shield badge 'S'; bomb shows countdown; buff shows '+'.
+      // Alpha 0.5.0 §28.1: an ARMED overlay shows its remaining turns whatever
+      // it will deliver, so a pending EBUFF reads as a countdown (it is doing
+      // nothing yet) and only switches to '+' once it is actually live.
+      const sp = view.special;
+      const armed = sp.countdown !== undefined && sp.countdown > 0;
+      const badge = armed
+        ? String(sp.countdown)
+        : sp.type === 'bomb'
+          ? String(sp.countdown ?? '?')
+          : sp.type === 'shield'
+            ? 'S'
+            : '+';
       ctx.fillText(badge, bx, by + 0.5);
       ctx.textBaseline = 'alphabetic';
     }

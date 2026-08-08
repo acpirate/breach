@@ -1,13 +1,16 @@
-FNC_ID,name,cost,payload,notes,quantity,countdown,areaPattern,magnitude,damage,startCharged,params
-FNC_001,BOMB,7,EFFECT_BOMB,player bomb,2,2,AREA_SQUARE_3X3,,,,0:0:1
-FNC_002,BUFF,8,EFFECT_BUFF,player buffer,1,,,5,,,
-FNC_003,ATTACK,10,EFFECT_ATTACK,direct damage to opponent,,,,,30,,
-FNC_004,DRAIN,9,EFFECT_DRAIN,"unit target, remove all charge",,,,,,,
-FNC_005,EBOMB,7,EFFECT_BOMB,,1,3,AREA_SQUARE_3X3_CARDINAL_2,,,,0:0:1
-FNC_006,SHIELD,8,EFFECT_SHIELD,,2,,,2,,,
-FNC_007,SHOWCASE,9,FNC_008:FNC_009,"chained function example, costs of called functions are ignored",,,,,,,
-FNC_008,ONEBOMB,5,EFFECT_BOMB,chained function payload,1,2,AREA_SQUARE_3X3,,,,0:0:1
-FNC_009,ONESHIELD,5,EFFECT_SHIELD,chained function payload,1,,,2,,,
-FNC_010,SCRAMBLE,3,EFFECT_SHAKE,re-arrange the packets on the whole screen - see param notes,,,,,,Y,0:0:0:0
-FNC_011,DATACUT,7,EFFECT_LINESLICE,"slice targeted row, deal damage, no charge",1,,,,,,0:1:0:0:1
-FNC_012,PLINK,5,EFFECT_BOMB,slice cross centered on target,1,,AREA_CARDINAL_1,,,,1:0:1
+FNC_ID,name,cost,payload,notes,quantity,countdown,areaPattern,magnitude,damage,startCharged,axisTarget,axisResult,params
+FNC_001,BOMB,7,EFFECT_BOMB,generic bomb effect,2,2,AREA_SQUARE_3X3,,,,,,0:0:1
+FNC_002,BUFF,8,EFFECT_BUFF,player buffer,1,,,5,,,,,
+FNC_003,ATTACK,10,EFFECT_ATTACK,direct damage to opponent,,,,,30,,,,
+FNC_004,DRAIN,9,EFFECT_DRAIN,"unit target, remove all charge",,,,,,,,,
+FNC_005,EBOMB,7,EFFECT_BOMB,,1,3,AREA_SQUARE_3X3_CARDINAL_2,,,,,,0:0:1
+FNC_006,SHIELD,8,EFFECT_SHIELD,,2,,,2,,,,,
+FNC_007,SHOWCASE,9,FNC_008:FNC_009,"chained function example, costs of called functions are ignored",,,,,,,,,
+FNC_008,ONEBOMB,5,EFFECT_BOMB,chained function payload,1,2,AREA_SQUARE_3X3,,,,,,0:0:1
+FNC_009,ONESHIELD,5,EFFECT_SHIELD,chained function payload,1,,,2,,,,,
+FNC_010,SCRAMBLE,3,EFFECT_SHAKE,re-arrange the packets on the whole screen - see param notes,,,,,,Y,,,0:0:0:0
+FNC_011,DATACUT,7,EFFECT_LINESLICE,"slice targeted row, deal damage, no charge",1,,,,,,,,0:1:0:0:1
+FNC_012,PLINK,5,EFFECT_BOMB,slice cross centered on target,1,,AREA_CARDINAL_1,,,,,,1:0:1
+FNC_013,COERCE,7,EFFECT_TRANSFORM,turn neutral packets into attacker axes,99,,,,,Y,NEU,YEL:STR,0:1
+FNC_014,EBUFF,9,EFFECT_BUFF,when countdown goes off those same packets become the buff,3,2,,5,,,,,
+FNC_015,SPAM,7,EFFECT_BOMB,"many small bombs, charges",3,1,AREA_CARDINAL_1,,,,,,0:0:0

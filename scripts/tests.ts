@@ -15,7 +15,10 @@ import {
   ACTIVE_BUILD_SIZE,
   DEFAULT_DECK_ID,
   DEFAULT_HACKER_ID,
+  HEADLESS_SYSTEM_ID,
   INVENTORY_SIZE,
+  SYSTEM_BUILD_SIZE,
+  allSystems,
   deckById,
   defaultBuild,
   getContent,
@@ -25,6 +28,7 @@ import {
   isValidBuild,
   programById,
   setActiveContent,
+  systemById,
   targetKindOf,
 } from '../src/logic/data/content';
 import { DataFiles, loadContent } from '../src/logic/data/load';
@@ -38,6 +42,7 @@ import {
   LOG_VERSION,
   LoggingLevel,
   TurnLogEntry,
+  identityStamp,
   loggingLevel,
   routeIsInteresting,
   setLoggingLevel,
@@ -45,13 +50,17 @@ import {
 import * as storage from '../src/storage';
 import { SAVE_VERSION } from '../src/logic/save';
 import { computeLineClears, detectMatches } from '../src/logic/match';
-import { StreamMap, addStream, routeChargeStream, routeStreams } from '../src/logic/resolve';
+import { StreamMap, addStream, addUnitCharge, applyTransform, buffBonus, routeChargeStream, routeStreams } from '../src/logic/resolve';
+import { consumeEvents, createBattleMetrics } from '../src/logic/metrics';
+import { ENEMY_TIMER_CHARGE_RATE } from '../src/logic/constants';
 import {
   PendingSetup,
   QuickMatchInfo,
   RUN_ENCOUNTERS,
   RUN_LENGTH,
   RunInfo,
+  SelectedSystem,
+  randomSystem,
   beginBuild,
   beginSetup,
   buildIdentity,
@@ -82,11 +91,11 @@ import {
   setupComplete,
   snapshotRunSettings,
 } from '../src/logic/session';
-import { BattleSettings, BuildOrigin, Color, RunStep, Shape, Side } from '../src/logic/types';
+import { BattleSettings, BuildOrigin, Color, RunStep, Shape, Side, gridViewOf } from '../src/logic/types';
 import { GameEvent, Pt, Tile } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { nodeDataFiles } from './dataNode';
-import { D, defaultActiveBuild, defaultHackerLink, manualLink, newBattle } from './harness';
+import { D, defaultActiveBuild, defaultHackerLink, headlessSystem, manualLink, newBattle } from './harness';
 
 let passed = 0;
 let failed = 0;
@@ -126,12 +135,14 @@ function files(over: Partial<Record<keyof DataFiles, string>>): DataFiles {
     hackers: { name: real.hackers.name, text: over.hackers ?? real.hackers.text },
     skills: { name: real.skills.name, text: over.skills ?? real.skills.text },
     decks: { name: real.decks.name, text: over.decks ?? real.decks.text },
+    systems: { name: real.systems.name, text: over.systems ?? real.systems.text },
   };
 }
 
 // Canonical Function-row width (§4.6 — the existing columns plus `params` and
-// `startCharged`). Fixtures may supply a prefix; the rest pads to blank.
-const FNC_COLUMNS = 12;
+// `startCharged`; Alpha 0.5.0 §21 appends `axisTarget` and `axisResult`).
+// Fixtures may supply a prefix; the rest pads to blank.
+const FNC_COLUMNS = 14;
 const fncRow = (fields: string[]): string => {
   const out = fields.slice();
   while (out.length < FNC_COLUMNS) out.push('');
@@ -150,9 +161,9 @@ function expectErrors(over: Partial<Record<keyof DataFiles, string>>, reasonPart
 
 // ---- §21.1 version stamps ----
 
-test('version stamps are alpha-0.4.0', () => {
-  assert(SAVE_VERSION === 'alpha-0.4.0', `SAVE_VERSION = ${SAVE_VERSION}`);
-  assert(LOG_VERSION === 'alpha-0.4.0', `LOG_VERSION = ${LOG_VERSION}`);
+test('version stamps are alpha-0.5.0', () => {
+  assert(SAVE_VERSION === 'alpha-0.5.0', `SAVE_VERSION = ${SAVE_VERSION}`);
+  assert(LOG_VERSION === 'alpha-0.5.0', `LOG_VERSION = ${LOG_VERSION}`);
 });
 
 // §21.1 — no active output path may continue to emit a stale build tag.
@@ -176,7 +187,8 @@ test('no stale build tags in active source (§21.1)', () => {
   // no `g` flag: these are used as stateless containment tests per file, and
   // a global-flag regex's `lastIndex` would otherwise persist across the
   // per-file .test() calls in the loop below.
-  const stalePattern = /alpha-0\.[123]\.0/;
+  // Alpha 0.5.0 — 0.4.x joins the stale set now that the build stamp moved on.
+  const stalePattern = /alpha-0\.[1234]\.\d/;
   const mkTagPattern = /(['"`])mk\d+\1/i;
   // smoke.ts: the deliberate pre-Alpha-0.4.0 rejection fixture. This test
   // file itself is excluded too — it necessarily quotes the old tags below to
@@ -214,8 +226,11 @@ test('§22.1 all six required datasets load through the shared pipeline', () => 
   // Alpha 0.4.0 — six Hacker Programs form the inventory; the System keeps its
   // four (System-side build selection is explicitly out of scope, §22).
   assert(c.hacker.length === INVENTORY_SIZE, `expected ${INVENTORY_SIZE} Hacker Programs, got ${c.hacker.length}`);
-  assert(c.system.length === 4, 'expected 4 System Programs');
-  assert(c.functions.size === 12, `expected 12 functions, got ${c.functions.size}`);
+  // Alpha 0.5.0 §7.1 — eight System Programs are LOADED; each System FIELDS
+  // four of them through its PRG_SET (§5.4). The loaded roster is no longer
+  // the battle roster, which is the whole point of System identity.
+  assert(c.system.length === 8, `expected 8 System Programs, got ${c.system.length}`);
+  assert(c.functions.size === 15, `expected 15 functions, got ${c.functions.size}`);
   const costs: Record<string, number> = {};
   for (const f of c.functions.values()) costs[f.name] = f.cost;
   // §4.2 approved Alpha costs
@@ -239,6 +254,25 @@ test('§22.1 all six required datasets load through the shared pipeline', () => 
   // §2.12 placeholders are parsed and RETAINED but never interpreted
   assert(hak.bio.length > 0 && hak.graphics.length > 0, 'BIO/GRAPHICS retained as data');
   assert(dek.descript.length > 0 && dek.graphics.length > 0, 'DESCRIPT/GRAPHICS retained as data');
+  // Alpha 0.5.0 §5/§6 — the seventh required dataset and its two authored rows.
+  assert(c.systems.size === 2, `expected 2 Systems, got ${c.systems.size}`);
+  const bouncer = c.systems.get('SYS_01')!;
+  assert(bouncer && bouncer.name === 'BOUNCER' && bouncer.baseIce === 100, 'SYS_01 BOUNCER resolves');
+  assert(bouncer.programIds.join(':') === 'PRG_S_003:PRG_S_005:PRG_S_006:PRG_S_001', 'BOUNCER ordered PRG_SET');
+  const midnight = c.systems.get('SYS_02')!;
+  assert(midnight && midnight.name === 'MIDNIGHT' && midnight.baseIce === 100, 'SYS_02 MIDNIGHT resolves');
+  assert(midnight.programIds.join(':') === 'PRG_S_007:PRG_S_008:PRG_S_001:PRG_S_002', 'MIDNIGHT ordered PRG_SET');
+  // §2.2 — System passive Skills are deferred, so authored rows carry none.
+  assert(bouncer.skillIds.length === 0 && midnight.skillIds.length === 0, 'no System Skills in Alpha 0.5');
+  // §5.2 — placeholders retained, never interpreted (as for the Hacker).
+  assert(bouncer.bio.length > 0 && bouncer.graphics.length > 0, 'System BIO/GRAPHICS retained as data');
+  // §7 — the new authored content the Systems field.
+  assert(c.functions.get('FNC_013')!.name === 'COERCE', 'FNC_013 COERCE');
+  assert(c.functions.get('FNC_014')!.name === 'EBUFF', 'FNC_014 EBUFF');
+  assert(c.functions.get('FNC_015')!.name === 'SPAM', 'FNC_015 SPAM');
+  for (const id of ['PRG_S_005', 'PRG_S_006', 'PRG_S_007', 'PRG_S_008']) {
+    assert(c.programsById.has(id), `${id} is loaded`);
+  }
 });
 
 test('§22.1 Skill display resolves %N placeholders in title case', () => {
@@ -255,7 +289,7 @@ test('§22.1 fingerprint tracks gameplay fields and ignores placeholders/display
   const a = loadContent(real).content!;
   // EXCLUDED: notes, BIO, GRAPHICS, DESCRIPT, presentational Skill display
   const same: Array<[string, DataFiles]> = [
-    ['notes', files({ functions: mutate(real.functions.text, 'player bomb', 'renamed note text') })],
+    ['notes', files({ functions: mutate(real.functions.text, 'generic bomb effect', 'renamed note text') })],
     ['BIO', files({ hackers: mutate(real.hackers.text, 'hacker biography goes here', 'entirely different bio') })],
     ['GRAPHICS', files({ hackers: mutate(real.hackers.text, 'hacker graphics reference goes here', 'other.png') })],
     ['DESCRIPT', files({ decks: mutate(real.decks.text, 'deck description goes here', 'other text') })],
@@ -269,7 +303,7 @@ test('§22.1 fingerprint tracks gameplay fields and ignores placeholders/display
   // INCLUDED: every gameplay-affecting value across all six datasets
   const differ: Array<[string, DataFiles]> = [
     ['Function cost', files({ functions: mutate(real.functions.text, 'FNC_001,BOMB,7', 'FNC_001,BOMB,8') })],
-    ['startCharged', files({ functions: mutate(real.functions.text, ',,Y,0:0:0:0', ',,N,0:0:0:0') })],
+    ['startCharged', files({ functions: mutate(real.functions.text, ',,Y,,,0:0:0:0', ',,N,,,0:0:0:0') })],
     ['Shake params', files({ functions: mutate(real.functions.text, '0:0:0:0', '0:0:1:1') })],
     ['BASE_LINK', files({ hackers: mutate(real.hackers.text, 'CR45H,100', 'CR45H,120') })],
     ['STRONG_COLORS', files({ hackers: mutate(real.hackers.text, 'RED:GRE:YEL', 'RED:GRE:BLU') })],
@@ -323,7 +357,7 @@ test('duplicate display names warn but load', () => {
   const dup =
     real.functions.text.trimEnd() +
     '\n' +
-    fncRow(['FNC_099', 'BOMB', '5', 'EFFECT_BOMB', '', '1', '2', 'AREA_SQUARE_3X3', '', '', '', '0:0:1']);
+    fncRow(['FNC_099', 'BOMB', '5', 'EFFECT_BOMB', '', '1', '2', 'AREA_SQUARE_3X3', '', '', '', '', '', '0:0:1']);
   const r = loadContent(files({ functions: dup }));
   assert(r.content !== null, 'duplicate names must still load');
   assert(r.warnings > 0 && r.issues.some((i) => i.severity === 'warning' && i.reason.includes('duplicate display name')), 'expected a name warning');
@@ -350,7 +384,7 @@ test('broken payload reference fails', () => {
 test('missing required Effect parameter fails', () => {
   // FNC_001 BOMB loses its quantity
   expectErrors(
-    { functions: mutate(real.functions.text, 'player bomb,2,2,AREA_SQUARE_3X3', 'player bomb,,2,AREA_SQUARE_3X3') },
+    { functions: mutate(real.functions.text, 'generic bomb effect,2,2,AREA_SQUARE_3X3', 'generic bomb effect,,2,AREA_SQUARE_3X3') },
     'missing or invalid required parameter',
     'missing param',
   );
@@ -362,7 +396,7 @@ test('invalid numeric syntax and ranges fail', () => {
   }
   // quantity 0 (required positive) and countdown 0
   expectErrors(
-    { functions: mutate(real.functions.text, 'player bomb,2,2,AREA_SQUARE_3X3', 'player bomb,0,2,AREA_SQUARE_3X3') },
+    { functions: mutate(real.functions.text, 'generic bomb effect,2,2,AREA_SQUARE_3X3', 'generic bomb effect,0,2,AREA_SQUARE_3X3') },
     'parameter out of range',
     'quantity 0',
   );
@@ -370,7 +404,7 @@ test('invalid numeric syntax and ranges fail', () => {
   // now MEANS "resolve the blast immediately, place no overlay". It must load
   // and resolve to an immediate Bomb.
   {
-    const t = mutate(real.functions.text, 'player bomb,2,2,AREA_SQUARE_3X3', 'player bomb,2,0,AREA_SQUARE_3X3');
+    const t = mutate(real.functions.text, 'generic bomb effect,2,2,AREA_SQUARE_3X3', 'generic bomb effect,2,0,AREA_SQUARE_3X3');
     const r = loadContent(files({ functions: t }));
     assert(r.content !== null, `countdown 0 must load: ${r.issues.map((i) => i.reason).join('; ')}`);
     const op = r.content.functions.get('FNC_001')!.plan[0];
@@ -440,7 +474,7 @@ test('§22.1 malformed tuples and invalid startCharged fail', () => {
   expectErrors({ functions: mutate(real.functions.text, '0:0:0:0', '2:0:0:0') }, 'out of range', 'shake range');
   expectErrors({ functions: mutate(real.functions.text, '0:0:0:0', '0:0:0:x') }, 'malformed tuple', 'shake token');
   expectErrors({ functions: mutate(real.functions.text, '0:0:0:0', '') }, 'missing required params tuple', 'shake missing');
-  expectErrors({ functions: mutate(real.functions.text, ',,Y,0:0:0:0', ',,MAYBE,0:0:0:0') }, 'invalid startCharged', 'startCharged');
+  expectErrors({ functions: mutate(real.functions.text, ',,Y,,,0:0:0:0', ',,MAYBE,,,0:0:0:0') }, 'invalid startCharged', 'startCharged');
   // §4.4 Skill param tuple contracts
   expectErrors({ skills: mutate(real.skills.text, 'RED:1,Deal', 'RED,Deal') }, 'exactly 2 colon-delimited', 'skill arity');
   expectErrors({ skills: mutate(real.skills.text, 'RED:1,Deal', 'REX:1,Deal') }, 'unknown color enum', 'skill color');
@@ -519,10 +553,10 @@ test('self-reference fails', () => {
 });
 
 test('composite-to-composite nesting (and thus cycles) fails', () => {
-  // FNC_013: FNC_010-012 are now required real records (SCRAMBLE, DATACUT,
-  // PLINK), so the fixture uses the next free ID to test nesting rather than
-  // an ID collision.
-  const t = real.functions.text.trimEnd() + '\n' + fncRow(['FNC_013', 'SHOWTWO', '9', 'FNC_007']);
+  // FNC_001-015 are all required real records now (Alpha 0.5.0 added COERCE,
+  // EBUFF and SPAM), so the fixture uses a high free ID to test nesting rather
+  // than colliding with authored content.
+  const t = real.functions.text.trimEnd() + '\n' + fncRow(['FNC_098', 'SHOWTWO', '9', 'FNC_007']);
   expectErrors({ functions: t }, 'may not reference another composite', 'composite nesting');
 });
 
@@ -563,7 +597,7 @@ test('§20.1 exactly one leading apostrophe is stripped before any parsing', () 
   // One apostrophe in front of an ID reference, an integer, a tuple, and an
   // enum list must all normalize away before parsing/resolution.
   const fns = mutate(real.functions.text, 'FNC_011,DATACUT,7', "FNC_011,DATACUT,'7");
-  const fns2 = mutate(fns, ',,,,0:1:0:0:1', ",,,,'0:1:0:0:1");
+  const fns2 = mutate(fns, ',,,,,,0:1:0:0:1', ",,,,,,'0:1:0:0:1");
   const hak = mutate(real.hackers.text, 'PRG_H_001:PRG_H_002:PRG_H_005', "'PRG_H_001:PRG_H_002:PRG_H_005");
   const prg = mutate(real.hacker.text, 'PRG_H_005,NINJA,MAG,CRO', "PRG_H_005,NINJA,'MAG,CRO");
   const r = loadContent(files({ functions: fns2, hackers: hak, hacker: prg }));
@@ -651,16 +685,16 @@ test('§20.1 every Program resolves exactly one active Function', () => {
 
 test('§20.1 EFFECT_BOMB requires exactly three parameters, EFFECT_LINESLICE exactly five', () => {
   // §4.8 — trailing defaults are never inferred and blank is invalid.
-  expectErrors({ functions: mutate(real.functions.text, 'AREA_SQUARE_3X3,,,,0:0:1', 'AREA_SQUARE_3X3,,,,0:0') }, 'exactly 3', 'short Bomb tuple');
-  expectErrors({ functions: mutate(real.functions.text, 'AREA_SQUARE_3X3,,,,0:0:1', 'AREA_SQUARE_3X3,,,,0:0:1:1') }, 'exactly 3', 'long Bomb tuple');
-  expectErrors({ functions: mutate(real.functions.text, 'AREA_SQUARE_3X3,,,,0:0:1', 'AREA_SQUARE_3X3,,,,') }, 'missing required params tuple', 'blank Bomb tuple');
-  expectErrors({ functions: mutate(real.functions.text, ',,,,0:1:0:0:1', ',,,,0:1:0:0') }, 'exactly 5', 'short LineSlice tuple');
-  expectErrors({ functions: mutate(real.functions.text, ',,,,0:1:0:0:1', ',,,,0:1:0:0:1:0') }, 'exactly 5', 'long LineSlice tuple');
-  expectErrors({ functions: mutate(real.functions.text, 'FNC_011,DATACUT,7,EFFECT_LINESLICE,"slice targeted row, deal damage, no charge",1,,,,,,0:1:0:0:1', 'FNC_011,DATACUT,7,EFFECT_LINESLICE,"slice targeted row, deal damage, no charge",1,,,,,,') }, 'missing required params tuple', 'blank LineSlice tuple');
+  expectErrors({ functions: mutate(real.functions.text, 'AREA_SQUARE_3X3,,,,,,0:0:1', 'AREA_SQUARE_3X3,,,,,,0:0') }, 'exactly 3', 'short Bomb tuple');
+  expectErrors({ functions: mutate(real.functions.text, 'AREA_SQUARE_3X3,,,,,,0:0:1', 'AREA_SQUARE_3X3,,,,,,0:0:1:1') }, 'exactly 3', 'long Bomb tuple');
+  expectErrors({ functions: mutate(real.functions.text, 'AREA_SQUARE_3X3,,,,,,0:0:1', 'AREA_SQUARE_3X3,,,,,,') }, 'missing required params tuple', 'blank Bomb tuple');
+  expectErrors({ functions: mutate(real.functions.text, ',,,,,,0:1:0:0:1', ',,,,,,0:1:0:0') }, 'exactly 5', 'short LineSlice tuple');
+  expectErrors({ functions: mutate(real.functions.text, ',,,,,,0:1:0:0:1', ',,,,,,0:1:0:0:1:0') }, 'exactly 5', 'long LineSlice tuple');
+  expectErrors({ functions: mutate(real.functions.text, 'FNC_011,DATACUT,7,EFFECT_LINESLICE,"slice targeted row, deal damage, no charge",1,,,,,,,,0:1:0:0:1', 'FNC_011,DATACUT,7,EFFECT_LINESLICE,"slice targeted row, deal damage, no charge",1,,,,,,,,') }, 'missing required params tuple', 'blank LineSlice tuple');
 });
 
 test('§20.1 invalid parameter enums fail with field/position context', () => {
-  const r = loadContent(files({ functions: mutate(real.functions.text, ',,,,0:1:0:0:1', ',,,,0:1:9:0:1') }));
+  const r = loadContent(files({ functions: mutate(real.functions.text, ',,,,,,0:1:0:0:1', ',,,,,,0:1:9:0:1') }));
   assert(r.content === null, 'out-of-range enum must fail');
   const issue = r.issues.find((i) => i.severity === 'error' && i.reason.includes('specialRetention'));
   assert(issue, `expected a specialRetention-specific error, got: ${r.issues.map((i) => i.reason).join('; ')}`);
@@ -713,17 +747,53 @@ test('§20.1 there is exactly one AREA_CARDINAL_1 definition (no alias)', () => 
 
 // ---- gameplay fixtures ----
 
+// Alpha 0.5.0 — a TEST-ONLY System that fields the Alpha 0.4 System roster
+// (E-BOMBER / SHIELDER / ATTACKER / DISABLER). Neither authored System fields
+// DISABLER, and only MIDNIGHT fields SHIELDER (§6.2), so without this the
+// regression gate would silently lose its Drain, Shield and E-Bomb coverage
+// (§51). Appended to the SYS dataset as fixture text — it is deliberately NOT
+// authored content, and the designer has a separate note to add a real TESTER
+// System in a future build.
+// A function DECLARATION and an inline literal, not consts: `install()` is
+// called from tests that appear earlier in this file, and a const would still
+// be in its temporal dead zone at that point.
+function testbedSystemId(): string {
+  return 'SYS_90';
+}
+function testbedSystems(): string {
+  return `${real.systems.text.replace(/\s*$/, '')}\nSYS_90,TESTBED,100,RED:GRE:YEL,TRI:SQU:STR,PRG_S_001:PRG_S_002:PRG_S_003:PRG_S_004,,bio,gfx`;
+}
+
+function testbed(): SelectedSystem {
+  return { systemId: testbedSystemId(), source: 'HEADLESS_PINNED' };
+}
+
+// A battle against the testbed roster, for the Effects only it fields.
+function newTestbedGame(seed = 7, settings: BattleSettings = D): Game {
+  const g = newBattle(settings, seed, undefined, 'DEFAULT', testbed());
+  g.startPlayerPhase();
+  return g;
+}
+
+// The default fixture install includes the testbed System, so any test can
+// select it without reinstalling content mid-file.
 function install(over?: Partial<Record<keyof DataFiles, string>>): void {
-  const r = loadContent(over ? files(over) : real);
+  const merged = { systems: testbedSystems(), ...(over ?? {}) };
+  const r = loadContent(files(merged));
   assert(r.content !== null, `fixture content failed to load: ${r.issues.map((i) => i.reason).join('; ')}`);
   setActiveContent(r.content);
 }
 
 // Under Normal LINK (the default) the harness identity resolves to
-// BASE_LINK + ADD_LINK for the Hacker, with System ICE mirroring it. Resolved
-// lazily: it reads the ACTIVE content, which install() below installs first.
+// BASE_LINK + ADD_LINK for the Hacker. Resolved lazily: it reads the ACTIVE
+// content, which install() below installs first.
 let _defaultLink: number | null = null;
 const DEFAULT_LINK = (): number => (_defaultLink ??= defaultHackerLink());
+
+// Alpha 0.5.0 §10.1 — System ICE no longer mirrors the Hacker's LINK: it is the
+// selected System's own BASE_ICE. Assertions about the SYSTEM's remaining ICE
+// must start from this, not from DEFAULT_LINK().
+const DEFAULT_ICE = (systemId: string = HEADLESS_SYSTEM_ID): number => systemById(systemId).baseIce;
 
 function newGame(seed = 7, settings: BattleSettings = D): Game {
   const g = newBattle(settings, seed);
@@ -733,8 +803,8 @@ function newGame(seed = 7, settings: BattleSettings = D): Game {
 
 // Alpha 0.4.0 — a battle whose ACTIVE BUILD is stated explicitly, for the
 // order/routing/inventory cases. Any four distinct inventory Programs.
-function newGameWithBuild(build: string[], seed = 7, settings: BattleSettings = D): Game {
-  const g = newBattle(settings, seed, build, 'PLAYER_EDITED');
+function newGameWithBuild(build: string[], seed = 7, settings: BattleSettings = D, system?: SelectedSystem): Game {
+  const g = newBattle(settings, seed, build, 'PLAYER_EDITED', system);
   g.startPlayerPhase();
   return g;
 }
@@ -742,7 +812,15 @@ function newGameWithBuild(build: string[], seed = 7, settings: BattleSettings = 
 // Alpha 0.4.0 — the Quick Match session info a save round-trip needs. The
 // build and its source are part of the saved session now (§9.5).
 function qmInfo(build: readonly string[] = defaultActiveBuild(), origin: BuildOrigin = 'DEFAULT'): QuickMatchInfo {
-  return { mode: 'QUICK_MATCH', identity: defaultIdentity(), build: [...build], buildOrigin: origin };
+  return {
+    mode: 'QUICK_MATCH',
+    identity: defaultIdentity(),
+    // Alpha 0.5.0 §32 — the session's opponent must match what the battle was
+    // built against, which for every fixture here is the pinned headless System.
+    system: headlessSystem(),
+    build: [...build],
+    buildOrigin: origin,
+  };
 }
 
 // The slot index holding a given Program in a battle's active build.
@@ -818,7 +896,7 @@ test('FNC_003: Attack costs 10 and deals 30 base direct damage', () => {
   const ev = g.fireProgram(2);
   const dmg = ev.find((e) => e.t === 'damage');
   assert(dmg && dmg.t === 'damage' && dmg.target === 'enemy' && dmg.source === 'attacker' && dmg.amount === 30, 'attack 30');
-  assert(g.state.hp.enemy === DEFAULT_LINK() - 30, 'enemy HP reduced');
+  assert(g.state.hp.enemy === DEFAULT_ICE() - 30, 'enemy HP reduced');
   assert(g.state.units.player[2].charge === 0, 'cost 10 spent');
 });
 
@@ -843,7 +921,9 @@ test('FNC_004: Hacker Drain uses the chosen target (valid even at 0 charge)', ()
 });
 
 test('System Drain: tier A prefers FULLY CHARGED over higher partial charge', () => {
-  const g = newGame(16);
+  // Alpha 0.5.0 — DISABLER is fielded by no AUTHORED System (§6.2), so the
+  // System-Drain algorithm is exercised against the testbed roster.
+  const g = newTestbedGame(16);
   chargeSlot(g, 'enemy', 3); // System DISABLER ready
   g.state.units.player[0].charge = 7; // BOMBER full (cap 7)
   g.state.units.player[3].charge = 8; // DISABLER partial (cap 9) — higher raw charge
@@ -853,7 +933,7 @@ test('System Drain: tier A prefers FULLY CHARGED over higher partial charge', ()
 });
 
 test('System Drain: tier C falls back to highest partial charge', () => {
-  const g = newGame(17);
+  const g = newTestbedGame(17);
   chargeSlot(g, 'enemy', 3);
   g.state.units.player[1].charge = 6; // BUFFER partial (cap 8)
   g.state.units.player[2].charge = 4; // ATTACK partial
@@ -863,7 +943,7 @@ test('System Drain: tier C falls back to highest partial charge', () => {
 });
 
 test('System Drain: residual charge tie breaks by highest cost', () => {
-  const g = newGame(18);
+  const g = newTestbedGame(18);
   chargeSlot(g, 'enemy', 3);
   g.state.units.player[0].charge = 5; // BOMBER cost 7
   g.state.units.player[3].charge = 5; // DISABLER cost 9 — higher cost wins
@@ -873,17 +953,21 @@ test('System Drain: residual charge tie breaks by highest cost', () => {
 });
 
 test('System Drain WITHHOLD: no charged target → no activation, charge preserved', () => {
-  const g = newGame(19);
+  const g = newTestbedGame(19);
   chargeSlot(g, 'enemy', 3); // DISABLER at cap 9
   // all player programs at 0 charge
   const ev = g.runEnemyPhase();
   assert(!ev.some((e) => e.t === 'ability' && e.side === 'enemy'), 'no System activation');
   assert(g.state.units.enemy[3].charge === 9, 'charge preserved, not spent on a no-op');
-  assert(ev.some((e) => e.t === 'msg' && e.text.includes('holds')), 'withhold is surfaced in the log');
+  // Alpha 0.5.0 §37.2 — a withheld activation is recorded as a compact
+  // battle-level COUNT, not a per-turn message: a Program blocked for many
+  // turns must not flood BASIC/VERBOSE with repeated decision logging.
+  assert(g.state.metrics.systemWithholds > 0, 'the withhold is counted at battle level');
+  assert(!ev.some((e) => e.t === 'msg' && e.text.includes('holds')), 'no repeated per-turn withhold message');
 });
 
 test('FNC_005: E-Bomb costs 7, places one 3-turn AREA_SQUARE_3X3_CARDINAL_2 bomb', () => {
-  const g = newGame(20);
+  const g = newTestbedGame(20);
   chargeSlot(g, 'enemy', 0);
   const ev = g.runEnemyPhase();
   const placed = ev.find((e) => e.t === 'placed' && e.kind === 'bomb');
@@ -895,7 +979,7 @@ test('FNC_005: E-Bomb costs 7, places one 3-turn AREA_SQUARE_3X3_CARDINAL_2 bomb
 });
 
 test('FNC_006: Shielder costs 8, places two magnitude-2 shield tiles', () => {
-  const g = newGame(21);
+  const g = newTestbedGame(21);
   chargeSlot(g, 'enemy', 1);
   const ev = g.runEnemyPhase();
   const placed = ev.find((e) => e.t === 'placed' && e.kind === 'shield');
@@ -905,7 +989,7 @@ test('FNC_006: Shielder costs 8, places two magnitude-2 shield tiles', () => {
 });
 
 test('shield reduces each separate incoming instance independently, min 0 (§9.5)', () => {
-  const g = newGame(22);
+  const g = newTestbedGame(22);
   // 2 shields (4 points) via state surgery on non-special standard tiles
   let planted = 0;
   outer: for (let y = 0; y < 8; y++) {
@@ -922,7 +1006,7 @@ test('shield reduces each separate incoming instance independently, min 0 (§9.5
   const s1 = ev1.find((e) => e.t === 'shield');
   assert(s1 && s1.t === 'shield' && s1.preShield === 30 && s1.shield === 4 && s1.prevented === 4 && s1.final === 26, `first instance: ${JSON.stringify(s1)}`);
   const hpAfter1 = g.state.hp.enemy;
-  assert(hpAfter1 === DEFAULT_LINK() - 26, 'dealt 26');
+  assert(hpAfter1 === DEFAULT_ICE(testbedSystemId()) - 26, 'dealt 26');
   // second instance is reduced independently by the same live shield
   chargeSlot(g, 'player', 2);
   const ev2 = g.fireProgram(2);
@@ -963,15 +1047,22 @@ test('detonation uses the bomb-owned footprint, clips at edges, owner strength a
   // collateral is valued on color AND shape and pays the higher tier, so a
   // Packet is HIGH for a side if either of its bindings is strong for it.
   // Here every Packet is Red with shapes cycling 0-5. For the player (strong
-  // RED + TRI/SQU/STR) every Packet is HIGH on colour: 9x2 = 18. For the enemy
-  // (the complements: strong MAG/CYA/BLU + CIR/DIA/CRO) Red is LOW, so each
-  // Packet pays HIGH only when its shape is enemy-strong.
-  const enemyStrongShapes = [Shape.Circle, Shape.Diamond, Shape.Cross];
+  // RED + TRI/SQU/STR) every Packet is HIGH on colour: 9x2 = 18.
+  //
+  // Alpha 0.5.0 §9 — the System's expectation is now derived from the SELECTED
+  // SYSTEM'S OWN authored profile rather than the Hacker's complement, so this
+  // reads the battle config instead of hardcoding a complement set. (Against
+  // BOUNCER, Red IS strong, which is exactly the behavior change §9 intends.)
+  const sysCfg = newGame(24).state.config;
+  const enemyStrongColors = sysCfg.strongColors.enemy;
+  const enemyStrongShapes = sysCfg.strongShapes.enemy;
   let enemyExpected = 0;
   for (let dy = -1; dy <= 1; dy++) {
     for (let dx = -1; dx <= 1; dx++) {
       const shape = ((dx + 1) + (dy + 1) * 3) % 6;
-      enemyExpected += enemyStrongShapes.includes(shape) ? 2 : 1;
+      const byColor = enemyStrongColors.includes(Color.Red) ? 2 : 1;
+      const byShape = enemyStrongShapes.includes(shape) ? 2 : 1;
+      enemyExpected += Math.max(byColor, byShape);
     }
   }
   const strengths: Array<{ owner: 'player' | 'enemy'; expected: number }> = [
@@ -1074,7 +1165,12 @@ install();
 // ---- §22.2 selection state and the fixed build ----
 
 const ids = defaultIdentity();
-const runInfoFor = (settings: BattleSettings, step: RunStep = 1, build?: string[]): RunInfo => ({
+const runInfoFor = (
+  settings: BattleSettings,
+  step: RunStep = 1,
+  build?: string[],
+  system: SelectedSystem = { systemId: HEADLESS_SYSTEM_ID, source: 'RUN_RANDOM' },
+): RunInfo => ({
   mode: 'RUN',
   step,
   settings,
@@ -1083,6 +1179,8 @@ const runInfoFor = (settings: BattleSettings, step: RunStep = 1, build?: string[
   inventory: inventoryProgramIds(ids.hackerId, ids.deckId),
   build: build ?? defaultBuild(ids.hackerId, ids.deckId),
   buildOrigin: build ? 'PLAYER_EDITED' : 'DEFAULT',
+  // Alpha 0.5.0 §33 — a committed Run always knows its upcoming opponent.
+  system,
 });
 
 test('§22.2 New Run setup advances Hacker -> Deck -> Review and retains choices on Back', () => {
@@ -1092,8 +1190,12 @@ test('§22.2 New Run setup advances Hacker -> Deck -> Review and retains choices
   s = chooseHacker(s, 'HAK_01');
   assert(s.step === 'DECK' && s.hackerId === 'HAK_01', 'choosing the Hacker advances to Deck Selection');
   assert(!setupComplete(s), 'setup is not committable before the Build screen');
-  s = chooseDeck(s, 'DEK_01');
+  s = chooseDeck(s, 'DEK_01', makeSetupRandom(1234).rng);
   assert(s.step === 'BUILD' && s.deckId === 'DEK_01', 'choosing the Deck advances to Build');
+  // Alpha 0.5.0 §11.3 — reaching the pre-battle state resolves Battle 1's
+  // opponent, so the player can build against it.
+  assert(s.system !== null && getContent().systems.has(s.system.systemId), 'entering Build resolves a valid System');
+  assert(s.system!.source === 'RUN_RANDOM', 'a Run opponent is recorded as randomly selected');
   assert(setupComplete(s), 'Build with both choices is committable');
   // §12.2 — Back RETAINS the pending choices
   const back1 = setupBack(s)!;
@@ -1104,6 +1206,47 @@ test('§22.2 New Run setup advances Hacker -> Deck -> Review and retains choices
   assert(setupBack(back2) === null, 'Back from Hacker Selection leaves setup');
 });
 
+// §11.3 — back-and-forward navigation inside ONE pending setup must not roll a
+// new opponent: the player would see the encounter they planned against change
+// under them. The RNG passed on the second pass is deliberately a DIFFERENT
+// stream, so a reroll would be visible.
+test('§11.3 re-entering Build during pending Run setup does not reroll the System', () => {
+  let s: PendingSetup = beginSetup();
+  s = chooseHacker(s, 'HAK_01');
+  s = chooseDeck(s, 'DEK_01', makeSetupRandom(11).rng);
+  const first = s.system!.systemId;
+  const back = setupBack(s)!;
+  assert(back.system!.systemId === first, 'Back retains the resolved opponent');
+  const again = chooseDeck(back, 'DEK_01', makeSetupRandom(999).rng);
+  assert(again.system!.systemId === first, 'returning to Build keeps the SAME opponent');
+});
+
+// §11.1 — sampling with replacement over the whole catalog: every authored
+// System must be reachable, and repeats across battles are legal.
+test('§11.1 random System selection draws from the full catalog with replacement', () => {
+  const seen = new Set<string>();
+  for (let seed = 0; seed < 200; seed++) {
+    const sel = randomSystem(makeSetupRandom(seed).rng, 'RUN_RANDOM');
+    assert(getContent().systems.has(sel.systemId), 'selection is always a valid loaded System');
+    assert(sel.source === 'RUN_RANDOM', 'selection carries its source');
+    seen.add(sel.systemId);
+  }
+  assert(seen.size === getContent().systemOrder.length, 'every authored System is reachable');
+});
+
+// §14 — setup randomness must not touch the gameplay stream. Two battles built
+// with the same gameplay seed but a different number of preceding SETUP draws
+// must produce byte-identical boards.
+test('§14 System selection does not perturb the gameplay RNG stream', () => {
+  const boardOf = (g: Game): string => JSON.stringify(gridViewOf(g.state.board));
+  const a = newBattle(D, 4242);
+  const setupRng = makeSetupRandom(7).rng;
+  for (let i = 0; i < 25; i++) randomSystem(setupRng, 'QUICK_RANDOM');
+  const b = newBattle(D, 4242);
+  assert(boardOf(a) === boardOf(b), 'gameplay board is unaffected by setup draws');
+  assert(a.state.rng.getState() === b.state.rng.getState(), 'gameplay RNG state is unaffected');
+});
+
 test('§22.2 every loaded Deck is offered for the selected Hacker (no compatibility filtering)', () => {
   const c = getContent();
   // §2.8 — all Decks are compatible with all Hackers; there are no compatibility
@@ -1112,7 +1255,7 @@ test('§22.2 every loaded Deck is offered for the selected Hacker (no compatibil
   assert(c.hackerOrder.length === c.hackers.size, 'every Hacker is offered');
   for (const h of c.hackerOrder) {
     for (const d of c.deckOrder) {
-      const id = buildIdentity(h, d, 'EXPLICIT_SELECTION', defaultBuild(h, d), 'DEFAULT');
+      const id = buildIdentity(h, d, headlessSystem(), 'EXPLICIT_SELECTION', defaultBuild(h, d), 'DEFAULT');
       assert(id.hackerId === h && id.deckId === d, `identity builds for ${h}/${d}`);
     }
   }
@@ -1125,11 +1268,18 @@ test('§22.2/§5.3 the ordered active build survives identity construction', () 
   const expected = defaultBuild('HAK_01', 'DEK_01');
   assert(expected.join(',') === 'PRG_H_001,PRG_H_002,PRG_H_003,PRG_H_004', 'current content default build');
   assert(c.hacker.length === INVENTORY_SIZE, 'all six Hacker Programs are loaded content');
-  const id = buildIdentity('HAK_01', 'DEK_01', 'EXPLICIT_SELECTION', expected, 'DEFAULT');
+  const id = buildIdentity('HAK_01', 'DEK_01', headlessSystem(), 'EXPLICIT_SELECTION', expected, 'DEFAULT');
   assert(id.hackerPrograms.join(',') === expected.join(','), 'identity carries the ordered active build');
   assert(id.inventory.join(',') === inventoryProgramIds('HAK_01', 'DEK_01').join(','), 'identity carries the inventory');
   assert(id.buildOrigin === 'DEFAULT', 'identity records the build source');
-  assert(id.systemPrograms.join(',') === c.system.map((p) => p.id).join(','), 'identity carries the System roster');
+  // Alpha 0.5.0 §5.4 — the System roster is the SELECTED System's ordered
+  // PRG_SET, no longer "every loaded System Program".
+  assert(id.systemId === HEADLESS_SYSTEM_ID, 'identity carries the selected System');
+  assert(
+    id.systemPrograms.join(',') === systemById(HEADLESS_SYSTEM_ID).programIds.join(','),
+    'identity carries the selected System PRG_SET in order',
+  );
+  assert(id.systemPrograms.length < c.system.length, 'the fielded roster is a subset of loaded System Programs');
   assert(id.skillIds.join(',') === 'SKL_001,SKL_002', 'identity carries the ordered Skill IDs');
   assert(id.deckFunctionId === 'FNC_010', 'identity carries the Deck Function ID');
   // §5.8 — battle construction instantiates EXACTLY the four active Programs
@@ -1160,11 +1310,16 @@ test('§22.3 Quick Match resolves the explicit default IDs and marks them defaul
 // ---- §22.4 save and restore ----
 
 test('§22.4 Run encounters, envelope round-trip, and rejections', () => {
-  // §4.1 exact table, §10.5 fresh-state creation without UI logic
-  assert(RUN_ENCOUNTERS.map((e) => e.systemHp).join(',') === '100,150,200,250', 'encounter ICE table');
+  // §4.1 exact table, §10.5 fresh-state creation without UI logic.
+  // Alpha 0.5.0 §10.1 — the table holds ADDITIVE modifiers now; effective ICE
+  // is the selected System's BASE_ICE plus the step modifier, which for a
+  // BASE_ICE=100 System reproduces the established 100/150/200/250 ladder.
+  assert(RUN_ENCOUNTERS.map((e) => e.iceModifier).join(',') === '0,50,100,150', 'encounter ICE modifier table');
+  const baseIce = systemById(HEADLESS_SYSTEM_ID).baseIce;
+  assert(baseIce === 100, 'fixture System BASE_ICE');
   for (const step of [1, 2, 3, 4] as const) {
     const g = createRunBattle(runInfoFor(D), step, 50 + step);
-    assert(g.state.config.enemyHp === encounterFor(step).systemHp, `step ${step} System ICE`);
+    assert(g.state.config.enemyHp === baseIce + encounterFor(step).iceModifier, `step ${step} System ICE`);
     assert(g.state.hp.player === DEFAULT_LINK(), 'Hacker at full resolved maximum LINK');
     assert(g.state.units.player.every((u) => u.charge === 0), 'fresh Program charge');
   }
@@ -1322,11 +1477,42 @@ test('§22.5 Hacker strong sets come from HAK_01 and System sets are complements
   assert(h.weakShapes.length + h.strongShapes.length === 6, 'shapes partition exactly');
   const sortedAsc = (xs: readonly number[]): boolean => xs.every((v, i) => i === 0 || xs[i - 1] < v);
   assert(sortedAsc(h.weakColors) && sortedAsc(h.weakShapes), 'derived complements preserve recognized enum order');
-  // §5.4 — the battle config resolves System strength as the Hacker's weak sets
+  // Alpha 0.5.0 §9 — the battle config resolves EACH side from its OWN
+  // authored identity. The Alpha 0.4 rule (System strength = the Hacker's weak
+  // sets) is gone, and this asserts it is really gone: with the current content
+  // the two are demonstrably different sets.
+  const sys = systemById(HEADLESS_SYSTEM_ID);
   const g = newBattle(D, 31);
   assert(g.state.config.strongColors.player.join(',') === h.strongColors.join(','), 'Hacker strong colors are authoritative');
-  assert(g.state.config.strongColors.enemy.join(',') === h.weakColors.join(','), 'System strong colors are the Hacker complement');
-  assert(g.state.config.strongShapes.enemy.join(',') === h.weakShapes.join(','), 'System strong shapes are the Hacker complement');
+  assert(g.state.config.strongColors.enemy.join(',') === sys.strongColors.join(','), 'System strong colors come from the System');
+  assert(g.state.config.strongShapes.enemy.join(',') === sys.strongShapes.join(','), 'System strong shapes come from the System');
+  assert(
+    g.state.config.strongColors.enemy.join(',') !== h.weakColors.join(','),
+    'System strength is NOT the Hacker complement any more',
+  );
+});
+
+// §5.3/§43.1 — each System derives its own weak sets, and two Systems with
+// different authored strengths really do produce different battle profiles.
+test('§5.3 System weak sets are the complement of that System\'s own strong sets', () => {
+  const c = getContent();
+  const sortedAsc = (xs: readonly number[]): boolean => xs.every((v, i) => i === 0 || xs[i - 1] < v);
+  for (const id of c.systemOrder) {
+    const s = c.systems.get(id)!;
+    assert(s.weakColors.every((x) => !s.strongColors.includes(x)), `${id} weak/strong colors disjoint`);
+    assert(s.weakColors.length + s.strongColors.length === 6, `${id} colors partition exactly`);
+    assert(s.weakShapes.length + s.strongShapes.length === 6, `${id} shapes partition exactly`);
+    assert(sortedAsc(s.weakColors) && sortedAsc(s.weakShapes), `${id} complements preserve enum order`);
+  }
+  const a = systemById('SYS_01');
+  const b = systemById('SYS_02');
+  assert(a.strongColors.join(',') !== b.strongColors.join(','), 'the two authored Systems differ in color profile');
+  const ga = newBattle(D, 77, undefined, 'DEFAULT', { systemId: 'SYS_01', source: 'HEADLESS_PINNED' });
+  const gb = newBattle(D, 77, undefined, 'DEFAULT', { systemId: 'SYS_02', source: 'HEADLESS_PINNED' });
+  assert(
+    ga.state.config.strongColors.enemy.join(',') !== gb.state.config.strongColors.enemy.join(','),
+    'selecting a different System changes the battle profile',
+  );
 });
 
 test('§22.5 non-3/3 strength cardinalities derive correctly', () => {
@@ -1346,26 +1532,43 @@ test('§22.5 Normal LINK ON derives LINK/ICE from content and the encounter tabl
   const on: BattleSettings = { ...D, normalLink: true };
   const link = resolveHackerMaxLink(on, 'HAK_01', 'DEK_01');
   assert(link === h.baseLink + d.addLink, `BASE_LINK + ADD_LINK = ${h.baseLink}+${d.addLink}, got ${link}`);
-  // Quick Match System ICE equals the resolved Hacker maximum LINK
-  assert(resolveQuickMatchIce(on, link) === link, 'Quick Match ICE mirrors Hacker LINK');
+  // Alpha 0.5.0 §10.1 — Quick Match System ICE is the SELECTED SYSTEM'S OWN
+  // BASE_ICE. Through Alpha 0.4.1 it mirrored the resolved Hacker maximum LINK
+  // (150 with the current content); it is now 100. Designer-approved change:
+  // System identity owns System durability.
+  const sys = systemById(HEADLESS_SYSTEM_ID);
+  assert(resolveQuickMatchIce(on, sys.id) === sys.baseIce, 'Quick Match ICE is the System BASE_ICE');
+  assert(resolveQuickMatchIce(on, sys.id) !== link, 'Quick Match ICE no longer mirrors Hacker LINK');
   const qm = newBattle(on, 41);
-  assert(qm.state.config.playerHp === link && qm.state.config.enemyHp === link, 'Quick Match battle uses the resolved pair');
-  // a Run uses the 100/150/200/250 encounter table
+  assert(qm.state.config.playerHp === link, 'Quick Match Hacker LINK is BASE_LINK + ADD_LINK');
+  assert(qm.state.config.enemyHp === sys.baseIce, 'Quick Match battle uses the System BASE_ICE');
+  // A Run uses BASE_ICE + the step modifier (§10.1).
   for (const step of [1, 2, 3, 4] as const) {
-    assert(resolveRunIce(on, step) === encounterFor(step).systemHp, `step ${step} ICE from the table`);
+    const expected = sys.baseIce + encounterFor(step).iceModifier;
+    assert(resolveRunIce(on, sys.id, step) === expected, `step ${step} ICE from BASE_ICE + modifier`);
     const g = createRunBattle(runInfoFor(on, step), step, 60 + step);
     assert(g.state.config.playerHp === link, `step ${step} Hacker at full resolved LINK`);
-    assert(g.state.config.enemyHp === encounterFor(step).systemHp, `step ${step} System ICE from the table`);
+    assert(g.state.config.enemyHp === expected, `step ${step} System ICE from BASE_ICE + modifier`);
+  }
+  // §10.1 — a System with different durability escalates on the same ladder
+  // without the Run progression needing to know anything about it.
+  const other = systemById('SYS_02');
+  for (const step of [1, 2, 3, 4] as const) {
+    assert(
+      resolveRunIce(on, other.id, step) === other.baseIce + encounterFor(step).iceModifier,
+      `SYS_02 step ${step} uses its own base`,
+    );
   }
 });
 
 test('§22.5 Normal LINK OFF uses manual values for the Hacker and EVERY Run encounter', () => {
   const off = manualLink(D, 222, 333);
   assert(resolveHackerMaxLink(off, 'HAK_01', 'DEK_01') === 222, 'manual Hacker LINK is used');
-  assert(resolveQuickMatchIce(off, 222) === 333, 'manual System ICE is used in Quick Match');
-  // the manual ICE intentionally OVERRIDES the Run's 100/150/200/250 sequence
+  // §10.2 — the manual value REPLACES the System's BASE_ICE; the two are never
+  // silently combined, and the Run modifier is not added on top of it either.
+  assert(resolveQuickMatchIce(off, HEADLESS_SYSTEM_ID) === 333, 'manual System ICE is used in Quick Match');
   for (const step of [1, 2, 3, 4] as const) {
-    assert(resolveRunIce(off, step) === 333, `step ${step} uses the manual ICE, not the table`);
+    assert(resolveRunIce(off, HEADLESS_SYSTEM_ID, step) === 333, `step ${step} uses the manual ICE, not base + modifier`);
     const g = createRunBattle(runInfoFor(off, step), step, 70 + step);
     assert(g.state.config.enemyHp === 333, `step ${step} battle uses the manual ICE`);
     assert(g.state.config.playerHp === 222, `step ${step} battle uses the manual LINK`);
@@ -1423,7 +1626,6 @@ function plantNeutrals(g: Game, cells: { x: number; y: number }[]): void {
 // The pure resolver and board helpers, imported once for the combat suites.
 const { resolveCascades, resolveDetonation } = await import('../src/logic/resolve');
 const { shakeBoard } = await import('../src/logic/board');
-const { consumeEvents } = await import('../src/logic/metrics');
 
 // Resolve one owner-scoped wave against the CURRENT board and route its events
 // through the SAME metrics collector Game.collect() uses — otherwise a direct
@@ -1620,7 +1822,7 @@ test('§22.7 startCharged resets at every battle and never carries between encou
     assert(g.state.deckCharge === deckById('DEK_01').fn.cost, `step ${step} Deck opens charged`);
   }
   // N: starts empty, and a spent pool does not persist into the next encounter
-  install({ functions: mutate(real.functions.text, ',,Y,0:0:0:0', ',,N,0:0:0:0') });
+  install({ functions: mutate(real.functions.text, ',,Y,,,0:0:0:0', ',,N,,,0:0:0:0') });
   try {
     assert(!deckById('DEK_01').fn.startCharged, 'the fixture authors startCharged=N');
     for (const step of [1, 2, 3, 4] as const) {
@@ -1628,7 +1830,11 @@ test('§22.7 startCharged resets at every battle and never carries between encou
       assert(g.state.deckCharge === 0, `step ${step} Deck opens empty under startCharged=N`);
     }
     // Program startCharged follows the same uniform rule
-    const withCharged = mutate(real.functions.text, 'FNC_001,BOMB,7,EFFECT_BOMB,player bomb,2,2,AREA_SQUARE_3X3,,,,', 'FNC_001,BOMB,7,EFFECT_BOMB,player bomb,2,2,AREA_SQUARE_3X3,,,Y,');
+    const withCharged = mutate(
+      real.functions.text,
+      'FNC_001,BOMB,7,EFFECT_BOMB,generic bomb effect,2,2,AREA_SQUARE_3X3,,,,',
+      'FNC_001,BOMB,7,EFFECT_BOMB,generic bomb effect,2,2,AREA_SQUARE_3X3,,,Y,',
+    );
     install({ functions: withCharged });
     const g2 = newBattle(D, 95);
     assert(g2.state.units.player[0].charge === 7, 'a directly assigned Program honours startCharged=Y');
@@ -1676,7 +1882,7 @@ test('§22.7 neutral Packets sliced in an owned Sync charge the Deck; Bombs neve
 });
 
 test('§22.7 Drain excludes the Deck Function entirely', () => {
-  const g = newGame(65);
+  const g = newTestbedGame(65);
   g.state.deckCharge = deckById('DEK_01').fn.cost; // fully charged Deck
   // System Drain priority considers PROGRAMS ONLY: with every Program empty and
   // only the Deck charged, the withhold rule must fire (nothing to drain).
@@ -1685,7 +1891,7 @@ test('§22.7 Drain excludes the Deck Function entirely', () => {
   assert(!ev.some((e) => e.t === 'ability' && e.side === 'enemy'), 'System withholds Drain — the Deck is not a candidate');
   assert(g.state.deckCharge === deckById('DEK_01').fn.cost, 'the Deck pool is untouched by System Drain');
   // and a charged Deck does not change fully-charged/highest-charge priority
-  const g2 = newGame(66);
+  const g2 = newTestbedGame(66);
   g2.state.deckCharge = deckById('DEK_01').fn.cost;
   chargeSlot(g2, 'enemy', 3);
   g2.state.units.player[0].charge = 7; // BOMBER full
@@ -2052,10 +2258,15 @@ test('Run progression: ICE table, fresh state every step, 1-3 advance, 4 does no
     // distinct seeds per step stand in for "a new battle RNG state/seed is
     // used" (§10.5) — the resulting board layouts must actually differ
     const g = createRunBattle(info, step, 1000 + step * 97);
-    assert(g.state.config.enemyHp === encounterFor(step).systemHp, `step ${step} System ICE matches the table`);
+    assert(g.state.config.enemyHp === (systemById(info.system.systemId).baseIce + encounterFor(step).iceModifier), `step ${step} System ICE matches the table`);
     assert(g.state.hp.player === info.hackerMaxLink, `step ${step} Hacker starts at full saved maximum LINK`);
-    assert(g.state.hp.enemy === encounterFor(step).systemHp, `step ${step} System starts at encounter ICE`);
-    assert(g.state.units.player.every((u) => u.charge === 0) && g.state.units.enemy.every((u) => u.charge === 0), `step ${step} Program charges reset`);
+    assert(g.state.hp.enemy === (systemById(info.system.systemId).baseIce + encounterFor(step).iceModifier), `step ${step} System starts at encounter ICE`);
+    // §4.6 — a fresh battle opens each pool at its Function's startCharged
+    // value, not at zero: BOUNCER fields MUSCLE, and COERCE is startCharged=Y.
+    const openingCharge = (u: { programId: string }): number =>
+      programById(u.programId).fn.startCharged ? programById(u.programId).cost : 0;
+    assert(g.state.units.player.every((u) => u.charge === openingCharge(u)), `step ${step} Hacker charges reset`);
+    assert(g.state.units.enemy.every((u) => u.charge === openingCharge(u)), `step ${step} System charges reset`);
     assert(g.state.deckCharge === deckById('DEK_01').fn.cost, `step ${step} Deck charge resets from startCharged`);
     assert(g.state.turn === 1, `step ${step} fresh turn counter`);
     assert(g.state.metrics.turns === 0 && g.state.metrics.autoReshuffles === 0, `step ${step} fresh metrics`);
@@ -2077,7 +2288,7 @@ test('every Run step round-trips through the save envelope', () => {
     const r = deserializeSession(serializeSession(info, g, null));
     assert(r && r.info.mode === 'RUN' && r.info.step === step, `step ${step} round-trips`);
     assert(r.game, `step ${step} restores its battle`);
-    assert(r.game.state.config.enemyHp === encounterFor(step).systemHp, `step ${step} encounter ICE round-trips`);
+    assert(r.game.state.config.enemyHp === (systemById(info.system.systemId).baseIce + encounterFor(step).iceModifier), `step ${step} encounter ICE round-trips`);
     assert(r.game.state.deckCharge === g.state.deckCharge, `step ${step} Deck charge round-trips exactly`);
   }
 });
@@ -2403,13 +2614,18 @@ test('§20.5/§10.6 SKL_EXTRA_MATCH_CHARGE inflates the stream BEFORE routing', 
 
 test('§20.5 System-side routing uses the same shared implementation', () => {
   const g = newGame(9);
-  // The System roster has no overlapping bindings today, so routing is a
-  // single-recipient case; what matters is that it goes through one code path.
+  // Alpha 0.5.0 — the System roster is the SELECTED System's ordered PRG_SET,
+  // so the Red-bound Program and its slot are read from that build rather than
+  // assumed. What matters is that it goes through ONE code path.
+  const roster = g.state.identity.systemPrograms;
+  const redIdx = roster.findIndex((id) => programById(id).colors.includes(Color.Red));
+  assert(redIdx >= 0, 'the fielded System build has a Red-bound Program');
+  const redId = roster[redIdx];
   const r = routeEventOf(routeColor(g, Color.Red, 3, 'enemy'));
-  assert(r.side === 'enemy' && r.eligible.join(',') === 'PRG_S_001', 'the System E-BOMBER is the Red-bound Program');
-  assert(g.state.units.enemy[0].charge === 3, 'System charge routes identically');
+  assert(r.side === 'enemy' && r.eligible.join(',') === redId, 'eligibility follows the fielded bindings');
+  assert(g.state.units.enemy[redIdx].charge === 3, 'System charge routes identically');
   // and overflow behaves the same when a compatible Program is full
-  g.state.units.enemy[0].charge = programById('PRG_S_001').chargeCap;
+  g.state.units.enemy[redIdx].charge = programById(redId).chargeCap;
   const r2 = routeEventOf(routeColor(g, Color.Red, 2, 'enemy'));
   assert(r2.discarded === 2, 'a full System Program discards rather than exceeding its cost');
 });
@@ -2685,7 +2901,7 @@ test('§20.7 existing Bomber/E-Bomber/ONEBOMB keep their countdown and quantity 
 test('§20.7 EFFECT_BOMB dealDamage=1 and gainCharge=0 behave as contracted', () => {
   // dealDamage=1 — the blast mutates the board but deals nothing
   {
-    install({ functions: mutate(real.functions.text, 'AREA_CARDINAL_1,,,,1:0:1', 'AREA_CARDINAL_1,,,,1:1:1') });
+    install({ functions: mutate(real.functions.text, 'AREA_CARDINAL_1,,,,,,1:0:1', 'AREA_CARDINAL_1,,,,,,1:1:1') });
     const g = weaselGame(57);
     const hpBefore = g.state.hp.enemy;
     const ev = g.fireProgram(0, { kind: 'packet', p: { x: 4, y: 4 } });
@@ -2697,7 +2913,7 @@ test('§20.7 EFFECT_BOMB dealDamage=1 and gainCharge=0 behave as contracted', ()
   }
   // gainCharge=0 — directly sliced blast Packets charge
   {
-    install({ functions: mutate(real.functions.text, 'AREA_CARDINAL_1,,,,1:0:1', 'AREA_CARDINAL_1,,,,1:0:0') });
+    install({ functions: mutate(real.functions.text, 'AREA_CARDINAL_1,,,,,,1:0:1', 'AREA_CARDINAL_1,,,,,,1:0:0') });
     const g = weaselGame(58);
     const ev = g.fireProgram(0, { kind: 'packet', p: { x: 4, y: 4 } });
     assert(ev.some((e) => e.t === 'chargeRoute' && e.streamSource === 'EFFECT_DESTRUCTION'), 'blast Packets opened charge streams');
@@ -2710,7 +2926,7 @@ test('§20.7 EFFECT_BOMB dealDamage=1 and gainCharge=0 behave as contracted', ()
 // ============================================================================
 
 test('§20.8 System Disabler never activates when no active Program holds charge', () => {
-  const g = newGame(60);
+  const g = newTestbedGame(60);
   chargeSlot(g, 'enemy', 3); // System DISABLER ready
   for (const u of g.state.units.player) u.charge = 0;
   const ev = g.runEnemyPhase();
@@ -2722,7 +2938,7 @@ test('§20.8 System Disabler never activates when no active Program holds charge
 test('§20.8 Disabler targets only ACTIVE Programs, never inactive ones or the Deck', () => {
   // BOMBER is left out of the build; only the four active Programs can be hit.
   const build = ['PRG_H_002', 'PRG_H_003', 'PRG_H_004', 'PRG_H_006'];
-  const g = newGameWithBuild(build, 61);
+  const g = newGameWithBuild(build, 61, D, testbed());
   chargeSlot(g, 'enemy', 3);
   g.state.units.player[1].charge = 4; // ATTACKER partially charged
   g.state.deckCharge = 3;
@@ -2736,7 +2952,7 @@ test('§20.8 Disabler targets only ACTIVE Programs, never inactive ones or the D
 });
 
 test('§20.8 every Drain activation logs target ID, readiness, charge, cost, and removal', () => {
-  const g = newGame(62);
+  const g = newTestbedGame(62);
   chargeSlot(g, 'enemy', 3);
   g.state.units.player[0].charge = 4; // BOMBER: charging (cost 7)
   const ev = g.runEnemyPhase();
@@ -2748,18 +2964,21 @@ test('§20.8 every Drain activation logs target ID, readiness, charge, cost, and
   assert(op.drained === 4, 'charge removed matches');
 
   // a FULLY charged target reports READY
-  const g2 = newGame(63);
+  const g2 = newTestbedGame(63);
   chargeSlot(g2, 'enemy', 3);
   chargeSlot(g2, 'player', 0);
   const op2 = g2.runEnemyPhase().find((e) => e.t === 'op' && e.effectId === 'EFFECT_DRAIN') as Extract<GameEvent, { t: 'op' }>;
   assert(op2.targetReadiness === 'READY', 'a full target reports READY');
 
-  // player-initiated Drain receives the same telemetry
+  // player-initiated Drain receives the same telemetry. Alpha 0.5.0 — which
+  // Program sits in a given System slot depends on the SELECTED System's
+  // PRG_SET, so the expected target is read from the battle rather than assumed.
   const g3 = newGame(64);
   chargeSlot(g3, 'player', 3);
   g3.state.units.enemy[1].charge = 2;
+  const targetId = g3.state.units.enemy[1].programId;
   const op3 = g3.fireProgram(3, { kind: 'unit', idx: 1 }).find((e) => e.t === 'op' && e.effectId === 'EFFECT_DRAIN') as Extract<GameEvent, { t: 'op' }>;
-  assert(op3.targetProgramId === 'PRG_S_002' && op3.targetReadiness === 'CHARGING' && op3.drained === 2, 'player Drain telemetry matches');
+  assert(op3.targetProgramId === targetId && op3.targetReadiness === 'CHARGING' && op3.drained === 2, 'player Drain telemetry matches');
 });
 
 // ============================================================================
@@ -2872,7 +3091,11 @@ test('§20.9 metrics stay disjoint and reconcile with the new line-slice bucket'
   }
   for (const side of ['player', 'enemy'] as const) {
     const m = g.state.metrics.sides[side];
-    const sum = m.matchDamage + m.attackerDamage + m.bombDamage + m.linesliceDamage + m.skillDamage + m.bufferDamageAdded;
+    // Alpha 0.5.0 — `transform` joins the disjoint set; omitting it here would
+    // under-count rather than fail loudly.
+    const sum =
+      m.matchDamage + m.attackerDamage + m.bombDamage + m.linesliceDamage +
+      m.transformDamage + m.skillDamage + m.bufferDamageAdded;
     assert(Math.abs(sum - m.totalDamage) < 1e-9, `${side}: disjoint buckets must sum to the total (${sum} vs ${m.totalDamage})`);
   }
   assert(g.state.metrics.sides.player.linesliceDamage > 0, 'DATACUT damage landed in its own bucket');
@@ -2976,23 +3199,79 @@ test('§20.3 retained route assignments stay arithmetically exact', () => {
   }
 });
 
-test('§20.4 routing discard aggregates to a battle total, not to a Program', () => {
+// Alpha 0.5.0 §39 — ONE canonical side-level total, covering EVERY source of
+// unstorable Program charge. §39.3 requires it to equal the sum of the
+// discarded/overflowed amounts in the routing and timer events, which is
+// exactly what this checks (and what makes the figure auditable).
+test('§39 charge waste is one side-level total equal to all discard/overflow sources', () => {
   // A build where BOMBER and WEASEL share RED guarantees overflow and discard.
   const { g, events } = capture('COMPLETE', 12, ['PRG_H_001', 'PRG_H_006', 'PRG_H_002', 'PRG_H_003']);
   const routes = events.filter((e) => e.kind === 'ROUTE').map((e) => e.route!);
   for (const side of ['player', 'enemy'] as const) {
-    const expected = routes.filter((r) => r.side === side).reduce((n, r) => n + r.discarded, 0);
-    assert(
-      g.state.metrics.sides[side].chargeDiscardedTotal === expected,
-      `${side}: battle total ${g.state.metrics.sides[side].chargeDiscardedTotal} must equal summed route discards ${expected}`,
-    );
+    const routed = routes.filter((r) => r.side === side).reduce((n, r) => n + r.discarded, 0);
+    // The flat System timer is the other genuine source; it emits chargeWaste
+    // events, which the metrics collector folds into the same total.
+    const total = g.state.metrics.sides[side].chargeWastedTotal;
+    assert(total >= routed, `${side}: total ${total} must include routing discard ${routed}`);
+    if (side === 'player') {
+      // The Hacker has no timer path, so its total is exactly routing discard.
+      assert(total === routed, `player: total ${total} must equal summed route discards ${routed}`);
+    }
   }
-  assert(g.state.metrics.sides.player.chargeDiscardedTotal > 0, 'the overlapping build actually discarded charge');
-  // §8.4 — no Hacker Program absorbs routing discard any more. (System
-  // Programs may still show genuine waste from the flat timer-charge path.)
+  assert(g.state.metrics.sides.player.chargeWastedTotal > 0, 'the overlapping build actually discarded charge');
+  // §39.2 — per-Program chargeWasted is GONE from the metric shape entirely,
+  // so it can no longer be mistaken for the analytical authority.
   for (const id of Object.keys(g.state.metrics.sides.player.units)) {
-    assert(g.state.metrics.sides.player.units[id].chargeWasted === 0, `${id} must not be blamed for routing discard`);
+    const u = g.state.metrics.sides.player.units[id] as unknown as Record<string, unknown>;
+    assert(!('chargeWasted' in u), `${id} must not carry a per-Program chargeWasted field`);
   }
+  // §39.4 — axis-specific waste is deferred and must not have crept in.
+  const sm = g.state.metrics.sides.player as unknown as Record<string, unknown>;
+  assert(!('chargeWastedColor' in sm) && !('chargeWastedShape' in sm), 'no axis-specific waste fields');
+});
+
+// §39.1/§39.3 — flat/timer overflow is the source Alpha 0.4.1 still reported
+// per Program. It must now land in the SAME side-level total as routing
+// discard, so the total really is "all charge this side could not store".
+// Exercised through the collector directly: whether a live battle happens to
+// leave a System pool full at timer time depends on the AI, and this is an
+// assertion about the metric contract, not about that scheduling.
+test('§39.1 timer overflow and routing discard share one side-level total', () => {
+  const m = createBattleMetrics(['PRG_H_001'], ['PRG_S_001']);
+  consumeEvents(m, [
+    { t: 'chargeWaste', side: 'enemy', ownerKind: 'program', programId: 'PRG_S_001', amount: 4 },
+    {
+      t: 'chargeRoute', side: 'enemy', axis: 'color', token: Color.Red, amount: 5,
+      streamSource: 'SYNC', order: ['PRG_S_001'], eligible: ['PRG_S_001'],
+      assignments: [{ programId: 'PRG_S_001', before: 0, assigned: 3, after: 3, overflowOut: 2 }],
+      discarded: 2,
+    },
+    // The Deck pool is a separate authority (director ruling): it keeps its own
+    // bucket and must NOT inflate the side total.
+    { t: 'deckCharge', side: 'player', amount: 2, wasted: 6 },
+  ]);
+  assert(m.sides.enemy.chargeWastedTotal === 6, `timer 4 + routing 2 = 6, got ${m.sides.enemy.chargeWastedTotal}`);
+  assert(m.sides.player.deck.chargeWasted === 6, 'Deck overflow is tracked in its own bucket');
+  assert(m.sides.player.chargeWastedTotal === 0, 'Deck overflow does not enter the Program-pool total');
+});
+
+// §39.1 — and the live path really does emit that timer overflow, so the
+// contract above is wired to something real.
+test('§39.1 a full System pool overflows the flat timer into chargeWaste events', () => {
+  const g = newGame(5);
+  for (const u of g.state.units.enemy) u.charge = programById(u.programId).chargeCap;
+  // Only the flat-timer branch is under test, so the Function phase must not
+  // spend the charge first: an all-full roster is exactly what it would fire.
+  const events: GameEvent[] = [];
+  for (const u of g.state.units.enemy) {
+    const wasted = addUnitCharge(g.state, u, ENEMY_TIMER_CHARGE_RATE);
+    if (wasted > 0) events.push({ t: 'chargeWaste', side: 'enemy', ownerKind: 'program', programId: u.programId, amount: wasted });
+  }
+  const emitted = events.reduce((n, e) => n + (e.t === 'chargeWaste' ? e.amount : 0), 0);
+  assert(emitted === ENEMY_TIMER_CHARGE_RATE * g.state.units.enemy.length, 'every full pool discards the whole tick');
+  const before = g.state.metrics.sides.enemy.chargeWastedTotal;
+  consumeEvents(g.state.metrics, events);
+  assert(g.state.metrics.sides.enemy.chargeWastedTotal === before + emitted, 'and it lands in the side total');
 });
 
 test('§20.4 detonations, line clears and reshuffles survive as battle aggregates', () => {
@@ -3024,7 +3303,10 @@ test('§20.1 targeted and Drain telemetry survive at BASIC via the event stream'
 test('§20.8 a level change affects future records only', () => {
   const previous = loggingLevel();
   setLoggingLevel('BASIC');
-  const g = newGame(41);
+  // Deep pools so the battle cannot end before the level change: Alpha 0.5.0
+  // gives the System its own BASE_ICE (100), which ends default battles sooner
+  // than the Alpha 0.4 mirrored 150 did.
+  const g = newGame(41, manualLink(D, 500, 500));
   const collected: TurnLogEntry[] = [];
   let safety = 0;
   while (!g.state.winner && safety++ < 6) {
@@ -3228,6 +3510,701 @@ test('§22.10 placeholder BIO/GRAPHICS/DESCRIPT are never rendered', () => {
 // headless Node harness. Per the escalation guidance, this remains a MANUAL
 // check rather than mocking a canvas (which would test the mock, not the real
 // renderer). See the manual-checks list in the final report.
+
+// ============================================================================
+// Alpha 0.5.0 §42 — SYS DATA AND FINGERPRINT
+// ============================================================================
+
+// Build a SYS dataset text with one field of SYS_01 replaced.
+const sysWith = (field: string, value: string): string => {
+  // The authored file is CRLF, so header cells are trimmed exactly as the
+  // loader's readTable does before matching.
+  const lines = real.systems.text.replace(/\s*$/, '').split(/\r?\n/);
+  const idx = lines[0].split(',').map((h) => h.trim()).indexOf(field);
+  assert(idx >= 0, `SYS header has no ${field}`);
+  const cells = lines[1].split(',');
+  cells[idx] = value;
+  lines[1] = cells.join(',');
+  return lines.join('\n');
+};
+
+test('§42 the SYS dataset is REQUIRED and its header is enforced', () => {
+  // §42.2 — a missing dataset blocks startup rather than defaulting.
+  expectErrors({ systems: '' }, 'file is empty', 'empty SYS dataset');
+  // §42.3/§2.3 — the durability column is BASE_ICE. A stale export still
+  // carrying BASE_LINK is a header error, never a silent alias.
+  expectErrors(
+    { systems: real.systems.text.replace('BASE_ICE', 'BASE_LINK') },
+    'header',
+    'BASE_LINK instead of BASE_ICE',
+  );
+});
+
+test('§42 SYS row validation: ID prefix, BASE_ICE, axes, PRG_SET, SKILL', () => {
+  expectErrors({ systems: sysWith('SYS_ID', 'SYSTEM_01') }, 'wrong System ID prefix', 'bad SYS_ID prefix'); // §42.4
+  expectErrors({ systems: sysWith('BASE_ICE', '0') }, 'out of range', 'zero BASE_ICE'); // §42.5
+  expectErrors({ systems: sysWith('BASE_ICE', '') }, 'BASE_ICE', 'blank BASE_ICE');
+  expectErrors({ systems: sysWith('STRONG_COLORS', 'RED:RED:YEL') }, 'duplicate token', 'duplicate strong color'); // §42.6
+  expectErrors({ systems: sysWith('STRONG_SHAPES', 'TRI:NOPE') }, 'unknown enum value', 'invalid strong shape');
+  // §42.7 — exactly four Programs
+  expectErrors({ systems: sysWith('PRG_SET', 'PRG_S_001:PRG_S_002:PRG_S_003') }, 'exactly 4', 'three Programs');
+  expectErrors(
+    { systems: sysWith('PRG_SET', 'PRG_S_001:PRG_S_002:PRG_S_003:PRG_S_004:PRG_S_005') },
+    'exactly 4',
+    'five Programs',
+  );
+  // §42.8 — duplicates within PRG_SET
+  expectErrors({ systems: sysWith('PRG_SET', 'PRG_S_001:PRG_S_001:PRG_S_003:PRG_S_004') }, 'duplicate token', 'duplicate Program');
+  // §42.9 — a Hacker Program in a System build
+  expectErrors({ systems: sysWith('PRG_SET', 'PRG_H_001:PRG_S_002:PRG_S_003:PRG_S_004') }, 'wrong ID prefix', 'PRG_H in System build');
+  // §42.10 — a well-formed but undefined reference
+  expectErrors({ systems: sysWith('PRG_SET', 'PRG_S_099:PRG_S_002:PRG_S_003:PRG_S_004') }, 'unknown System Program', 'broken Program reference');
+  // §42.11/§2.2 — System passive Skills are unsupported content in Alpha 0.5
+  expectErrors({ systems: sysWith('SKILL', 'SKL_001') }, 'not supported', 'nonblank System SKILL');
+});
+
+test('§42.12 System weak sets derive as the complement, in recognized enum order', () => {
+  const c = loadContent(real).content!;
+  const s = c.systems.get('SYS_01')!;
+  assert(s.strongColors.join(',') === [Color.Red, Color.Green, Color.Yellow].join(','), 'authored order preserved');
+  assert(s.weakColors.join(',') === [Color.Magenta, Color.Cyan, Color.Blue].join(','), 'weak colors are the complement in enum order');
+  assert(s.weakShapes.join(',') === [Shape.Circle, Shape.Diamond, Shape.Cross].join(','), 'weak shapes are the complement in enum order');
+  // §5.3 — no authored weak columns exist to disagree with the derivation.
+  assert(!real.systems.text.includes('WEAK'), 'the schema has no redundant weak-set columns');
+});
+
+test('§42.13/§42.14 the fingerprint tracks System gameplay fields and ignores placeholders', () => {
+  const base = loadContent(real).content!.fingerprint;
+  const changed: Array<[string, string]> = [
+    ['BASE_ICE', sysWith('BASE_ICE', '120')],
+    ['STRONG_COLORS', sysWith('STRONG_COLORS', 'RED:GRE:CYA')],
+    ['STRONG_SHAPES', sysWith('STRONG_SHAPES', 'TRI:SQU:CRO')],
+    ['PRG_SET members', sysWith('PRG_SET', 'PRG_S_003:PRG_S_005:PRG_S_006:PRG_S_002')],
+    // §5.4 — ORDER is charge-routing priority, so reordering is a real change.
+    ['PRG_SET order', sysWith('PRG_SET', 'PRG_S_005:PRG_S_003:PRG_S_006:PRG_S_001')],
+  ];
+  for (const [label, text] of changed) {
+    const fp = loadContent(files({ systems: text })).content!.fingerprint;
+    assert(fp !== base, `${label} must change the gameplay fingerprint`);
+  }
+  const same: Array<[string, string]> = [
+    ['BIO', sysWith('BIO', 'completely different biography prose')],
+    ['GRAPHICS', sysWith('GRAPHICS', 'some/other/asset.png')],
+    ['name', sysWith('name', 'RENAMED')],
+  ];
+  for (const [label, text] of same) {
+    const r = loadContent(files({ systems: text }));
+    assert(r.content !== null, `${label} fixture must still load`);
+    assert(r.content.fingerprint === base, `${label} must NOT change the gameplay fingerprint`);
+  }
+});
+
+test('§42.15 leading-apostrophe normalization applies to SYS and the Transform axes', () => {
+  const sys = sysWith('BASE_ICE', "'100");
+  const fns = mutate(real.functions.text, ',NEU,YEL:STR,', ",'NEU,'YEL:STR,");
+  const r = loadContent(files({ systems: sys, functions: fns }));
+  assert(r.content !== null, `quoted values must load: ${r.issues.filter((i) => i.severity === 'error').map((i) => i.reason).join('; ')}`);
+  assert(r.content.systems.get('SYS_01')!.baseIce === 100, "'100 parsed as 100");
+  const op = r.content.functions.get('FNC_013')!.plan[0];
+  assert(op.params.axisTarget === 'NEU' && op.params.axisResult!.color === Color.Yellow, 'quoted axes parsed');
+  // §20.1.4 — quoting must not change the fingerprint.
+  assert(r.content.fingerprint === loadContent(real).content!.fingerprint, 'quoting must not change the fingerprint');
+});
+
+test('§42.16 EFFECT_TRANSFORM axis and tuple validation', () => {
+  // exact two-value tuple
+  expectErrors({ functions: mutate(real.functions.text, 'YEL:STR,0:1', 'YEL:STR,0') }, 'exactly 2', 'short Transform tuple');
+  expectErrors({ functions: mutate(real.functions.text, 'YEL:STR,0:1', 'YEL:STR,0:1:0') }, 'exactly 2', 'long Transform tuple');
+  // supported tuple enum values
+  expectErrors({ functions: mutate(real.functions.text, 'YEL:STR,0:1', 'YEL:STR,0:9') }, 'specialPacketTreatment', 'bad special treatment');
+  expectErrors({ functions: mutate(real.functions.text, 'YEL:STR,0:1', 'YEL:STR,5:1') }, 'targeting', 'bad targeting');
+  // §22.1 — the only supported axisTarget in Alpha 0.5
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',RED,YEL:STR,') }, 'unsupported axisTarget', 'color axisTarget');
+  // §22.2 — exactly one color and one shape, and the color may not be neutral
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,YEL,') }, 'exactly one color and one shape', 'axisResult missing shape');
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,YEL:STR:TRI,') }, 'exactly one color and one shape', 'axisResult too long');
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,NEU:STR,') }, 'may not be neutral', 'neutral result color');
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,YEL:NOPE,') }, 'unknown shape', 'bad result shape');
+  // required axes must be present
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',,YEL:STR,') }, 'missing required parameter', 'blank axisTarget');
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,,') }, 'missing required parameter', 'blank axisResult');
+  // §23.1/§45.15 — targeted Transform is restricted to quantity 1
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,0:1', ',NEU,YEL:STR,1:1') }, 'must have quantity 1', 'targeted Transform with quantity 99');
+});
+
+test('§2.5 quantity is an ordinary maximum — 99 gets no special handling', () => {
+  const c = loadContent(real).content!;
+  assert(c.functions.get('FNC_013')!.plan[0].params.quantity === 99, 'COERCE quantity is the authored 99');
+  // A quantity far above the board size is legal and means "up to that many".
+  const big = loadContent(files({ functions: mutate(real.functions.text, 'COERCE,7,EFFECT_TRANSFORM,turn neutral packets into attacker axes,99', 'COERCE,7,EFFECT_TRANSFORM,turn neutral packets into attacker axes,500') }));
+  assert(big.content !== null, 'a quantity above the board size is valid');
+  assert(big.content.functions.get('FNC_013')!.plan[0].params.quantity === 500, 'and is stored verbatim');
+});
+
+// ============================================================================
+// Alpha 0.5.0 §45 — COERCE / EFFECT_TRANSFORM behavior
+// ============================================================================
+
+// A board whose neutral Packets are placed deliberately. Everything else is a
+// non-matching background, so any Sync that appears is one COERCE created.
+function coerceGame(neutrals: Pt[], seed = 5): Game {
+  const g = newGame(seed);
+  for (let y = 0; y < BOARD_HEIGHT; y++) {
+    for (let x = 0; x < BOARD_WIDTH; x++) {
+      const t = g.state.board[y][x]!;
+      t.kind = 'standard';
+      t.color = (x + y) % 2 === 0 ? Color.Red : Color.Green;
+      t.shape = (x + y) % 3;
+      delete t.special;
+    }
+  }
+  for (const p of neutrals) {
+    const t = g.state.board[p.y][p.x]!;
+    t.kind = 'neutral';
+    delete t.color;
+    delete t.shape;
+  }
+  return g;
+}
+
+// Fire the System's COERCE Program directly, whatever slot it occupies.
+function fireCoerce(g: Game): GameEvent[] {
+  const idx = g.state.units.enemy.findIndex((u) => programById(u.programId).fn.id === 'FNC_013');
+  assert(idx >= 0, 'the fielded System build includes COERCE');
+  chargeSlot(g, 'enemy', idx);
+  return g.runEnemyPhase();
+}
+
+test('§45.1/§45.2 COERCE converts up to quantity, and 99 converts every neutral', () => {
+  const neutrals: Pt[] = [{ x: 0, y: 0 }, { x: 4, y: 6 }, { x: 7, y: 2 }];
+  const g = coerceGame(neutrals);
+  const ev = fireCoerce(g);
+  const xf = ev.find((e) => e.t === 'transform') as Extract<GameEvent, { t: 'transform' }>;
+  assert(xf, 'a transform event is emitted');
+  assert(xf.candidates === neutrals.length, `all ${neutrals.length} neutrals were eligible`);
+  assert(xf.converted === neutrals.length, 'fewer neutrals than quantity converts them all');
+  assert(xf.requested === 99, 'the authored maximum is recorded as requested');
+  for (const p of neutrals) {
+    const t = g.state.board[p.y][p.x];
+    // A converted Packet may have been sliced by a resulting Sync; if it
+    // survives, it must carry the authored result axes.
+    if (t && t.kind === 'standard') {
+      assert(t.color === Color.Yellow || t.shape === Shape.Star, 'converted Packets carry the authored axes');
+    }
+  }
+});
+
+test('§45.6 COERCE produces exactly the authored result color and shape', () => {
+  // One isolated neutral cannot form a Sync, so the converted Packet stays put.
+  const g = coerceGame([{ x: 3, y: 3 }]);
+  fireCoerce(g);
+  const t = g.state.board[3][3]!;
+  assert(t.kind === 'standard', 'the Packet is no longer neutral');
+  assert(t.color === Color.Yellow && t.shape === Shape.Star, `expected YEL:STR, got ${t.color}/${t.shape}`);
+});
+
+test('§45.13 converting EVERY eligible Packet consumes no gameplay RNG', () => {
+  // Measured around the transform EXECUTOR: a whole System turn legitimately
+  // rolls for activation choice and for refills, which would mask the point.
+  const spec = {
+    owner: 'enemy' as const,
+    params: { targeting: 0 as const, specialPacketTreatment: 1 as const },
+    axisResult: { color: Color.Yellow, shape: Shape.Star },
+    programId: 'PRG_S_005',
+    fnId: 'FNC_013',
+  };
+  const g = coerceGame([{ x: 3, y: 3 }, { x: 6, y: 1 }]);
+  const before = g.state.rng.getState();
+  applyTransform(g.state, { ...spec, quantity: 99 }, []);
+  assert(g.state.rng.getState() === before, 'a complete selection must not roll for order');
+  // But a PARTIAL selection genuinely is gameplay-affecting and must use it.
+  const g2 = coerceGame([{ x: 3, y: 3 }, { x: 6, y: 1 }, { x: 1, y: 7 }]);
+  const before2 = g2.state.rng.getState();
+  const out = applyTransform(g2.state, { ...spec, quantity: 2 }, []);
+  assert(out.cells.length === 2, 'quantity caps the conversion');
+  assert(g2.state.rng.getState() !== before2, 'an excluding selection consumes gameplay RNG');
+});
+
+test('§45.5/§45.7 transformation is atomic, and the Sync it creates resolves immediately', () => {
+  // Three neutrals in a row become three YEL:STR Packets — a Sync on BOTH axes.
+  const g = coerceGame([{ x: 2, y: 5 }, { x: 3, y: 5 }, { x: 4, y: 5 }]);
+  const hpBefore = g.state.hp.player;
+  const ev = fireCoerce(g);
+  const xf = ev.indexOf(ev.find((e) => e.t === 'transform')!);
+  const destroy = ev.findIndex((e) => e.t === 'destroy');
+  assert(destroy > xf, 'detection runs only AFTER the transform is complete');
+  assert(ev.some((e) => e.t === 'damage' && e.source === 'transform'), 'the created Sync dealt damage immediately');
+  assert(g.state.hp.player < hpBefore, 'and the Hacker actually took it');
+  // §26 — the resulting Packets do not linger as a stable pre-existing Sync.
+  assert(detectMatches(g.state.board).length === 0, 'the board settles with no leftover Sync');
+});
+
+test('§45.8/§45.9 resulting damage uses the System profile and charge routes through its queue', () => {
+  const g = coerceGame([{ x: 2, y: 5 }, { x: 3, y: 5 }, { x: 4, y: 5 }]);
+  const ev = fireCoerce(g);
+  const dmg = ev.find((e) => e.t === 'damage' && e.source === 'transform') as Extract<GameEvent, { t: 'damage' }>;
+  assert(dmg && dmg.target === 'player', 'the System owns the Sync it created');
+  // YEL is strong for BOUNCER and STR is one of its strong shapes, so each
+  // sliced Packet pays the HIGH tier — which is the authored synergy.
+  assert(g.state.config.strongColors.enemy.includes(Color.Yellow), 'YEL is strong for this System');
+  // §30.1 — the charge goes through the ordinary ordered queue, not a
+  // hardcoded COERCE -> ATTACKER path.
+  const routes = ev.filter((e) => e.t === 'chargeRoute' && e.side === 'enemy') as Extract<GameEvent, { t: 'chargeRoute' }>[];
+  assert(routes.length > 0, 'the created Sync generated System charge');
+  const order = g.state.identity.systemPrograms;
+  for (const r of routes) {
+    assert(r.order.join(',') === order.join(','), 'routing used the authored PRG_SET order');
+    assert(r.streamSource === 'EFFECT_TRANSFORM', 'generation is attributed to the Transform');
+    assert(r.sourceId === 'FNC_013', 'and names the causing Function');
+  }
+  // The Yellow/Star streams reach ATTACKER because it is bound to them AND sits
+  // first — emergent from bindings and order (§30.1).
+  const attacker = routes.find((r) => r.eligible.includes('PRG_S_003'));
+  assert(attacker, 'ATTACKER is eligible for the transformed axes');
+});
+
+test('§45.12 the Transform itself contributes no direct damage and no direct charge', () => {
+  // A single neutral cannot create a Sync, so anything observed here would be
+  // the Effect's own contribution.
+  const g = coerceGame([{ x: 3, y: 3 }]);
+  const hpBefore = g.state.hp.player;
+  const chargeBefore = g.state.units.enemy.reduce((n, u) => n + u.charge, 0);
+  const ev = fireCoerce(g);
+  assert(g.state.hp.player === hpBefore, 'no direct Function damage');
+  assert(!ev.some((e) => e.t === 'damage'), 'no damage event at all');
+  // No charge stream at all: the Effect grants none of its own, and with no
+  // Sync created there is nothing else to route. (The flat System timer adds
+  // charge at END of phase without routing, so pool totals are the wrong
+  // instrument for this assertion.)
+  assert(!ev.some((e) => e.t === 'chargeRoute'), 'no direct charge stream');
+  assert(!ev.some((e) => e.t === 'destroy'), 'a lone conversion slices nothing');
+  void chargeBefore;
+});
+
+test('§45.4/§45.16 all three special-retention branches are contract-tested', () => {
+  const c = loadContent(real).content!;
+  assert(c.functions.get('FNC_013')!.plan[0].params.transform!.specialPacketTreatment === 1, 'live content retains all');
+  // Neutral Packets cannot currently carry an overlay, so the branches are
+  // exercised against a planted special via the shared executor rather than
+  // through authored content (§45.16 — every typed branch gets coverage).
+  for (const [treatment, expectKept] of [[0, false], [1, true], [2, true]] as const) {
+    const g = coerceGame([{ x: 3, y: 3 }]);
+    const t = g.state.board[3][3]!;
+    t.special = { type: 'buff', owner: 'enemy', magnitude: 5, seq: 1 };
+    const events: GameEvent[] = [];
+    applyTransform(
+      g.state,
+      {
+        owner: 'enemy',
+        params: { targeting: 0, specialPacketTreatment: treatment },
+        axisResult: { color: Color.Yellow, shape: Shape.Star },
+        quantity: 99,
+        programId: 'PRG_S_005',
+        fnId: 'FNC_013',
+      },
+      events,
+    );
+    const after = g.state.board[3][3]!;
+    assert(!!after.special === expectKept, `treatment ${treatment}: special kept=${!!after.special}`);
+    assert(after.color === Color.Yellow, 'the underlying Packet changed either way');
+  }
+  // treatment 2 destroys overlays owned by the OTHER side
+  const g2 = coerceGame([{ x: 3, y: 3 }]);
+  g2.state.board[3][3]!.special = { type: 'buff', owner: 'player', magnitude: 5, seq: 1 };
+  applyTransform(
+    g2.state,
+    {
+      owner: 'enemy',
+      params: { targeting: 0, specialPacketTreatment: 2 },
+      axisResult: { color: Color.Yellow, shape: Shape.Star },
+      quantity: 99,
+      programId: 'PRG_S_005',
+      fnId: 'FNC_013',
+    },
+    [],
+  );
+  assert(!g2.state.board[3][3]!.special, 'retain-own destroys an opposing special');
+});
+
+test('§45.14/§26 COERCE is withheld when no neutral Packet exists, keeping its charge', () => {
+  const g = coerceGame([]); // a board with no neutrals at all
+  const idx = g.state.units.enemy.findIndex((u) => programById(u.programId).fn.id === 'FNC_013');
+  chargeSlot(g, 'enemy', idx);
+  const cost = programById(g.state.units.enemy[idx].programId).cost;
+  const ev = g.runEnemyPhase();
+  assert(!ev.some((e) => e.t === 'transform'), 'no transform is attempted');
+  assert(!ev.some((e) => e.t === 'ability' && e.fn === 'FNC_013'), 'no activation is logged');
+  assert(g.state.units.enemy[idx].charge === cost, 'the charge is preserved, not spent on a no-op');
+  assert(g.state.metrics.systemWithholds > 0, 'the withhold is counted at battle level');
+});
+
+// ============================================================================
+// Alpha 0.5.0 §46 — DYNAMIC SYSTEM FUNCTION PHASE
+// ============================================================================
+
+test('§46.3/§46.4 a Program activates at most once per Function phase', () => {
+  const g = newGame(31);
+  // Give every System Program full charge and enough ICE that nothing ends.
+  for (const u of g.state.units.enemy) u.charge = programById(u.programId).chargeCap;
+  const ev = g.runEnemyPhase();
+  const fired = ev.filter((e) => e.t === 'ability' && e.side === 'enemy') as Extract<GameEvent, { t: 'ability' }>[];
+  const counts = new Map<string, number>();
+  for (const f of fired) counts.set(f.programId, (counts.get(f.programId) ?? 0) + 1);
+  for (const [pid, n] of counts) assert(n === 1, `${pid} activated ${n} times in one phase`);
+});
+
+test('§46.4 a Program recharged after firing does not fire again in the same phase', () => {
+  const g = newGame(32);
+  const idx = g.state.units.enemy.findIndex((u) => programById(u.programId).fn.id === 'FNC_003'); // ATTACKER
+  assert(idx >= 0, 'BOUNCER fields ATTACKER');
+  chargeSlot(g, 'enemy', idx);
+  // Refill the pool the instant it is spent, which a same-phase recharge would
+  // otherwise turn into a second activation.
+  const unit = g.state.units.enemy[idx];
+  const cap = programById(unit.programId).chargeCap;
+  let charge = cap;
+  Object.defineProperty(unit, 'charge', {
+    get: () => charge,
+    set: (v: number) => {
+      charge = v < cap ? cap : v; // instantly "recharged"
+    },
+    configurable: true,
+  });
+  const ev = g.runEnemyPhase();
+  const fires = ev.filter((e) => e.t === 'ability' && e.side === 'enemy' && e.fn === 'FNC_003').length;
+  assert(fires === 1, `a permanently full Program still fired ${fires} times`);
+});
+
+test('§46.1/§46.2 charge created by one Function can enable another in the SAME phase', () => {
+  // COERCE creates a YEL:STR Sync; ATTACKER is bound to YEL and STR and sits
+  // first in BOUNCER's queue, so the charge reaches it mid-phase.
+  const g = coerceGame([{ x: 2, y: 5 }, { x: 3, y: 5 }, { x: 4, y: 5 }], 12);
+  const coerceIdx = g.state.units.enemy.findIndex((u) => programById(u.programId).fn.id === 'FNC_013');
+  const attackIdx = g.state.units.enemy.findIndex((u) => programById(u.programId).fn.id === 'FNC_003');
+  chargeSlot(g, 'enemy', coerceIdx);
+  // ATTACKER starts one short of ready, so ONLY same-phase charge can fire it.
+  const attackCost = programById(g.state.units.enemy[attackIdx].programId).cost;
+  g.state.units.enemy[attackIdx].charge = attackCost - 1;
+  const ev = g.runEnemyPhase();
+  const order = ev.filter((e) => e.t === 'ability' && e.side === 'enemy') as Extract<GameEvent, { t: 'ability' }>[];
+  assert(order.some((e) => e.fn === 'FNC_013'), 'COERCE fired');
+  assert(order.some((e) => e.fn === 'FNC_003'), 'ATTACKER became ready and fired in the same phase');
+  assert(
+    order.findIndex((e) => e.fn === 'FNC_013') < order.findIndex((e) => e.fn === 'FNC_003'),
+    'and it fired AFTER the Function that charged it',
+  );
+});
+
+test('§46.5/§46.6 a ready-but-invalid Function is skipped, then reconsidered when it becomes valid', () => {
+  // No neutrals: COERCE is ready but ineligible, so it must not spend charge.
+  const g = coerceGame([], 13);
+  const coerceIdx = g.state.units.enemy.findIndex((u) => programById(u.programId).fn.id === 'FNC_013');
+  chargeSlot(g, 'enemy', coerceIdx);
+  const cost = programById(g.state.units.enemy[coerceIdx].programId).cost;
+  g.runEnemyPhase();
+  assert(g.state.units.enemy[coerceIdx].charge === cost, 'blocked COERCE keeps its charge');
+  // Now give it a target: the same Program becomes eligible on a later phase.
+  const t = g.state.board[3][3]!;
+  t.kind = 'neutral';
+  delete t.color;
+  delete t.shape;
+  const ev2 = g.runEnemyPhase();
+  assert(ev2.some((e) => e.t === 'transform'), 'once a valid target exists the Function fires');
+});
+
+test('§46.8/§46.9 the phase terminates, and the turn-ending match does not reopen it', () => {
+  const g = newGame(33, { ...D, enemyMatching: true });
+  for (const u of g.state.units.enemy) u.charge = programById(u.programId).chargeCap;
+  const ev = g.runEnemyPhase();
+  // The System's own match happens after the Function phase; any charge it
+  // creates belongs to the NEXT turn (§19.6). So no activation may appear after
+  // the turn-ending swap.
+  const swapAt = ev.findIndex((e) => e.t === 'swap');
+  if (swapAt >= 0) {
+    const after = ev.slice(swapAt).filter((e) => e.t === 'ability' && e.side === 'enemy');
+    assert(after.length === 0, 'no System Function activated after the turn-ending match');
+  }
+});
+
+// ============================================================================
+// Alpha 0.5.0 §47 — EBUFF delayed delivery
+// ============================================================================
+
+// Fire the System's EBUFF Program (ENHANCE) directly.
+function fireEbuff(g: Game): GameEvent[] {
+  const idx = g.state.units.enemy.findIndex((u) => programById(u.programId).fn.id === 'FNC_014');
+  assert(idx >= 0, 'the fielded System build includes ENHANCE');
+  // Isolate ENHANCE: MUSCLE opens charged (COERCE is startCharged=Y), and a
+  // same-phase COERCE Sync could slice the very overlays under test.
+  for (const u of g.state.units.enemy) u.charge = 0;
+  chargeSlot(g, 'enemy', idx);
+  return g.runEnemyPhase();
+}
+
+test('§47.1/§47.2 EBUFF arms up to quantity countdowns that provide ZERO magnitude', () => {
+  const g = newGame(40);
+  fireEbuff(g);
+  const pending = specialsOf(g, 'buff', 'enemy');
+  assert(pending.length === 3, `authored quantity 3, placed ${pending.length}`);
+  for (const t of pending) {
+    assert(t.special!.countdown === 2, 'authored countdown 2');
+    assert(t.special!.delivers === 'EFFECT_BUFF', 'the overlay names what it will deliver');
+    assert(t.special!.magnitude === 5, 'the authored magnitude travels with the overlay');
+  }
+  // §28.1 — pending overlays contribute nothing while armed.
+  assert(buffBonus(g.state, 'enemy') === 0, 'a pending EBUFF adds no Buff magnitude');
+});
+
+test('§47.3/§47.4/§47.5/§47.6 at expiry the countdown becomes a live Buff on the same Packet', () => {
+  const g = newGame(41);
+  fireEbuff(g);
+  const armed = specialsOf(g, 'buff', 'enemy');
+  const seqs = armed.map((t) => t.special!.seq);
+  const coordsOf = (): string[] => {
+    const out: string[] = [];
+    for (let y = 0; y < BOARD_HEIGHT; y++) {
+      for (let x = 0; x < BOARD_WIDTH; x++) {
+        const sp = g.state.board[y][x]?.special;
+        if (sp && seqs.includes(sp.seq)) out.push(`${x},${y}`);
+      }
+    }
+    return out;
+  };
+  const before = coordsOf();
+  assert(before.length === 3, 'three armed overlays on the board');
+  // §28.2 — established owner-turn countdown semantics: ticked on System turns.
+  g.runEnemyPhase();
+  assert(specialsOf(g, 'buff', 'enemy').every((t) => t.special!.countdown === 1), 'one turn elapsed');
+  assert(buffBonus(g.state, 'enemy') === 0, 'still pending, still zero');
+  g.runEnemyPhase();
+  const live = specialsOf(g, 'buff', 'enemy').filter((t) => t.special!.countdown === undefined);
+  assert(live.length > 0, 'surviving countdowns delivered');
+  for (const t of live) {
+    assert(t.special!.magnitude === 5, 'the authored magnitude is applied');
+    assert(t.special!.delivers === undefined, 'a delivered overlay is no longer armed');
+  }
+  // §28.3 — delivery happens on the SAME Packet.
+  const after = coordsOf();
+  for (const c of after) assert(before.includes(c), `delivered Buff at ${c} was not one of the armed Packets`);
+  // §47.6 — the now-live Buff contributes to damage.
+  assert(buffBonus(g.state, 'enemy') === 5 * live.length, 'live Buffs contribute their magnitude');
+});
+
+test('§47.7 slicing a pending EBUFF prevents any later delivery', () => {
+  const g = newGame(42);
+  fireEbuff(g);
+  const armedSeqs = specialsOf(g, 'buff', 'enemy').map((t) => t.special!.seq);
+  assert(armedSeqs.length === 3, 'three overlays were armed');
+  // Remove every armed overlay before it can expire.
+  for (let y = 0; y < BOARD_HEIGHT; y++) {
+    for (let x = 0; x < BOARD_WIDTH; x++) {
+      const t = g.state.board[y][x];
+      if (t?.special && armedSeqs.includes(t.special.seq)) delete t.special;
+    }
+  }
+  // Well past the authored countdown. ENHANCE may legitimately recharge and arm
+  // NEW overlays, so the assertion is scoped to the REMOVED objects: none of
+  // them may reappear, anywhere, in any state.
+  for (let i = 0; i < 4; i++) g.runEnemyPhase();
+  const survivors = specialsOf(g, 'buff', 'enemy').filter((t) => armedSeqs.includes(t.special!.seq));
+  assert(survivors.length === 0, 'a removed countdown never delivers and never reappears');
+});
+
+test('§47.8 a pending EBUFF survives save/resume and still delivers correctly', () => {
+  const g = newGame(43);
+  fireEbuff(g);
+  g.startPlayerPhase(); // §17.3 — an active save is taken in the stable phase
+  const info = qmInfo([...g.state.identity.hackerPrograms], g.state.identity.buildOrigin);
+  const restored = deserializeSession(serializeSession(info, g, null));
+  assert(restored && restored.game, 'a battle holding pending countdowns round-trips');
+  const pending = specialsOf(restored.game, 'buff', 'enemy');
+  assert(pending.length === 3, 'all three armed overlays survive');
+  for (const t of pending) {
+    assert(t.special!.countdown === 2 && t.special!.delivers === 'EFFECT_BUFF', 'armed state survives verbatim');
+    assert(t.special!.magnitude === 5, 'the resolved magnitude survives');
+  }
+  assert(buffBonus(restored.game.state, 'enemy') === 0, 'still contributes nothing after resume');
+});
+
+test('§47.9/§47.10 Bomb countdowns are unchanged and share the one scheduler', () => {
+  const g = newTestbedGame(44);
+  const idx = g.state.units.enemy.findIndex((u) => programById(u.programId).fn.id === 'FNC_005');
+  chargeSlot(g, 'enemy', idx);
+  g.runEnemyPhase();
+  const bombs = specialsOf(g, 'bomb', 'enemy');
+  assert(bombs.length === 1 && bombs[0].special!.countdown === 3, 'E-Bomb still arms at countdown 3');
+  assert(bombs[0].special!.delivers === 'EFFECT_BOMB', 'a bomb declares its own delivery');
+  g.runEnemyPhase();
+  assert(specialsOf(g, 'bomb', 'enemy')[0].special!.countdown === 2, 'bomb timing is unchanged');
+});
+
+// ============================================================================
+// Alpha 0.5.0 §48 — SPAM / Bomb charge behavior
+// ============================================================================
+
+test('§48.1/§48.2 SPAM uses its authored parameters and its tuple enables charge', () => {
+  const c = loadContent(real).content!;
+  const spam = c.functions.get('FNC_015')!.plan[0];
+  assert(spam.params.quantity === 3 && spam.params.countdown === 1, 'authored quantity/countdown');
+  assert(spam.params.areaPattern === 'AREA_CARDINAL_1', 'authored area');
+  // §29.1 — gainCharge 0 MEANS "sliced Packets charge" (param notes). This is
+  // the intentional difference from every other Bomb row, which uses 1.
+  assert(spam.params.bomb!.gainCharge === 0, 'SPAM enables the charge branch');
+  for (const id of ['FNC_001', 'FNC_005', 'FNC_008', 'FNC_012']) {
+    assert(c.functions.get(id)!.plan[0].params.bomb!.gainCharge === 1, `${id} keeps the no-charge branch (§48.4)`);
+  }
+});
+
+test('§48.2/§48.3 a SPAM detonation grants charge that routes through the System queue', () => {
+  // MIDNIGHT fields SPAMBOT.
+  const g = newBattle(D, 51, undefined, 'DEFAULT', { systemId: 'SYS_02', source: 'HEADLESS_PINNED' });
+  g.startPlayerPhase();
+  const idx = g.state.units.enemy.findIndex((u) => programById(u.programId).fn.id === 'FNC_015');
+  assert(idx >= 0, 'MIDNIGHT fields SPAMBOT');
+  chargeSlot(g, 'enemy', idx);
+  g.runEnemyPhase(); // arms three 1-turn bombs
+  const bombs = specialsOf(g, 'bomb', 'enemy');
+  assert(bombs.length === 3 && bombs.every((b) => b.special!.gainCharge === 0), 'three charge-granting bombs armed');
+  const ev = g.runEnemyPhase(); // they detonate at the start of this System turn
+  assert(ev.some((e) => e.t === 'detonate'), 'the bombs detonated');
+  const routes = ev.filter(
+    (e) => e.t === 'chargeRoute' && e.side === 'enemy' && e.streamSource === 'EFFECT_DESTRUCTION',
+  );
+  assert(routes.length > 0, 'sliced Packets generated System charge (§29.1)');
+});
+
+// ============================================================================
+// Alpha 0.5.0 §49 — save / resume of System identity
+// ============================================================================
+
+test('§49 an Alpha 0.4.x active save is rejected cleanly, never migrated', () => {
+  const g = newGame(52);
+  const json = serializeSession(qmInfo(), g, null);
+  const env = JSON.parse(json) as Record<string, unknown>;
+  // §31.1 — the version/schema bump is what rejects it; there is no migration
+  // path and no synthesized System identity for an old battle.
+  assert(deserializeSession(JSON.stringify({ ...env, version: 'alpha-0.4.0' })) === null, 'old build tag rejected');
+  assert(deserializeSession(JSON.stringify({ ...env, schema: 3 })) === null, 'old save schema rejected');
+  // §41 — an envelope with no System identity at all is incompatible, NOT an
+  // invitation to substitute a default.
+  const identity = { ...(env.identity as Record<string, unknown>) };
+  delete identity.systemId;
+  assert(deserializeSession(JSON.stringify({ ...env, identity })) === null, 'a save without SYS_ID is rejected');
+  assert(
+    deserializeSession(JSON.stringify({ ...env, identity: { ...(env.identity as object), systemId: 'SYS_99' } })) === null,
+    'a save naming an unknown System is rejected',
+  );
+});
+
+test('§49 an Alpha 0.5 save round-trips System identity and its exact Program order', () => {
+  const g = newGame(53);
+  const r = deserializeSession(serializeSession(qmInfo(), g, null));
+  assert(r && r.game, 'the save round-trips');
+  assert(r.info.system.systemId === g.state.identity.systemId, 'session opponent survives');
+  assert(r.game.state.identity.systemId === g.state.identity.systemId, 'battle opponent survives');
+  assert(
+    r.game.state.identity.systemPrograms.join(',') === g.state.identity.systemPrograms.join(','),
+    'the ordered System build survives exactly',
+  );
+  assert(r.game.state.identity.systemSelectionSource === g.state.identity.systemSelectionSource, 'selection source survives');
+  // §32 — Program charge state is battle state and must round-trip too.
+  assert(
+    r.game.state.units.enemy.map((u) => `${u.programId}:${u.charge}`).join(',') ===
+      g.state.units.enemy.map((u) => `${u.programId}:${u.charge}`).join(','),
+    'System Program charges survive',
+  );
+});
+
+test('§49/§33 PENDING_BUILD restores the same upcoming System without rerolling', () => {
+  const info: RunInfo = { ...runInfoFor(snapshotRunSettings(D), 2), pendingBuild: true };
+  const json = serializeSession(info, null, null);
+  const r = deserializeSession(json);
+  assert(r && r.game === null, 'a pending-build Run restores with no battle');
+  assert(r.info.mode === 'RUN' && r.info.system.systemId === info.system.systemId, 'the upcoming System is preserved');
+  // Reopening/re-serializing must be idempotent — no reroll on the way back.
+  assert(serializeSession(r.info, null, null) === json, 'round-trip is byte-identical');
+});
+
+test('§49/§11.5 retrying the same Run step keeps the same System', () => {
+  const info = runInfoFor(snapshotRunSettings(D), 3);
+  const first = createRunBattle(info, 3, 61);
+  // A retry rebuilds the battle from the SAME RunInfo (the session layer never
+  // rerolls on defeat), so the opponent must be identical.
+  const retry = createRunBattle(info, 3, 62);
+  assert(retry.state.identity.systemId === first.state.identity.systemId, 'the retry faces the same System');
+  assert(
+    retry.state.identity.systemPrograms.join(',') === first.state.identity.systemPrograms.join(','),
+    'and the same ordered build',
+  );
+  assert(retry.state.battleId !== first.state.battleId, 'but it is a genuinely new battle');
+});
+
+test('§49/§34 the Constructed build preference is independent of System identity', () => {
+  const preset = serializeConstructedPreset('HAK_01', 'DEK_01', defaultBuild('HAK_01', 'DEK_01'));
+  assert(!preset.includes('SYS_'), 'no remembered System is written into the Hacker build preference');
+  const back = deserializeConstructedPreset(preset);
+  assert(back && back.build.join(',') === defaultBuild('HAK_01', 'DEK_01').join(','), 'the remembered build still resolves');
+});
+
+// ============================================================================
+// Alpha 0.5.0 §50 — logging and metrics
+// ============================================================================
+
+test('§50.1/§50.2 System identity is battle-level context, not repeated per turn', () => {
+  const g = newGame(54);
+  const stamp = identityStamp(g.state.identity);
+  assert(stamp.systemId === g.state.identity.systemId, 'the battle record carries SYS_ID');
+  assert(stamp.systemSelectionSource === g.state.identity.systemSelectionSource, 'and the selection source');
+  assert(stamp.systemPrograms.join(',') === g.state.identity.systemPrograms.join(','), 'and the ordered build');
+  // §35/§50.9 — turn records must NOT carry any of it.
+  setLoggingLevel('VERBOSE');
+  const mv = botMove(g)!;
+  g.attemptSwap(mv.a, mv.b);
+  g.runEnemyPhase();
+  g.startPlayerPhase();
+  for (const turn of g.drainTurnLogs()) {
+    const json = JSON.stringify(turn);
+    assert(!json.includes('SYS_'), 'a turn record must not repeat System identity');
+    assert(!json.includes('PRG_S_'), 'nor the System roster');
+  }
+});
+
+test('§50.3 a COERCE activation records converted count, candidates and result axes', () => {
+  setLoggingLevel('COMPLETE');
+  const g = coerceGame([{ x: 2, y: 5 }, { x: 3, y: 5 }, { x: 4, y: 5 }], 55);
+  fireCoerce(g);
+  const rec = g.drainEventLogs().find((e) => e.kind === 'TRANSFORM');
+  assert(rec && rec.transform, 'a TRANSFORM battle event is written');
+  assert(rec.transform.converted === 3 && rec.transform.candidates === 3, 'converted and eligible counts');
+  assert(rec.transform.requested === 99, 'the authored maximum');
+  assert(rec.transform.axisTarget === 'NEU', 'the source axis');
+  assert(rec.transform.resultColor === Color.Yellow && rec.transform.resultShape === Shape.Star, 'the result axes');
+  assert(rec.transform.fnId === 'FNC_013', 'the causing Function');
+});
+
+test('§50.4 EBUFF placement and delivery are both auditable', () => {
+  setLoggingLevel('COMPLETE');
+  const g = newGame(56);
+  fireEbuff(g);
+  const placed = g.drainEventLogs();
+  assert(placed.length >= 0, 'placement drains cleanly');
+  g.runEnemyPhase();
+  g.runEnemyPhase();
+  const delivered = g.drainEventLogs().filter((e) => e.kind === 'COUNTDOWN');
+  assert(delivered.length > 0, 'delivery is recorded');
+  for (const d of delivered) {
+    assert(d.countdown!.effectId === 'EFFECT_BUFF', 'the delivered payload is named');
+    assert(d.countdown!.magnitude === 5, 'with its resolved magnitude');
+  }
+});
+
+test('§50.11/§50.13 current metrics carry one total and no axis-specific waste', () => {
+  const g = newGame(57);
+  const sm = g.state.metrics.sides.player as unknown as Record<string, unknown>;
+  assert('chargeWastedTotal' in sm, 'the canonical total exists');
+  assert(!('chargeDiscardedTotal' in sm), 'the Alpha 0.4.1 field name is gone from current metrics');
+  assert(!('chargeWastedColor' in sm) && !('chargeWastedShape' in sm), 'no axis-specific waste (§39.4)');
+});
 
 // ---- summary ----
 

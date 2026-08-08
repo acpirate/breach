@@ -11,6 +11,7 @@ import systemText from '../data/breach datastructures - PRG_S.csv?raw';
 import hakText from '../data/breach datastructures - HAK.csv?raw';
 import sklText from '../data/breach datastructures - SKL.csv?raw';
 import dekText from '../data/breach datastructures - DEK.csv?raw';
+import sysText from '../data/breach datastructures - SYS.csv?raw';
 import { DataFiles } from './logic/data/load';
 
 // The manifest: each dataset's ROLE is declared here and independently
@@ -23,5 +24,6 @@ export function browserDataFiles(): DataFiles {
     hackers: { name: 'breach datastructures - HAK.csv', text: hakText },
     skills: { name: 'breach datastructures - SKL.csv', text: sklText },
     decks: { name: 'breach datastructures - DEK.csv', text: dekText },
+    systems: { name: 'breach datastructures - SYS.csv', text: sysText },
   };
 }

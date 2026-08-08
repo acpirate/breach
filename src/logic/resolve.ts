@@ -31,6 +31,7 @@ import {
 import { AREA_PATTERNS, AreaPatternId } from './data/areas';
 import type { EffectId } from './data/effects';
 import {
+  AxisResult,
   GAIN_CHARGE_YES,
   DEAL_DAMAGE_YES,
   LINE_DIMENSION_COLUMN,
@@ -38,6 +39,7 @@ import {
   ResolvedSkill,
   SPECIALS_RETAIN_ALL,
   SPECIALS_RETAIN_OWN,
+  TransformParams,
   deckById,
   hackerById,
   programById,
@@ -60,12 +62,23 @@ import {
   tileViewOf,
 } from './types';
 
-// Sum of the owner's active buff-tile magnitudes (per-tile value from data).
+// Sum of the owner's LIVE buff-tile magnitudes (per-tile value from data).
+//
+// Alpha 0.5.0 §28.1 — a Buff overlay whose countdown is still positive is
+// PENDING: it is on the board, it can be sliced away, but it contributes ZERO
+// magnitude until delivery. That is the whole behavioral point of EBUFF, and
+// enforcing it here (rather than at each damage site) means every existing
+// consumer of buff magnitude gets it right for free.
+export function isPendingSpecial(sp: { countdown?: number } | undefined): boolean {
+  return !!sp && sp.countdown !== undefined && sp.countdown > 0;
+}
+
 export function buffBonus(state: GameState, side: Side): number {
   let n = 0;
   for (const row of state.board) {
     for (const t of row) {
-      if (t?.special?.type === 'buff' && t.special.owner === side) n += t.special.magnitude ?? 0;
+      const sp = t?.special;
+      if (sp?.type === 'buff' && sp.owner === side && !isPendingSpecial(sp)) n += sp.magnitude ?? 0;
     }
   }
   return n;
@@ -319,14 +332,15 @@ export function accumulateTileCharge(
   axes: Set<MatchCondition>,
   streams: StreamMap,
   source: ChargeStreamSource,
+  sourceId?: string,
 ): void {
   if (t.kind === 'neutral') return;
   const singleAxis = state.config.singleAxisPayout;
   if (!singleAxis || axes.has('color')) {
-    addStream(streams, 'color', t.color!, CHARGE_PER_TILE_COLOR_MATCH, source);
+    addStream(streams, 'color', t.color!, CHARGE_PER_TILE_COLOR_MATCH, source, sourceId);
   }
   if (!singleAxis || axes.has('shape')) {
-    addStream(streams, 'shape', t.shape!, CHARGE_PER_TILE_SHAPE_MATCH, source);
+    addStream(streams, 'shape', t.shape!, CHARGE_PER_TILE_SHAPE_MATCH, source, sourceId);
   }
 }
 
@@ -513,9 +527,14 @@ export function resolveCascades(
   budget: number | null,
   // MK7.3/§15.3 — everything descended from an initiating action carries THAT
   // action's causal bucket, not the mechanism that finally dealt the damage.
-  cause: 'match' | 'bomb' | 'lineslice',
+  cause: 'match' | 'bomb' | 'lineslice' | 'transform',
   freshIds: Set<number>,
   causeProgramId?: string, // the initiating Function's Program (non-match causes)
+  // Alpha 0.5.0 — labels the charge streams of the FIRST wave with the Effect
+  // that caused it, so generation is attributable (§37.1). Later waves are
+  // ordinary cascades and label themselves. Allocation is untouched: the
+  // top-to-bottom queue rule does not consult this (§30.1).
+  origin?: { streamSource: ChargeStreamSource; sourceId: string },
 ): { steps: number; stochasticRounds: number } {
   let steps = 0;
   let stochasticRounds = 0;
@@ -612,7 +631,10 @@ export function resolveCascades(
     // routed together below, after any Skill has had its chance to inflate a
     // stream (§10.6). A cascade wave is labelled as such for telemetry.
     const streams: StreamMap = new Map();
-    const streamSource: ChargeStreamSource = steps > 1 || stochastic.some(Boolean) ? 'CASCADE' : 'SYNC';
+    const isCascadeWave = steps > 1 || stochastic.some(Boolean);
+    const streamSource: ChargeStreamSource = isCascadeWave
+      ? 'CASCADE'
+      : (origin?.streamSource ?? 'SYNC');
     for (const { p, m, axes, stochOnly } of info.values()) {
       const t = state.board[p.y][p.x];
       if (!t) continue;
@@ -626,7 +648,7 @@ export function resolveCascades(
       else if (axis === 'shape') shapeRaw += base * m;
       if (stochOnly) cascadeRaw += base * m;
       if (t.kind === 'standard' && (oppColors.has(t.color!) || oppShapes.has(t.shape!))) contested++;
-      accumulateTileCharge(state, t, axes, streams, streamSource);
+      accumulateTileCharge(state, t, axes, streams, streamSource, isCascadeWave ? undefined : origin?.sourceId);
     }
 
     // ---- §6 Hacker Skills: owner-scoped, once per qualifying Sync event ----
@@ -712,6 +734,12 @@ export function resolveCascades(
           source: cause, // MK7.3: bucket = initiating cause, not mechanism
           label: owner === 'player' ? 'Hacker Sync' : 'System Sync',
           programId: cause === 'match' ? undefined : causeProgramId,
+          // Alpha 0.5.0 — a Transform-caused Sync carries the Function and
+          // Effect that caused it, so the new `transform` damage bucket is
+          // auditable back to the exact activation that produced it.
+          ...(cause === 'transform'
+            ? { fnId: origin?.sourceId, effectId: 'EFFECT_TRANSFORM' as const }
+            : {}),
           // Under suppression the crit cross-cut reports 0: the multiplier's
           // contribution to BASE Sync damage is exactly what is suppressed, and
           // the surviving Skill contribution is reported in its own bucket. This
@@ -957,6 +985,92 @@ export function resolveLineSlice(
   }
 
   return { dimension: vertical ? 'column' : 'row', sliced: slicedPts, retained, damage, charge };
+}
+
+// ============================================================================
+// Alpha 0.5.0 §20-§26 — EFFECT_TRANSFORM
+// ============================================================================
+
+export interface TransformSpec {
+  owner: Side;
+  params: TransformParams;
+  axisResult: AxisResult;
+  quantity: number;
+  programId: string;
+  fnId: string;
+}
+
+export interface TransformOutcome {
+  candidates: number; // eligible Packets on the board at activation time
+  cells: Pt[]; // what was actually transformed
+  specialsRetained: number;
+  specialsDestroyed: number;
+}
+
+// §22.1 — the eligible pool for the current `axisTarget` contract. Alpha 0.5
+// supports NEU only: Packets whose underlying board identity is neutral.
+export function transformCandidates(state: GameState): Pt[] {
+  const out: Pt[] = [];
+  for (let y = 0; y < BOARD_HEIGHT; y++) {
+    for (let x = 0; x < BOARD_WIDTH; x++) {
+      const t = state.board[y][x];
+      if (t && t.kind === 'neutral') out.push({ x, y });
+    }
+  }
+  return out;
+}
+
+// §24 — ATOMIC transformation. Every selected Packet changes BEFORE any Sync
+// detection runs, so arbitrary target-iteration order can never become
+// mechanically significant (transform one, resolve, refill, transform the next
+// would make it so, and would not match the player's mental model).
+//
+// This function performs ONLY the board mutation and returns what it did; the
+// caller runs the resulting Sync wave. Splitting it that way keeps the "all
+// transforms, then detection" ordering impossible to get wrong.
+export function applyTransform(state: GameState, spec: TransformSpec, events: GameEvent[]): TransformOutcome {
+  const candidates = transformCandidates(state);
+  const outcome: TransformOutcome = { candidates: candidates.length, cells: [], specialsRetained: 0, specialsDestroyed: 0 };
+  if (!candidates.length) return outcome;
+
+  // §23.1 — up to `quantity` distinct targets, drawn without replacement.
+  // When every eligible Packet will be transformed anyway, the selection is a
+  // complete set and its order is irrelevant, so NO gameplay RNG is consumed
+  // merely to permute it (§45.13). RNG is only gameplay-affecting when the
+  // choice actually excludes something.
+  let chosen: Pt[];
+  if (candidates.length <= spec.quantity) {
+    chosen = candidates;
+  } else {
+    const pool = [...candidates];
+    chosen = [];
+    for (let i = 0; i < spec.quantity; i++) chosen.push(pool.splice(state.rng.int(pool.length), 1)[0]);
+  }
+
+  for (const p of chosen) {
+    const t = state.board[p.y][p.x]!;
+    // §23.2 — special-overlay treatment, sharing the established SPECIALS_*
+    // enum. Retaining preserves the overlay's ownership and Effect-specific
+    // state (countdown, magnitude, attribution) while the UNDERLYING Packet
+    // changes identity (§22.3). Neutral Packets cannot currently carry an
+    // overlay, so this is contract completeness rather than live behavior.
+    if (t.special) {
+      const keep =
+        spec.params.specialPacketTreatment === SPECIALS_RETAIN_ALL ||
+        (spec.params.specialPacketTreatment === SPECIALS_RETAIN_OWN && t.special.owner === spec.owner);
+      if (keep) outcome.specialsRetained++;
+      else {
+        delete t.special;
+        outcome.specialsDestroyed++;
+      }
+    }
+    t.kind = 'standard';
+    t.color = spec.axisResult.color;
+    t.shape = spec.axisResult.shape;
+    outcome.cells.push(p);
+    events.push({ t: 'setTile', p, view: tileViewOf(t) });
+  }
+  return outcome;
 }
 
 // Run after every settle: if the Datastream has no valid moves, the automatic

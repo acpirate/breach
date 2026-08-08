@@ -9,7 +9,9 @@
 import { parseCsv } from './csv';
 import { AREA_PATTERNS, isAreaPatternId } from './areas';
 import {
+  EFFECT_AXIS_NAMES,
   EFFECT_PARAM_NAMES,
+  EffectAxisName,
   EffectParamName,
   EffectTupleField,
   TargetKind,
@@ -19,12 +21,15 @@ import {
 import { SkillEffectId, SkillParamKind, isSkillEffectId, skillContract, skillEffectIds } from './skills';
 import {
   ACTIVE_BUILD_SIZE,
+  AXIS_TARGET_NEUTRAL,
+  AxisResult,
   BombParams,
   DATA_SCHEMA_VERSION,
   DEFAULT_DECK_ID,
   DEFAULT_HACKER_ID,
   EffectParams,
   GAME_VERSION,
+  HEADLESS_SYSTEM_ID,
   INVENTORY_SIZE,
   LineSliceParams,
   PORTFOLIO_SIZE,
@@ -35,8 +40,11 @@ import {
   ResolvedHacker,
   ResolvedProgram,
   ResolvedSkill,
+  ResolvedSystem,
+  SYSTEM_BUILD_SIZE,
   ShakeParams,
   TARGETING_TARGETED,
+  TransformParams,
 } from './content';
 import { Color, Shape, Side } from '../types';
 
@@ -49,6 +57,7 @@ export type DatasetName =
   | 'hackers'
   | 'skills'
   | 'decks'
+  | 'systems' // Alpha 0.5.0 §5 — the seventh required runtime dataset
   | 'content';
 
 export interface DataIssue {
@@ -91,6 +100,10 @@ export interface DataFiles {
   hackers: DataFile;
   skills: DataFile;
   decks: DataFile;
+  // Alpha 0.5.0 §0.2 — the seventh REQUIRED runtime dataset. It joins the same
+  // manifest and the same pipeline rather than getting a parallel loader
+  // (§3 — no second loading path).
+  systems: DataFile;
 }
 
 export interface LoadResult {
@@ -129,6 +142,9 @@ const RECOGNIZED_SHAPES: Shape[] = Object.values(SHAPE_TOKENS).sort((a, b) => a 
 const PROGRAM_HEADER = ['PRG_ID', 'name', 'colors', 'shapes', 'functions', 'notes'];
 // §4.6 — the existing columns are preserved and the new fields appended. The
 // parser binds by header NAME, so the authored column order is irrelevant.
+// Alpha 0.5.0 §21 — `axisTarget`/`axisResult` are appended for
+// EFFECT_TRANSFORM. Binding is by header NAME, so authored column order stays
+// irrelevant and every other Effect simply leaves them blank.
 const FUNCTION_HEADER = [
   'FNC_ID',
   'name',
@@ -142,11 +158,17 @@ const FUNCTION_HEADER = [
   'damage',
   'params',
   'startCharged',
+  'axisTarget',
+  'axisResult',
 ];
 // §4.4/§4.5 — Alpha 0.4 activates PRG_SET on both identity datasets.
 const HACKER_HEADER = ['HAK_ID', 'name', 'BASE_LINK', 'STRONG_COLORS', 'STRONG_SHAPES', 'PRG_SET', 'SKILL', 'BIO', 'GRAPHICS'];
 const SKILL_HEADER = ['SKILL_ID', 'skill_effect', 'params', 'display'];
 const DECK_HEADER = ['DEK_ID', 'name', 'ADD_LINK', 'PRG_SET', 'FUNCTIONS', 'DESCRIPT', 'GRAPHICS'];
+// Alpha 0.5.0 §5.1 — the System schema. The durability column is BASE_ICE, NOT
+// BASE_LINK (§2.3): a stale export carrying BASE_LINK fails the header check
+// rather than being silently aliased.
+const SYSTEM_HEADER = ['SYS_ID', 'name', 'BASE_ICE', 'STRONG_COLORS', 'STRONG_SHAPES', 'PRG_SET', 'SKILL', 'BIO', 'GRAPHICS'];
 
 // Required Alpha record IDs (their VALUES are validated by the schema/contract
 // rules; per designer ruling the dataset is the final authority on the values).
@@ -155,13 +177,23 @@ const REQUIRED_FNC_IDS = [
   'FNC_006', 'FNC_007', 'FNC_008', 'FNC_009', 'FNC_010',
   // Alpha 0.4.0 §4.7 — DATACUT and PLINK
   'FNC_011', 'FNC_012',
+  // Alpha 0.5.0 §7 — COERCE, EBUFF, SPAM
+  'FNC_013', 'FNC_014', 'FNC_015',
 ];
 // Alpha 0.4.0 — NINJA and WEASEL complete the six-Program inventory.
 const REQUIRED_PRG_H_IDS = ['PRG_H_001', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004', 'PRG_H_005', 'PRG_H_006'];
-const REQUIRED_PRG_S_IDS = ['PRG_S_001', 'PRG_S_002', 'PRG_S_003', 'PRG_S_004'];
+// Alpha 0.5.0 §7.1 — MUSCLE, ENHANCE, SPAMBOT, THROWER join the System roster.
+// PRG_S_004 DISABLER remains required content even though neither authored
+// System currently fields it (§6.2).
+const REQUIRED_PRG_S_IDS = [
+  'PRG_S_001', 'PRG_S_002', 'PRG_S_003', 'PRG_S_004',
+  'PRG_S_005', 'PRG_S_006', 'PRG_S_007', 'PRG_S_008',
+];
 const REQUIRED_HAK_IDS = ['HAK_01'];
 const REQUIRED_SKL_IDS = ['SKL_001', 'SKL_002'];
 const REQUIRED_DEK_IDS = ['DEK_01'];
+// Alpha 0.5.0 §6 — BOUNCER and MIDNIGHT.
+const REQUIRED_SYS_IDS = ['SYS_01', 'SYS_02'];
 
 // ---- Alpha 0.4.0 §4.2 spreadsheet-safe value normalization ----
 
@@ -213,6 +245,7 @@ interface FunctionRow {
   payloadRaw: string;
   notes: string;
   params: Record<EffectParamName, string>; // raw discrete-column text
+  axes: Record<EffectAxisName, string>; // Alpha 0.5.0 §21 raw axis-column text
   tupleRaw: string; // raw `params` column text
   startCharged: boolean;
 }
@@ -252,6 +285,20 @@ interface DeckRow {
   portfolio: string[]; // §4.5 — ordered PRG_SET
   functionId: string;
   descript: string;
+  graphics: string;
+}
+
+// Alpha 0.5.0 §5.2 — an authored System row.
+interface SystemRow {
+  file: string;
+  row: number;
+  id: string;
+  name: string;
+  baseIce: number;
+  strongColors: Color[];
+  strongShapes: Shape[];
+  programs: string[]; // ordered PRG_SET — exactly SYSTEM_BUILD_SIZE PRG_S_* refs
+  bio: string;
   graphics: string;
 }
 
@@ -417,6 +464,25 @@ export function loadContent(files: DataFiles): LoadResult {
     return ids;
   };
 
+  // Alpha 0.5.0 §5.2/§40 — a System's ordered active build: exactly
+  // SYSTEM_BUILD_SIZE distinct valid PRG_S_* references. The PRG_S_ prefix
+  // requirement is what rejects a Hacker Program smuggled into a System build;
+  // authored order is gameplay-significant (charge routing) and is preserved.
+  const parseSystemBuild = (raw: string, ctx: Ctx & { field: string }): string[] | null => {
+    const ids = parseRefList(raw, 'PRG_S_', ctx, false);
+    if (ids === null) return null;
+    if (ids.length !== SYSTEM_BUILD_SIZE) {
+      err({
+        ...ctx,
+        value: raw.trim(),
+        expected: `exactly ${SYSTEM_BUILD_SIZE} PRG_S_* references`,
+        reason: `PRG_SET must contain exactly ${SYSTEM_BUILD_SIZE} distinct System Programs`,
+      });
+      return null;
+    }
+    return ids;
+  };
+
   const checkName = (raw: string, ctx: Ctx): string | null => {
     const name = raw.trim();
     if (!name) {
@@ -561,6 +627,8 @@ export function loadContent(files: DataFiles): LoadResult {
         if (name === null || cost === null || !payloadRaw || startCharged === null) continue;
         const params = {} as Record<EffectParamName, string>;
         for (const p of EFFECT_PARAM_NAMES) params[p] = r.get(p);
+        const axes = {} as Record<EffectAxisName, string>;
+        for (const a of EFFECT_AXIS_NAMES) axes[a] = r.get(a);
         functionRows.push({
           file: files.functions.name,
           row: r.line,
@@ -570,6 +638,7 @@ export function loadContent(files: DataFiles): LoadResult {
           payloadRaw,
           notes: r.get('notes').trim(),
           params,
+          axes,
           tupleRaw: r.get('params').trim(),
           startCharged,
         });
@@ -773,6 +842,63 @@ export function loadContent(files: DataFiles): LoadResult {
     }
   }
 
+  // ---- Phase 3/4 — parse System dataset (Alpha 0.5.0 §5) ----
+
+  const systemRows: SystemRow[] = [];
+  {
+    const table = readTable(files.systems, 'systems', SYSTEM_HEADER);
+    if (table) {
+      for (const r of table.rows) {
+        const id = r.get('SYS_ID').trim();
+        const ctx: Ctx = { dataset: 'systems', file: files.systems.name, row: r.line, id };
+        if (!id) {
+          err({ ...ctx, field: 'SYS_ID', reason: 'SYS_ID is required' });
+          continue;
+        }
+        if (!id.startsWith('SYS_')) {
+          err({ ...ctx, field: 'SYS_ID', value: id, expected: 'SYS_*', reason: 'wrong System ID prefix' });
+          continue;
+        }
+        const name = checkName(r.get('name'), ctx);
+        // §5.2 — a positive integer base maximum ICE. Run escalation is applied
+        // on top of this as an additive modifier (§10.1), never baked in here.
+        const baseIce = readInt(r.get('BASE_ICE'), { ...ctx, field: 'BASE_ICE' }, 1, 9999);
+        const strongColors = parseTokenList(r.get('STRONG_COLORS'), COLOR_TOKENS, { ...ctx, field: 'STRONG_COLORS' });
+        const strongShapes = parseTokenList(r.get('STRONG_SHAPES'), SHAPE_TOKENS, { ...ctx, field: 'STRONG_SHAPES' });
+        const programs = parseSystemBuild(r.get('PRG_SET'), { ...ctx, field: 'PRG_SET' });
+        // §2.2/§40 — System passive Skills are DEFERRED. A nonblank value is
+        // unsupported content and blocks startup rather than being parsed and
+        // silently ignored, so authored intent can never quietly do nothing.
+        const skillRaw = r.get('SKILL').trim();
+        if (skillRaw !== '') {
+          err({
+            ...ctx,
+            field: 'SKILL',
+            value: skillRaw,
+            expected: 'blank',
+            reason: 'System passive Skills are not supported in Alpha 0.5 — SKILL must be blank',
+          });
+        }
+        if (name === null || baseIce === null || strongColors === null || strongShapes === null || programs === null || skillRaw !== '') {
+          continue;
+        }
+        systemRows.push({
+          file: files.systems.name,
+          row: r.line,
+          id,
+          name,
+          baseIce,
+          strongColors,
+          strongShapes,
+          programs,
+          // §5.2 placeholders: retained verbatim, never interpreted or displayed
+          bio: r.get('BIO').trim(),
+          graphics: r.get('GRAPHICS').trim(),
+        });
+      }
+    }
+  }
+
   // ---- Phase 5 — global ID uniqueness + duplicate-name warnings ----
 
   const idHome = new Map<string, { dataset: DatasetName; file: string; row: number }>();
@@ -790,6 +916,7 @@ export function loadContent(files: DataFiles): LoadResult {
   const uniqueSkills = skillRows.filter((s) => claimId(s.id, { dataset: 'skills', file: s.file, row: s.row }));
   const uniqueHackers = hackerRows.filter((h) => claimId(h.id, { dataset: 'hackers', file: h.file, row: h.row }));
   const uniqueDecks = deckRows.filter((d) => claimId(d.id, { dataset: 'decks', file: d.file, row: d.row }));
+  const uniqueSystems = systemRows.filter((s) => claimId(s.id, { dataset: 'systems', file: s.file, row: s.row }));
 
   {
     // §4.2 — duplicate display names are valid but produce a startup warning.
@@ -799,6 +926,7 @@ export function loadContent(files: DataFiles): LoadResult {
       ...uniqueFunctions.map((f) => ({ name: f.name, dataset: 'functions' as const, file: f.file, row: f.row, id: f.id })),
       ...uniqueHackers.map((h) => ({ name: h.name, dataset: 'hackers' as const, file: h.file, row: h.row, id: h.id })),
       ...uniqueDecks.map((d) => ({ name: d.name, dataset: 'decks' as const, file: d.file, row: d.row, id: d.id })),
+      ...uniqueSystems.map((s) => ({ name: s.name, dataset: 'systems' as const, file: s.file, row: s.row, id: s.id })),
     ]) {
       const prev = names.get(rec.name);
       if (prev) {
@@ -954,8 +1082,13 @@ export function loadContent(files: DataFiles): LoadResult {
           continue;
         }
         const v = parsed.value;
+        // Alpha 0.5.0 §2.5 — `quantity` is "up to this many valid targets", so
+        // an authored maximum may legitimately exceed the board's cell count
+        // (COERCE uses 99 to mean "every eligible Packet"). The old 1-64 bound
+        // was the board size; 99 is an ORDINARY number here, never a sentinel,
+        // and fewer targets simply means fewer deployments.
         const range: [number, number] =
-          col === 'quantity' ? [1, 64] : col === 'countdown' ? [1, 9999] : [1, 999999];
+          col === 'quantity' ? [1, 999] : col === 'countdown' ? [1, 9999] : [1, 999999];
         if (v < range[0] || v > range[1]) {
           err({ ...ctx, field: col, value: raw.trim(), expected: `${range[0]}-${range[1]}`, reason: 'parameter out of range' });
           ok = false;
@@ -987,6 +1120,11 @@ export function loadContent(files: DataFiles): LoadResult {
             dealDamage: vals[3],
             gainCharge: vals[4],
           } as LineSliceParams;
+        } else if (p.effectId === 'EFFECT_TRANSFORM') {
+          out.transform = {
+            targeting: vals[0],
+            specialPacketTreatment: vals[1],
+          } as TransformParams;
         } else if (p.effectId === 'EFFECT_SHAKE') {
           const shake: ShakeParams = {
             boardComposition: vals[0] as ShakeParams['boardComposition'],
@@ -1007,11 +1145,71 @@ export function loadContent(files: DataFiles): LoadResult {
     } else if (f.tupleRaw !== '') {
       warn({ ...ctx, field: 'params', value: f.tupleRaw, reason: `populated parameter is unused by ${p.effectId}` });
     }
+
+    // ---- Alpha 0.5.0 §22 — the Transform AXIS columns ----
+    // Required columns are parsed into typed enum values here so runtime never
+    // re-reads the authored strings; columns an Effect does not declare warn
+    // when populated, exactly as unused discrete parameters do.
+    {
+      const declared = new Set<EffectAxisName>(contract.axes ?? []);
+      for (const col of EFFECT_AXIS_NAMES) {
+        const raw = f.axes[col].trim();
+        if (!declared.has(col)) {
+          if (raw) warn({ ...ctx, field: col, value: raw, reason: `populated parameter is unused by ${p.effectId}` });
+          continue;
+        }
+        if (!raw) {
+          err({ ...ctx, field: col, reason: `missing required parameter for ${p.effectId}` });
+          ok = false;
+          continue;
+        }
+        if (col === 'axisTarget') {
+          // §22.1 — Alpha 0.5 supports exactly one source axis. Broadening to
+          // arbitrary color/shape sources needs a concrete authored row first.
+          if (raw !== AXIS_TARGET_NEUTRAL) {
+            err({ ...ctx, field: col, value: raw, expected: AXIS_TARGET_NEUTRAL, reason: 'unsupported axisTarget for Alpha 0.5' });
+            ok = false;
+            continue;
+          }
+          out.axisTarget = AXIS_TARGET_NEUTRAL;
+          continue;
+        }
+        // §22.2 — axisResult is exactly <COLOR>:<SHAPE>, one of each, and the
+        // result color may not be the neutral pseudo-axis (a transform whose
+        // result is neutral again would be a no-op with a cost).
+        const tokens = raw.split(':').map((t) => t.trim());
+        if (tokens.length !== 2) {
+          err({ ...ctx, field: col, value: raw, expected: '<COLOR>:<SHAPE>', reason: 'axisResult must contain exactly one color and one shape' });
+          ok = false;
+          continue;
+        }
+        const [colorTok, shapeTok] = tokens;
+        if (colorTok === AXIS_TARGET_NEUTRAL) {
+          err({ ...ctx, field: col, value: colorTok, expected: Object.keys(COLOR_TOKENS).join('|'), reason: 'axisResult color may not be neutral' });
+          ok = false;
+          continue;
+        }
+        if (!(colorTok in COLOR_TOKENS)) {
+          err({ ...ctx, field: col, value: colorTok, expected: Object.keys(COLOR_TOKENS).join('|'), reason: 'unknown color enum value in axisResult' });
+          ok = false;
+          continue;
+        }
+        if (!(shapeTok in SHAPE_TOKENS)) {
+          err({ ...ctx, field: col, value: shapeTok, expected: Object.keys(SHAPE_TOKENS).join('|'), reason: 'unknown shape enum value in axisResult' });
+          ok = false;
+          continue;
+        }
+        out.axisResult = { color: COLOR_TOKENS[colorTok], shape: SHAPE_TOKENS[shapeTok] } as AxisResult;
+      }
+    }
+
     // §12.3 — a PLAYER-TARGETED configuration deploys exactly once. Quantity
     // above one would mean accumulating several player-chosen targets, which
     // is deferred multi-target behavior and explicitly out of scope (§22).
     // Random targeting may still deploy more than once.
-    const targeting = out.bomb?.targeting ?? out.line?.targeting;
+    // Alpha 0.5.0 §23.1 — EFFECT_TRANSFORM joins the same rule through the
+    // same check rather than getting its own targeted-quantity validation.
+    const targeting = out.bomb?.targeting ?? out.line?.targeting ?? out.transform?.targeting;
     if (targeting === TARGETING_TARGETED && (out.quantity ?? 1) !== 1) {
       err({
         ...ctx,
@@ -1066,6 +1264,27 @@ export function loadContent(files: DataFiles): LoadResult {
   for (const h of uniqueHackers) checkPortfolioRefs(h.id, h.portfolio, { dataset: 'hackers', file: h.file, row: h.row });
   for (const d of uniqueDecks) checkPortfolioRefs(d.id, d.portfolio, { dataset: 'decks', file: d.file, row: d.row });
 
+  // Alpha 0.5.0 §40 — a System's PRG_SET must resolve to LOADED System
+  // Programs. The prefix check already rejected PRG_H_* references; this
+  // catches a well-formed PRG_S_* ID that no row defines.
+  const systemProgramIds = new Set(uniquePrograms.filter((p) => p.dataset === 'system-programs').map((p) => p.id));
+  for (const s of uniqueSystems) {
+    for (const pid of s.programs) {
+      if (!systemProgramIds.has(pid)) {
+        err({
+          dataset: 'systems',
+          file: s.file,
+          row: s.row,
+          id: s.id,
+          field: 'PRG_SET',
+          value: pid,
+          expected: 'a loaded PRG_S_* Program',
+          reason: 'PRG_SET references an unknown System Program ID',
+        });
+      }
+    }
+  }
+
   // §4.6 — because every Deck is compatible with every Hacker (§2.7), EVERY
   // pairing must be able to produce a valid six-Program inventory. Overlap
   // between a Hacker and a Deck portfolio is a startup content error: Alpha
@@ -1116,7 +1335,7 @@ export function loadContent(files: DataFiles): LoadResult {
   const resolveTarget = (effectId: string, params: EffectParams): TargetKind | null => {
     const contract = effectContract(effectId)!;
     if (contract.targeted) return contract.targetKind ?? 'unit';
-    const targeting = params.bomb?.targeting ?? params.line?.targeting;
+    const targeting = params.bomb?.targeting ?? params.line?.targeting ?? params.transform?.targeting;
     return targeting === TARGETING_TARGETED ? (contract.targetKind ?? 'packet') : null;
   };
 
@@ -1181,6 +1400,20 @@ export function loadContent(files: DataFiles): LoadResult {
   requireIds(REQUIRED_HAK_IDS, (id) => hakIds.has(id), 'hackers', files.hackers.name);
   requireIds(REQUIRED_SKL_IDS, (id) => sklById.has(id), 'skills', files.skills.name);
   requireIds(REQUIRED_DEK_IDS, (id) => dekIds.has(id), 'decks', files.decks.name);
+  const sysIds = new Set(uniqueSystems.map((s) => s.id));
+  requireIds(REQUIRED_SYS_IDS, (id) => sysIds.has(id), 'systems', files.systems.name);
+
+  // §11.1/§41 — random encounter selection samples the loaded catalog, so an
+  // EMPTY catalog is not a playable state and must not be papered over with a
+  // synthesized default System.
+  if (uniqueSystems.length === 0) {
+    err({ dataset: 'systems', file: files.systems.name, reason: 'at least one valid System is required' });
+  }
+  // The headless harness pins one System (§44); a missing pin is a content
+  // error rather than a silent fall back to whatever row happens to be first.
+  if (uniqueSystems.length > 0 && !sysIds.has(HEADLESS_SYSTEM_ID)) {
+    err({ dataset: 'content', file: files.systems.name, id: HEADLESS_SYSTEM_ID, reason: `HEADLESS_SYSTEM_ID ${HEADLESS_SYSTEM_ID} is not a valid loaded System` });
+  }
 
   // §5.2 — a missing or invalid explicit default BLOCKS startup. There is no
   // fallback to another row.
@@ -1213,6 +1446,19 @@ export function loadContent(files: DataFiles): LoadResult {
     for (const s of uniqueSkills) {
       if (!referencedSkills.has(s.id)) {
         warn({ dataset: 'skills', file: s.file, row: s.row, id: s.id, reason: 'valid Skill row is not referenced by any Hacker' });
+      }
+    }
+    // Alpha 0.5.0 §5.4 — SYS.PRG_SET is now the only thing that puts a System
+    // Program into play, so a System Program no authored System fields is dead
+    // content. It WARNS rather than failing (it is valid, just unused), which
+    // is how PRG_S_004 DISABLER currently surfaces: neither BOUNCER nor
+    // MIDNIGHT fields it, so the System never Drains in Alpha 0.5 (§6.2).
+    const referencedSystemPrograms = new Set<string>();
+    for (const s of uniqueSystems) for (const pid of s.programs) referencedSystemPrograms.add(pid);
+    for (const p of uniquePrograms) {
+      if (p.dataset !== 'system-programs') continue;
+      if (!referencedSystemPrograms.has(p.id)) {
+        warn({ dataset: p.dataset, file: p.file, row: p.row, id: p.id, reason: 'valid System Program row is not fielded by any System PRG_SET' });
       }
     }
   }
@@ -1316,7 +1562,27 @@ export function loadContent(files: DataFiles): LoadResult {
     });
   }
 
-  const fingerprint = computeFingerprint(hacker, system, functions, hackers, skills, decks);
+  // Alpha 0.5.0 §5.3 — weak sets are calculated complements over the
+  // recognized enum vocabularies, exactly as the Hacker's are. Each System has
+  // its own independent profile; nothing here consults the Hacker (§2.4).
+  const systems = new Map<string, ResolvedSystem>();
+  for (const s of uniqueSystems) {
+    systems.set(s.id, {
+      id: s.id,
+      name: s.name,
+      baseIce: s.baseIce,
+      strongColors: s.strongColors,
+      weakColors: RECOGNIZED_COLORS.filter((c) => !s.strongColors.includes(c)),
+      strongShapes: s.strongShapes,
+      weakShapes: RECOGNIZED_SHAPES.filter((sh) => !s.strongShapes.includes(sh)),
+      programIds: s.programs,
+      skillIds: [], // §2.2 — validated blank above; reserved for a later build
+      bio: s.bio,
+      graphics: s.graphics,
+    });
+  }
+
+  const fingerprint = computeFingerprint(hacker, system, functions, hackers, skills, decks, systems);
   const content: ResolvedContent = {
     gameVersion: GAME_VERSION,
     schemaVersion: DATA_SCHEMA_VERSION,
@@ -1328,8 +1594,10 @@ export function loadContent(files: DataFiles): LoadResult {
     hackers,
     skills,
     decks,
+    systems,
     hackerOrder: uniqueHackers.map((h) => h.id),
     deckOrder: uniqueDecks.map((d) => d.id),
+    systemOrder: uniqueSystems.map((s) => s.id),
   };
   return { content, issues, errors, warnings };
 }
@@ -1338,9 +1606,11 @@ export function loadContent(files: DataFiles): LoadResult {
 // values from ALL required datasets: program IDs/side/bindings/function refs,
 // function IDs/costs/ordered payload plans/validated parameters/startCharged,
 // the area-pattern definitions the content uses, Hacker LINK and strong sets
-// and ordered Skill IDs, Skill effect types and typed parameters, and Deck
-// added LINK and Function references. EXCLUDES notes, display names, BIO,
-// GRAPHICS, DESCRIPT, presentational Skill display text, and CSV formatting.
+// and ordered Skill IDs, Skill effect types and typed parameters, Deck added
+// LINK and Function references, and (Alpha 0.5.0 §8) System base ICE, authored
+// strong sets, and ordered PRG_SET. EXCLUDES notes, display names, BIO,
+// GRAPHICS, DESCRIPT, presentational Skill display text, derived weak sets, and
+// CSV formatting.
 function computeFingerprint(
   hacker: ResolvedProgram[],
   system: ResolvedProgram[],
@@ -1348,6 +1618,7 @@ function computeFingerprint(
   hackers: Map<string, ResolvedHacker>,
   skills: Map<string, ResolvedSkill>,
   decks: Map<string, ResolvedDeck>,
+  systems: Map<string, ResolvedSystem>,
 ): string {
   const usedAreas = new Set<string>();
   const byId = <T extends { id: string }>(m: Map<string, T>): T[] =>
@@ -1381,6 +1652,12 @@ function computeFingerprint(
               op.params.line.gainCharge,
             ]
           : null,
+        // Alpha 0.5.0 §8 — the Transform tuple and its RESOLVED axes are
+        // gameplay-affecting: changing the result color/shape changes what the
+        // Effect does, so it must change the fingerprint.
+        xf: op.params.transform ? [op.params.transform.targeting, op.params.transform.specialPacketTreatment] : null,
+        at: op.params.axisTarget ?? null,
+        ar: op.params.axisResult ? [op.params.axisResult.color, op.params.axisResult.shape] : null,
         tgt: op.target,
       };
     }),
@@ -1399,6 +1676,20 @@ function computeFingerprint(
   }));
   const sklNorm = byId(skills).map((s) => ({ id: s.id, effect: s.effectType, color: s.color, mag: s.magnitude }));
   const dekNorm = byId(decks).map((d) => ({ id: d.id, add: d.addLink, fn: d.functionId, prg: [...d.portfolioProgramIds] }));
+  // Alpha 0.5.0 §8 — System gameplay identity. Base ICE, the authored strong
+  // sets, and the ORDERED Program build all change how a battle plays, so all
+  // three are fingerprint input; PRG_SET order matters because it is charge-
+  // routing priority. BIO and GRAPHICS are presentation-only and excluded,
+  // exactly as the Hacker's placeholders are. Weak sets are derived from the
+  // strong sets, so fingerprinting them too would be duplicate authority.
+  const sysNorm = byId(systems).map((s) => ({
+    id: s.id,
+    ice: s.baseIce,
+    sc: [...s.strongColors],
+    ss: [...s.strongShapes],
+    prg: [...s.programIds],
+    skills: [...s.skillIds],
+  }));
   const areas = [...usedAreas].sort().map((id) => ({ id, cells: AREA_PATTERNS[id as keyof typeof AREA_PATTERNS] }));
   const canonical = JSON.stringify({
     schema: DATA_SCHEMA_VERSION,
@@ -1409,6 +1700,7 @@ function computeFingerprint(
     hackers: hakNorm,
     skills: sklNorm,
     decks: dekNorm,
+    systems: sysNorm,
   });
   let h = 5381;
   for (let i = 0; i < canonical.length; i++) h = ((h << 5) + h + canonical.charCodeAt(i)) >>> 0;
