@@ -22,10 +22,12 @@ import {
   PortfolioSource,
   ResolvedDeck,
   ResolvedHacker,
+  ResolvedHost,
   ResolvedProgram,
   ResolvedSystem,
   allDecks,
   allHackers,
+  allHosts,
   allSystems,
   contentStamp,
   deckById,
@@ -33,6 +35,7 @@ import {
   functionTargetKind,
   getContent,
   hackerById,
+  hostById,
   inventoryFor,
   inventoryProgramIds,
   programById,
@@ -40,6 +43,7 @@ import {
   setActiveContent,
   systemById,
   targetKindOf,
+  upgradeById,
 } from './logic/data/content';
 import type { TargetKind } from './logic/data/effects';
 import { formatIssue, loadContent } from './logic/data/load';
@@ -61,6 +65,8 @@ import { isPendingSpecial } from './logic/resolve';
 import {
   BuildContext,
   BuildState,
+  PathOffer,
+  PendingPath,
   PendingResultInfo,
   PendingSetup,
   RunInfo,
@@ -71,6 +77,7 @@ import {
   beginSetup,
   chooseDeck,
   chooseHacker,
+  commitNewRun,
   RUN_LENGTH,
   contextLabel,
   continueLabel,
@@ -86,14 +93,17 @@ import {
   moveBuildSlot,
   naturalOf,
   nextStep,
+  openPathChoice,
   progressesAsVictory,
   randomBuild,
+  randomHost,
   randomSystem,
   recreateBattleFromConfig,
   replaceInBuild,
   resolveHackerMaxLink,
   resolveQuickMatchIce,
   resolveRunIce,
+  selectPath,
   serializeConstructedPreset,
   serializeSession,
   setupBack,
@@ -167,6 +177,9 @@ let build: BuildState | null = null;
 // NOT started yet. Ephemeral pending setup exactly like `setup` above: it does
 // not touch the resident save until the battle actually begins.
 let pendingQuickSystem: SelectedSystem | null = null;
+// Alpha 0.6.0 §38 — the HOST chosen for a Constructed Quick Match that has not
+// started yet, on exactly the same ephemeral terms as the System above.
+let pendingQuickHost: string | null = null;
 // §20.2 — true exactly while Hacker input is locked for the System turn.
 let systemTurnActive = false;
 // MK5.4: the menu's chosen settings — persisted, never implicitly reset.
@@ -349,7 +362,7 @@ function metricsElement(m: BattleMetrics): HTMLElement {
     row(`  transform-caused (incl. its cascades): ${fmt(sm.transformDamage)}`);
     row(`  Attack: ${fmt(sm.attackerDamage)}`);
     row(`  Buffer added: ${fmt(sm.bufferDamageAdded)}`);
-    row(`  Skill damage: ${fmt(sm.skillDamage)}`);
+    row(`  PASSIVE damage: ${fmt(sm.passiveDamage)}`);
     row(`Cascade (RNG-refill) damage, any cause: ${fmt(sm.cascadeDamage)}`);
     row(`Sync damage by axis: color ${fmt(sm.matchDamageColor)} / shape ${fmt(sm.matchDamageShape)}`);
     const critPct = sm.matchDamage > 0 ? ((sm.critExtra / sm.matchDamage) * 100).toFixed(1) : '0.0';
@@ -381,10 +394,22 @@ function metricsElement(m: BattleMetrics): HTMLElement {
       if (d.shakeAttempts > 0) {
         row(`  Shake: ${d.shakeSuccesses}/${d.shakeAttempts} resolved, ${d.shakeFizzles} legal fizzle${d.shakeFizzles === 1 ? '' : 's'}`);
       }
-      for (const [sid, k] of Object.entries(sm.skills)) {
-        const skill = getContent().skills.get(sid);
-        row(`Skill ${sid}${skill ? ` (${skill.display})` : ''}: ${k.triggers} trigger${k.triggers === 1 ? '' : 's'}, +${fmt(k.damage)} dmg, +${k.charge} charge`);
-      }
+    }
+    // Alpha 0.6.0 §47 — PASSIVE contributions, one row per INSTANCE (source +
+    // PASSIVE), for BOTH sides: a HOST or an UPGRADE can now modify either
+    // agent's numbers, so restricting this to the Hacker would hide half of it.
+    for (const k of Object.values(sm.passives)) {
+      const psv = getContent().passives.get(k.passiveId);
+      const parts = [
+        k.damage !== 0 ? `${k.damage >= 0 ? '+' : ''}${fmt(k.damage)} dmg` : '',
+        k.charge !== 0 ? `${k.charge >= 0 ? '+' : ''}${k.charge} charge` : '',
+        k.shield !== 0 ? `+${k.shield} shield` : '',
+        k.steps !== 0 ? `+${k.steps} area step${k.steps === 1 ? '' : 's'}` : '',
+      ].filter(Boolean);
+      row(
+        `${k.sourceKind} ${k.sourceId} / ${k.passiveId}${psv?.display ? ` (${psv.display})` : ''}: ` +
+          `${k.triggers} trigger${k.triggers === 1 ? '' : 's'}${parts.length ? `, ${parts.join(', ')}` : ''}`,
+      );
     }
   }
 
@@ -486,13 +511,20 @@ function configPanel(rerender: () => void): HTMLElement {
   nlRow.appendChild(document.createTextNode(' Normal LINK'));
   health.appendChild(nlRow);
 
+  // Alpha 0.6.0 §51 — the note text and the manual rows are updated IN PLACE
+  // when Normal Link toggles. Through Alpha 0.5 the handler called rerender(),
+  // which rebuilt the whole panel and therefore collapsed every open <details>
+  // section — including this one, hiding the manual inputs it had just enabled.
+  const noteText = (): string =>
+    menuSettings.normalLink
+      ? 'Hacker LINK = Hacker BASE_LINK + Deck ADD_LINK. Quick Match System ICE is the System’s own BASE_ICE; a Run adds +0/+50/+100/+150.'
+      : 'Manual values below are used for the Hacker and for every Run encounter.';
   const note = document.createElement('div');
   note.className = 'cfgnote';
-  note.textContent = menuSettings.normalLink
-    ? 'Hacker LINK = Hacker BASE_LINK + Deck ADD_LINK. Quick Match System ICE mirrors it; a Run uses 100/150/200/250.'
-    : 'Manual values below are used for the Hacker and for every Run encounter.';
+  note.textContent = noteText();
   health.appendChild(note);
 
+  const manualRows: HTMLElement[] = [];
   const manualRow = (label: string, key: 'manualHackerLink' | 'manualSystemIce'): void => {
     const l = document.createElement('label');
     l.appendChild(document.createTextNode(`${label} `));
@@ -511,15 +543,20 @@ function configPanel(rerender: () => void): HTMLElement {
     l.appendChild(n);
     // hidden (not removed) while Normal LINK is ON — the values persist
     if (menuSettings.normalLink) l.style.display = 'none';
+    manualRows.push(l);
     health.appendChild(l);
   };
   manualRow('Hacker LINK', 'manualHackerLink');
   manualRow('System ICE', 'manualSystemIce');
 
+  // §51 — toggling in EITHER direction leaves this accordion exactly as the
+  // user left it. The OFF case matters most: the manual inputs it reveals must
+  // be immediately visible, not behind a section that just collapsed itself.
   nlCb.addEventListener('change', () => {
     menuSettings = { ...menuSettings, normalLink: nlCb.checked };
     saveMenuSettings(menuSettings);
-    rerender(); // re-open so the manual controls appear/disappear
+    note.textContent = noteText();
+    for (const l of manualRows) l.style.display = menuSettings.normalLink ? 'none' : '';
   });
 
   const hintRow = document.createElement('label');
@@ -780,16 +817,37 @@ function characterSheetSide(cfg: BattleConfig, side: Side, identity: BattleIdent
   row(`Weak colors (${DAMAGE_PER_TILE_LOW_COLOR} dmg): ${colorList(weakC)}`);
   row(`Strong shapes (${DAMAGE_PER_TILE_HIGH_SHAPE} dmg): ${shapeList(strongS)}`);
   row(`Weak shapes (${DAMAGE_PER_TILE_LOW_SHAPE} dmg): ${shapeList(weakS)}`);
+  // Alpha 0.6.0 §25/§26 — PASSIVEs on the sheet for BOTH sides, each labelled
+  // with the source that supplied it. The HOST is not an agent, so its
+  // PASSIVEs appear on the environment panel below rather than being folded
+  // into either sheet (§13 — HOST is a first-class source, not a Hacker or
+  // System property).
+  const sidePassives =
+    side === 'player'
+      ? [
+          ...hacker.passives.map((p) => ({ p, src: `HAK ${hacker.id}` })),
+          ...identity.upgradeIds.flatMap((uid) =>
+            upgradeById(uid).passives.map((p) => ({ p, src: `UPG ${upgradeById(uid).name}` })),
+          ),
+        ]
+      : systemById(identity.systemId).passives.map((p) => ({ p, src: `SYS ${identity.systemId}` }));
+  row('PASSIVES', true);
+  if (!sidePassives.length) row('none');
+  for (const { p, src } of sidePassives) row(`${p.display} [${p.id}] — ${src}`);
   if (side === 'player') {
-    // §20.3 — Hacker Skill descriptions for the selected Hacker
-    row('SKILLS', true);
-    if (!hacker.skills.length) row('none');
-    for (const sk of hacker.skills) row(`${sk.display} [${sk.id}]`);
     // §20.3 — Deck name and Deck Function summary on the Hacker side
     const deck = deckById(identity.deckId);
     row('DECK', true);
     row(`${deck.name} [${deck.id}] — +${deck.addLink} LINK`);
     row(`${deck.fn.name} costs ${deck.fn.cost}, ${startChargeText(deck.fn.startCharged, deck.fn.cost)}`);
+  } else {
+    // §25 — the committed HOST and its resolved PASSIVEs, on the System sheet
+    // because that is the opponent-facing surface a tester already opens.
+    const host = hostById(identity.hostId);
+    row('HOST', true);
+    row(`${host.name} [${host.id}]`);
+    if (!host.passives.length) row('no PASSIVEs');
+    for (const p of host.passives) row(`${p.display} [${p.id}]`);
   }
   // §5.3/§19.4 — the ACTIVE build in battle order, numbered so the charge
   // priority the player is looking at is unambiguous.
@@ -832,9 +890,15 @@ function showCharacterSheet(side: Side): void {
 
 // ---- persistence (session envelope — logic/session.ts owns the format) ----
 
+// Alpha 0.6.0 §28/§42 — a committed Run is saveable with NO battle: the Path
+// Choice is real persisted state, not a transient screen. Through Alpha 0.5
+// this required `game`, which would have silently dropped every pending-path
+// save on the floor. Quick Match still always has a battle, and a battle-less
+// Quick Match envelope would not deserialize, so it is never written.
 function persistSession(): void {
-  if (!game || !session) return;
-  saveBattle(serializeSession(session, game, pending), game.state.turn);
+  if (!session) return;
+  if (!game && session.mode !== 'RUN') return;
+  saveBattle(serializeSession(session, game, pending), game?.state.turn ?? 0);
 }
 
 function appendWizard(action: WizardAction): void {
@@ -889,6 +953,57 @@ function logSystemSelected(system: SelectedSystem, context: SelectionLogEntry['b
       systemStrongShapes: [...s.strongShapes],
       systemPrograms: [...s.programIds],
       ...(context ? { buildContext: context } : {}),
+    },
+  });
+}
+
+// Alpha 0.6.0 §46 — one record per COMMITTED HOST resolution, on exactly the
+// System's terms: emitted when the HOST is resolved, never per turn.
+function logHostSelected(
+  hostId: string,
+  source: 'QUICK_RANDOM' | 'QUICK_CONSTRUCTED' | 'RUN_PATH',
+  context: SelectionLogEntry['buildContext'],
+): void {
+  const h = hostById(hostId);
+  logSelection('HOST_SELECTED', {
+    extra: {
+      hostId: h.id,
+      hostSelectionSource: source,
+      hostPassives: [...h.passiveIds],
+      ...(context ? { buildContext: context } : {}),
+    },
+  });
+}
+
+// §46 — the offer-generation record: enough to reconstruct EVERY offered path,
+// including which battle it leads into and whether the duplicate UPGRADE was
+// the pool-exhaustion case. Abandoned hover/preselect state is deliberately not
+// logged (§46 — no abandoned modal noise); only generation and commitment are.
+function logPathOffered(p: PendingPath): void {
+  logSelection('PATH_OFFERED', {
+    extra: {
+      targetStep: p.step,
+      offers: p.offers.map((o) => ({ index: o.index, systemId: o.systemId, hostId: o.hostId, upgradeId: o.upgradeId })),
+      upgradeExhausted: p.upgradeExhausted,
+    },
+  });
+}
+
+// §46 — the commitment record: which path, its exact package, and the acquired
+// UPGRADE list AFTER commitment.
+function logPathSelected(p: PendingPath, offer: PathOffer, before: string[], after: string[]): void {
+  logSelection('PATH_SELECTED', {
+    extra: {
+      targetStep: p.step,
+      selectedPath: offer.index,
+      systemId: offer.systemId,
+      hostId: offer.hostId,
+      upgradeId: offer.upgradeId,
+      upgradeExhausted: p.upgradeExhausted,
+      // §31 — a duplicate-offer path acquires its UPGRADE exactly once, so an
+      // unchanged list here is the legitimate already-acquired case, not a bug.
+      upgradeAcquired: after.length > before.length,
+      acquiredUpgrades: [...after],
     },
   });
 }
@@ -1090,7 +1205,7 @@ function showHackerSelection(s: PendingSetup): void {
         `Weak colors: ${colorList(h.weakColors)}`,
         `Strong shapes: ${shapeList(h.strongShapes)}`,
         `Weak shapes: ${shapeList(h.weakShapes)}`,
-        ...h.skills.map((sk) => `Skill: ${sk.display}`),
+        ...h.passives.map((p) => `Passive: ${p.display}`),
       ],
     })),
     preselect,
@@ -1114,7 +1229,7 @@ function showHackerSelection(s: PendingSetup): void {
   }
   showDialog(
     'SELECT HACKER',
-    'Step 1 of 3',
+    'Step 1 of 2',
     [
       // explicit forward action; no modal confirmation follows it (§13.2)
       ['Choose', () => {
@@ -1187,23 +1302,22 @@ function showDeckSelection(s: PendingSetup): void {
   }
   showDialog(
     'SELECT DECK',
-    'Step 2 of 3',
+    'Step 2 of 2',
     [
       ['Choose', () => {
         if (!preselect) return;
         logSelection('DECK_SELECTED', { identity: { hackerId: s.hackerId ?? undefined, deckId: preselect } });
-        // Alpha 0.5.0 §11.2/§11.3 — entering Build resolves the Battle 1
-        // opponent, so the player can react to it while editing the build. The
-        // roll uses an isolated SETUP random source (§14): it must not consume
-        // or perturb the gameplay RNG the battle will seed independently.
-        // chooseDeck keeps any System already rolled during this pending setup,
-        // so Back/forward navigation cannot reroll the encounter (§11.3).
-        const next = chooseDeck({ ...s, deckId: preselect }, preselect, makeSetupRandom().rng);
-        setup = next;
-        if (!s.system && next.system) logSystemSelected(next.system, 'INITIAL_RUN');
-        // §8.3 — a newly initiated Run always opens Build on the DEFAULT
-        // build, whatever any prior Run or remembered preset held.
-        openBuild(beginBuild('INITIAL_RUN', s.hackerId!, preselect, null, 'DEFAULT'));
+        setup = chooseDeck({ ...s, deckId: preselect }, preselect);
+        // Alpha 0.6.0 §28 — this is now the DESTRUCTIVE COMMITMENT BOUNDARY:
+        // advancing into the initial Path Choice creates the Run and replaces
+        // the resident save. The confirmation moved here with it, so the
+        // destructive step is still confirmed exactly once (§12.3).
+        const restored = deserializeSession(loadBattleJson());
+        confirmReplace(
+          restored ? restored.info : null,
+          () => void commitRunToPathChoice(),
+          () => showDeckSelection({ ...s, deckId: preselect }),
+        );
       }, undefined, !preselect],
       // Back RETAINS the pending choices (§12.2)
       ['Back', () => {
@@ -1230,6 +1344,128 @@ function showDeckSelection(s: PendingSetup): void {
 // it never affects the build until a slot is chosen).
 let buildPick: string | null = null;
 
+// ============================================================================
+// Alpha 0.6.0 §27-§32 — PATH CHOICE
+//
+// Before every battle the player commits one of two `SYS + HST + UPG` packages.
+// The offers live in the committed Run save (§42), so this screen renders
+// session state and never generates or holds it.
+// ============================================================================
+
+// §25/§26 — the whitebox description of one offered path. Names first, then the
+// resolved PASSIVE displays: enough to understand the encounter without an art
+// system, an inventory screen, or `notes` leaking into player-facing copy.
+function pathOfferLines(offer: PathOffer): string[] {
+  const sys = systemById(offer.systemId);
+  const host = hostById(offer.hostId);
+  const upgrade = upgradeById(offer.upgradeId);
+  const lines = [`SYSTEM ${sys.name} — base ICE ${sys.baseIce}`];
+  lines.push(`HOST ${host.name}${host.passives.length ? '' : ' — no passives'}`);
+  for (const p of host.passives) lines.push(`  ${p.display}`);
+  lines.push(`UPGRADE ${upgrade.name}`);
+  for (const p of upgrade.passives) lines.push(`  ${p.display}`);
+  return lines;
+}
+
+function showPathChoice(): void {
+  if (!session || session.mode !== 'RUN' || !session.pendingPath) return;
+  const run = session;
+  const pending = run.pendingPath!;
+  const panels = document.createElement('div');
+  panels.className = 'panelscroll';
+
+  // §26 — the acquired UPGRADE list, so the tester can verify persistent Run
+  // state from the screen where it changes.
+  const acquired = document.createElement('div');
+  acquired.className = 'config readonly';
+  const acqHead = document.createElement('div');
+  acqHead.className = 'cfghead';
+  acqHead.textContent = 'UPGRADES ACQUIRED';
+  acquired.appendChild(acqHead);
+  const acqRow = document.createElement('div');
+  acqRow.textContent = run.upgradeIds.length
+    ? run.upgradeIds.map((id) => upgradeById(id).name).join(', ')
+    : 'none yet';
+  acquired.appendChild(acqRow);
+  panels.appendChild(acquired);
+
+  panels.appendChild(
+    optionList(
+      pending.offers.map((offer) => ({
+        id: String(offer.index),
+        title: `PATH ${offer.index + 1}`,
+        lines: pathOfferLines(offer),
+      })),
+      pathPick === null ? null : String(pathPick),
+      (id) => {
+        pathPick = Number(id);
+        showPathChoice();
+      },
+    ),
+  );
+
+  // §31 — the one-remaining-UPGRADE case is normal, not an error. Saying so on
+  // the screen keeps it from reading as a bug during playtest.
+  if (pending.upgradeExhausted) {
+    const note = document.createElement('div');
+    note.className = 'cfgnote';
+    note.textContent = 'Only one UPGRADE remains — both paths offer it.';
+    panels.appendChild(note);
+  }
+
+  showDialog(
+    `CHOOSE PATH — BATTLE ${pending.step} OF ${RUN_LENGTH}`,
+    'Selecting a path commits its System, HOST, and UPGRADE.',
+    [
+      // §32 — selection is immediate and final for that battle; there is
+      // deliberately no Back action on this screen.
+      ['Take this path', () => {
+        if (pathPick === null) return;
+        void takePath(pathPick);
+      }, undefined, pathPick === null],
+      ['Save and Quit', () => {
+        persistSession();
+        showTitle();
+      }],
+    ],
+    panels,
+    true,
+  );
+}
+
+// Which path card is armed (presentation only until confirmed).
+let pathPick: number | null = null;
+
+// §32 — commit the selected path, then open the pre-battle Build for it. The
+// UPGRADE is acquired BEFORE the Build screen exists, so its PASSIVEs are
+// already active for the battle the player is now building against (§27).
+async function takePath(index: number): Promise<void> {
+  if (!session || session.mode !== 'RUN' || !session.pendingPath) return;
+  const path = session.pendingPath;
+  const offer = path.offers[index];
+  if (!offer) return;
+  const before = [...session.upgradeIds];
+  const committed = selectPath(session, index);
+  session = committed;
+  logPathSelected(path, offer, before, committed.upgradeIds);
+  logHostSelected(offer.hostId, 'RUN_PATH', path.step === 1 ? 'INITIAL_RUN' : 'RUN_BETWEEN');
+  logSystemSelected({ systemId: offer.systemId, source: 'RUN_RANDOM' }, path.step === 1 ? 'INITIAL_RUN' : 'RUN_BETWEEN');
+  pathPick = null;
+  // §33 — Battle 1 opens on the DEFAULT build for a new Run; later battles
+  // carry the current build and order forward.
+  const first = path.step === 1;
+  const s = beginBuild(
+    first ? 'INITIAL_RUN' : 'RUN_BETWEEN',
+    committed.identity.hackerId,
+    committed.identity.deckId,
+    first ? null : committed.build,
+    first ? 'DEFAULT' : 'CARRIED_RUN',
+  );
+  openBuild(s);
+  persistBuildIfCommitted();
+  logBuildOpened(s);
+}
+
 function buildTitle(c: BuildContext): string {
   return c === 'CONSTRUCTED_QUICK_MATCH' ? 'CONSTRUCTED QUICK MATCH' : 'BUILD';
 }
@@ -1237,7 +1473,6 @@ function buildTitle(c: BuildContext): string {
 // §8.2 — the final action's wording follows the flow it sits in.
 function buildStartLabel(c: BuildContext, step: number): string {
   if (c === 'CONSTRUCTED_QUICK_MATCH') return 'Start Quick Match';
-  if (c === 'INITIAL_RUN') return 'Start Run — Battle 1';
   if (c === 'RUN_RETRY') return `Retry Battle ${step}`;
   return `Start Battle ${step}`;
 }
@@ -1254,8 +1489,16 @@ function openBuild(s: BuildState): void {
 // committed Run's persisted selection, or the pending Constructed choice.
 function upcomingSystemFor(s: BuildState): SelectedSystem | null {
   if (s.context === 'CONSTRUCTED_QUICK_MATCH') return pendingQuickSystem;
-  if (s.context === 'INITIAL_RUN') return setup?.system ?? null;
+  // Alpha 0.6.0 §27/§33 — every Run Build screen, INITIAL_RUN included, now
+  // opens only after a path is committed, so the committed Run is the one
+  // authority for the upcoming encounter.
   return session?.mode === 'RUN' ? session.system : null;
+}
+
+// §25/§33 — the committed HOST for this Build screen, from the same authority.
+function upcomingHostFor(s: BuildState): string | null {
+  if (s.context === 'CONSTRUCTED_QUICK_MATCH') return pendingQuickHost;
+  return session?.mode === 'RUN' ? session.hostId : null;
 }
 
 function showBuild(): void {
@@ -1292,7 +1535,7 @@ function showBuild(): void {
   idRow(`Weak colors: ${colorList(hacker.weakColors)}`);
   idRow(`Strong shapes: ${shapeList(hacker.strongShapes)}`);
   idRow(`Weak shapes: ${shapeList(hacker.weakShapes)}`);
-  for (const sk of hacker.skills) idRow(`Skill: ${sk.display}`);
+  for (const p of hacker.passives) idRow(`Passive: ${p.display}`);
   idRow(`${deck.name} [${deck.id}] — +${deck.addLink} LINK`, true);
   idRow(`Deck Function: ${deck.fn.name} costs ${deck.fn.cost}, ${startChargeText(deck.fn.startCharged, deck.fn.cost)}`);
   idBox.appendChild(details);
@@ -1333,8 +1576,53 @@ function showBuild(): void {
     sysRow(`Weak shapes: ${shapeList(sys.weakShapes)}`);
     sysRow('PROGRAMS (top to bottom — charge priority)', true);
     sysDetails.appendChild(systemProgramStrip(sys.programIds, showBuild));
+    if (sys.passives.length) {
+      sysRow('SYSTEM PASSIVES', true);
+      for (const p of sys.passives) sysRow(p.display);
+    }
     sysBox.appendChild(sysDetails);
     panels.appendChild(sysBox);
+  }
+
+  // ---- Alpha 0.6.0 §25/§26 — the committed HOST and acquired UPGRADEs ----
+  // The encounter package is committed BEFORE this screen opens (§27), so the
+  // player edits the build against a known battlefield and a known reward set.
+  // Same compact expandable presentation as the opponent panel, for the same
+  // narrow-screen reason.
+  const hostId = upcomingHostFor(s);
+  if (hostId) {
+    const host = hostById(hostId);
+    const envBox = document.createElement('div');
+    envBox.className = 'config readonly';
+    const envDetails = document.createElement('details');
+    envDetails.className = 'cfgsection';
+    const envSummary = document.createElement('summary');
+    const acquiredIds = session?.mode === 'RUN' ? session.upgradeIds : [];
+    envSummary.textContent =
+      `HOST: ${host.name}` + (acquiredIds.length ? ` — ${acquiredIds.length} UPGRADE${acquiredIds.length === 1 ? '' : 's'}` : '');
+    envDetails.appendChild(envSummary);
+    const envRow = (text: string, head = false): void => {
+      const d = document.createElement('div');
+      if (head) d.className = 'cfghead';
+      d.textContent = text;
+      envDetails.appendChild(d);
+    };
+    envRow(`${host.name} [${host.id}]`, true);
+    if (!host.passives.length) envRow('no PASSIVEs');
+    for (const p of host.passives) envRow(p.display);
+    // §26 — the acquired UPGRADE list, so persistent Run state is verifiable
+    // from the pre-battle screen. Quick Match has none and shows none (§37).
+    if (s.context !== 'CONSTRUCTED_QUICK_MATCH') {
+      envRow('UPGRADES ACQUIRED', true);
+      if (!acquiredIds.length) envRow('none yet');
+      for (const id of acquiredIds) {
+        const u = upgradeById(id);
+        envRow(`${u.name} [${u.id}]`);
+        for (const p of u.passives) envRow(`  ${p.display}`);
+      }
+    }
+    envBox.appendChild(envDetails);
+    panels.appendChild(envBox);
   }
 
   // ---- four ordered active slots (§8.1/§5.7) ----
@@ -1446,18 +1734,7 @@ function showBuild(): void {
   // ---- context-appropriate actions (§8.2/§8.3/§8.4/§8.5) ----
   const buttons: ButtonSpec[] = [];
   const startLabel = buildStartLabel(s.context, step);
-  if (s.context === 'INITIAL_RUN') {
-    const restored = deserializeSession(loadBattleJson());
-    // §12.3/§17.3 — the ONLY setup action that replaces the save.
-    buttons.push([startLabel, () => confirmReplace(restored ? restored.info : null, () => void commitRun(), showBuild)]);
-    buttons.push(['Back', () => {
-      // §6.3 — Back preserves pending setup; the resident save is untouched.
-      const prev = setup ? setupBack(setup) : null;
-      build = null;
-      if (prev) showDeckSelection(prev);
-      else showTitle();
-    }]);
-  } else if (s.context === 'CONSTRUCTED_QUICK_MATCH') {
+  if (s.context === 'CONSTRUCTED_QUICK_MATCH') {
     const restored = deserializeSession(loadBattleJson());
     buttons.push([startLabel, () => confirmReplace(restored ? restored.info : null, () => void startConstructedQuickMatch(), showBuild)]);
     // §9.3 — backing out neither writes the preset nor replaces the save.
@@ -1465,9 +1742,9 @@ function showBuild(): void {
     // screen that now precedes it), with the previous pick still showing.
     buttons.push(['Back', () => {
       build = null;
-      systemPick = pendingQuickSystem?.systemId ?? null;
-      pendingQuickSystem = null;
-      showSystemSelection();
+      hostPick = pendingQuickHost;
+      pendingQuickHost = null;
+      showHostSelection();
     }]);
   } else {
     buttons.push([startLabel, () => void startRunBattleFromBuild()]);
@@ -1480,49 +1757,42 @@ function showBuild(): void {
   }
 
   const sub =
-    s.context === 'INITIAL_RUN'
-      ? 'Step 3 of 3 — choose four Programs and their order'
-      : s.context === 'CONSTRUCTED_QUICK_MATCH'
-        ? 'Choose four Programs and their order'
-        : `Battle ${step} of ${RUN_LENGTH} — adjust your build`;
+    s.context === 'CONSTRUCTED_QUICK_MATCH'
+      ? 'Choose four Programs and their order'
+      : `Battle ${step} of ${RUN_LENGTH} — adjust your build`;
   showDialog(buildTitle(s.context), sub, buttons, panels, true);
 }
 
-// §12.3/§17.3 — atomic commitment: replace the save, commit the selected
-// identity, record the derived inventory and the final ordered build, create
-// Battle 1, and enter it.
-async function commitRun(): Promise<void> {
-  if (!setup || !setupComplete(setup) || !setup.hackerId || !setup.deckId || !setup.system || !build) return;
+// Alpha 0.6.0 §28 — THE DESTRUCTIVE COMMITMENT BOUNDARY. Advancing from Deck
+// Selection into the initial Path Choice creates the Run, replaces the previous
+// active save, generates the two initial offers, and PERSISTS them immediately,
+// so a reload lands on exactly the same two cards (§35).
+//
+// It does not create a battle and does not open Build: the encounter package is
+// what the player is about to choose (§27).
+async function commitRunToPathChoice(): Promise<void> {
+  if (!setup || !setupComplete(setup) || !setup.hackerId || !setup.deckId) return;
   const hackerId = setup.hackerId;
   const deckId = setup.deckId;
-  // §11.3 — the opponent rolled when setup reached Build is the one committed
-  // here; Start Run never re-resolves it.
-  const system = setup.system;
-  // §10.4 — snapshot the settings (including Normal LINK) and resolve the
-  // effective Hacker maximum LINK now; the whole Run uses these saved values.
-  const settings = snapshotRunSettings(menuSettings);
-  const hackerMaxLink = resolveHackerMaxLink(settings, hackerId, deckId);
-  const finalBuild = [...build.build];
-  const origin = build.origin;
-  const edited = build.edited;
+  // §35 — the Run's route randomness comes from ONE isolated stream, seeded
+  // here and then persisted with the Run. It never touches gameplay RNG.
+  const { seed } = makeSetupRandom();
   clearBattleSave();
-  session = {
-    mode: 'RUN',
-    step: 1,
-    settings,
-    identity: { hackerId, deckId, selectionSource: 'EXPLICIT_SELECTION' },
-    hackerMaxLink,
-    inventory: inventoryProgramIds(hackerId, deckId),
-    build: finalBuild,
-    buildOrigin: origin,
-    system,
-  };
+  // §10.4 — the settings snapshot (including Normal LINK) is taken at Run
+  // creation and is authoritative for the whole Run.
+  const run = commitNewRun(setup, menuSettings, seed);
+  session = run;
   pending = null;
   setup = null;
   build = null;
-  const g = createRunBattle(session, 1);
-  logSelection('RUN_CREATED', { g, extra: { ...portfolioContext(hackerId, deckId), buildContext: 'INITIAL_RUN', buildEdited: edited } });
-  await enterBattle(g);
+  game = null;
+  pathPick = null;
+  persistSession();
+  logSelection('RUN_CREATED', {
+    extra: { ...portfolioContext(hackerId, deckId), buildContext: 'INITIAL_RUN', routeSeed: seed },
+  });
+  logPathOffered(run.pendingPath!);
+  showPathChoice();
 }
 
 // §8.4/§17.4 — leave the pre-battle Build phase and start the encounter with
@@ -1658,12 +1928,70 @@ function showSystemSelection(): void {
         if (!preselect) return;
         const system: SelectedSystem = { systemId: preselect, source: 'QUICK_CONSTRUCTED' };
         logSystemSelected(system, 'CONSTRUCTED_QUICK_MATCH');
-        openConstructedQuickMatchBuild(system);
+        // Alpha 0.6.0 §37 — HOST Selection sits between System Selection and
+        // Build, so both deliberate choices are made before the build is edited.
+        pendingQuickSystem = system;
+        hostPick = null;
+        showHostSelection();
       }, undefined, !preselect],
       // §12.2 — Back from System Selection returns to the Quick Match submenu.
       ['Back', () => {
         systemPick = null;
         showQuickMatchMenu();
+      }],
+    ],
+    panels,
+    true,
+  );
+}
+
+// ============================================================================
+// Alpha 0.6.0 §38 — CONSTRUCTED QUICK MATCH HOST SELECTION.
+//
+// Every valid HOST is listed, `in_pool` included or not: that flag governs
+// RANDOM generation only, and this screen exists precisely so a tester can
+// field a specific battlefield deliberately (director spec 2026-08-11).
+// ============================================================================
+
+let hostPick: string | null = null;
+
+function showHostSelection(): void {
+  build = null;
+  const hosts = allHosts();
+  const preselect = hostPick ?? (hosts.length === 1 ? hosts[0].id : null);
+  const list = optionList(
+    hosts.map((h: ResolvedHost) => ({
+      id: h.id,
+      title: `${h.name} [${h.id}]`,
+      // §38 — the resolved PASSIVE display, or the payload Function name where
+      // a carrier has no authored display (§5.7), is what makes the current
+      // whitebox behavior understandable without an art system.
+      lines: h.passives.length ? h.passives.map((p) => p.display) : ['no PASSIVEs'],
+    })),
+    preselect,
+    (id) => {
+      hostPick = id;
+      showHostSelection();
+    },
+  );
+  const panels = document.createElement('div');
+  panels.className = 'panelscroll';
+  panels.appendChild(list);
+  showDialog(
+    'SELECT HOST',
+    'Choose the environment you will fight in',
+    [
+      ['Choose', () => {
+        if (!preselect) return;
+        pendingQuickHost = preselect;
+        logHostSelected(preselect, 'QUICK_CONSTRUCTED', 'CONSTRUCTED_QUICK_MATCH');
+        openConstructedQuickMatchBuild(pendingQuickSystem!);
+      }, undefined, !preselect],
+      ['Back', () => {
+        hostPick = null;
+        systemPick = pendingQuickSystem?.systemId ?? null;
+        pendingQuickSystem = null;
+        showSystemSelection();
       }],
     ],
     panels,
@@ -1703,13 +2031,18 @@ async function startRandomQuickMatch(): Promise<void> {
   const { rng, seed } = makeSetupRandom();
   const chosen = randomBuild(inventory, rng);
   const system = randomSystem(rng, 'QUICK_RANDOM');
+  // Alpha 0.6.0 §39 — the HOST is drawn from that SAME isolated setup stream,
+  // from the in_pool subset, and no HOST Selection screen opens.
+  const hostId = randomHost(rng);
   clearBattleSave(); // confirmed replacement
-  session = { mode: 'QUICK_MATCH', identity: ids, system, build: chosen, buildOrigin: 'RANDOM' };
+  session = { mode: 'QUICK_MATCH', identity: ids, system, hostId, build: chosen, buildOrigin: 'RANDOM' };
   pending = null;
   setup = null;
   build = null;
   pendingQuickSystem = null;
+  pendingQuickHost = null;
   logSystemSelected(system, 'RANDOM_QUICK_MATCH');
+  logHostSelected(hostId, 'QUICK_RANDOM', 'RANDOM_QUICK_MATCH');
   // §18.4 — logged BEFORE battle creation.
   logSelection('BUILD_OPENED', {
     identity: { hackerId: ids.hackerId, deckId: ids.deckId },
@@ -1722,7 +2055,7 @@ async function startRandomQuickMatch(): Promise<void> {
       gameplayRngIndependent: true,
     },
   });
-  const g = createQuickMatchBattle(menuSettings, ids, system, chosen, 'RANDOM');
+  const g = createQuickMatchBattle(menuSettings, ids, system, hostId, chosen, 'RANDOM');
   logSelection('QUICK_MATCH_CREATED', { g, extra: { buildContext: 'RANDOM_QUICK_MATCH', buildEdited: false } });
   await enterBattle(g);
 }
@@ -1730,21 +2063,24 @@ async function startRandomQuickMatch(): Promise<void> {
 // §9.3 — start the Constructed battle and remember the build. The preset is
 // written ONLY here, never on Back.
 async function startConstructedQuickMatch(): Promise<void> {
-  if (!build || !pendingQuickSystem) return;
+  if (!build || !pendingQuickSystem || !pendingQuickHost) return;
   const ids = defaultIdentity();
   const system = pendingQuickSystem;
+  const hostId = pendingQuickHost;
   const chosen = [...build.build];
   const edited = build.edited;
-  // §12.4 — the remembered preset stays a HACKER build preference. The chosen
-  // System is deliberately NOT part of it: Alpha 0.5 adds no remembered System.
+  // §12.4/§37 — the remembered preset stays a HACKER build preference. The
+  // chosen System and HOST are deliberately NOT part of it, and it remains
+  // independent of Run progression.
   saveConstructedPreset(serializeConstructedPreset(ids.hackerId, ids.deckId, chosen));
   clearBattleSave();
-  session = { mode: 'QUICK_MATCH', identity: ids, system, build: chosen, buildOrigin: build.origin };
+  session = { mode: 'QUICK_MATCH', identity: ids, system, hostId, build: chosen, buildOrigin: build.origin };
   pending = null;
   setup = null;
   build = null;
   pendingQuickSystem = null;
-  const g = createQuickMatchBattle(menuSettings, ids, system, chosen, session.buildOrigin);
+  pendingQuickHost = null;
+  const g = createQuickMatchBattle(menuSettings, ids, system, hostId, chosen, session.buildOrigin);
   logSelection('QUICK_MATCH_CREATED', { g, extra: { buildContext: 'CONSTRUCTED_QUICK_MATCH', buildEdited: edited } });
   await enterBattle(g);
 }
@@ -1760,6 +2096,7 @@ async function resetQuickMatch(config: BattleConfig, identity: BattleIdentity): 
     // §18.3/§14 — Reset replays the concluded battle's OWN encounter. It never
     // rerolls the opponent, exactly as it never rerolls a Random build.
     system: { systemId: identity.systemId, source: identity.systemSelectionSource },
+    hostId: identity.hostId,
     build: [...identity.hackerPrograms],
     buildOrigin: identity.buildOrigin,
   };
@@ -1783,8 +2120,10 @@ async function resumeSession(): Promise<void> {
     showTitle(); // save vanished/corrupted since the dialog was built
     return;
   }
-  // §17.4 — a Run suspended on its pre-battle Build screen resumes to exactly
-  // that screen, with the same upcoming encounter and the same build.
+  // §17.4/§42 — a Run suspended on its pre-battle Build screen, or parked on a
+  // Path Choice, resumes to exactly that screen with exactly the same state:
+  // the same upcoming encounter and build, or the same two offers (§35 — a
+  // pending choice is NEVER rerolled on reload).
   if (!r.game) {
     session = r.info;
     game = null;
@@ -1796,6 +2135,12 @@ async function resumeSession(): Promise<void> {
     view.clearBoard();
     if (r.info.mode !== 'RUN') {
       showTitle();
+      return;
+    }
+    if (r.info.pendingPath) {
+      pathPick = null;
+      build = null;
+      showPathChoice();
       return;
     }
     const s = beginBuild('RUN_BETWEEN', r.info.identity.hackerId, r.info.identity.deckId, r.info.build, r.info.buildOrigin);
@@ -1818,7 +2163,8 @@ async function resumeSession(): Promise<void> {
   const id = game.state.identity;
   console.info(
     `[breach] ${contextLabel(session)} restored (turn ${game.state.turn}) — ${id.hackerId}/${id.deckId} ` +
-      `skills=[${id.skillIds.join(',')}] deckFn=${id.deckFunctionId} build=[${id.hackerPrograms.join(',')}]`,
+      `host=${id.hostId} upgrades=[${id.upgradeIds.join(',')}] passives=[${id.passiveIds.join(',')}] ` +
+      `deckFn=${id.deckFunctionId} build=[${id.hackerPrograms.join(',')}]`,
   );
   busy = true;
   await view.play([{ t: 'msg', text: `${contextLabel(session)} resumed — turn ${game.state.turn}` }]);
@@ -1859,19 +2205,25 @@ function exitToTitleClearing(): void {
 
 // §8.4 — the Run advances to the next encounter's BUILD screen, not straight
 // into the battle. The build carries forward and may be adjusted first.
+// Alpha 0.6.0 §27/§30 — winning (or Force-Winning) a battle leads to the next
+// PATH CHOICE, not straight to Build: the player commits an encounter package
+// before editing the build for it. Offers are generated once, here, from the
+// Run's persisted route RNG (§35), then saved; reopening, quitting, resuming,
+// or reloading all reuse those exact offers rather than rolling again.
 function advanceRun(): void {
   if (!session || session.mode !== 'RUN') return;
   const n = nextStep(session.step);
   if (n === null) return; // step 4 concludes via Run Complete, not advance
-  // Alpha 0.5.0 §11.4 — successful progression creates the next pre-battle
-  // state, so the next opponent is resolved EXACTLY ONCE, here, from an
-  // isolated setup random source (§14). Reopening Build, saving and quitting,
-  // or resuming all reuse the persisted value rather than rolling again.
-  // Repeats across battles are allowed (§11.1 — sampling with replacement).
-  const system = randomSystem(makeSetupRandom().rng, 'RUN_RANDOM');
-  session = { ...session, step: n, system };
-  logSystemSelected(system, 'RUN_BETWEEN');
-  openRunBuild('RUN_BETWEEN');
+  const run = openPathChoice(session, n);
+  session = run;
+  pending = null;
+  game = null;
+  build = null;
+  pathPick = null;
+  view.clearBoard();
+  persistSession();
+  logPathOffered(run.pendingPath!);
+  showPathChoice();
 }
 
 // §18.2 — Force Win. On a natural DEFEAT it overrides the result while
@@ -1911,19 +2263,31 @@ function wizardRestartRun(): void {
   if (!session || session.mode !== 'RUN') return;
   appendWizard('WIZARD_RESTART_RUN');
   const ids = session.identity;
-  // §11.4 — Restart Run creates a fresh Battle 1 pre-battle state, so it
-  // resolves a new opponent like any other new step. (A RETRY of the same step
-  // does not; that path is wizardRestartLostBattle above.)
-  const system = randomSystem(makeSetupRandom().rng, 'RUN_RANDOM');
-  session = { ...session, step: 1, build: defaultBuild(ids.hackerId, ids.deckId), buildOrigin: 'DEFAULT', system, pendingBuild: true };
-  logSystemSelected(system, 'RUN_BETWEEN');
+  // Alpha 0.6.0 §34.3 — a true Restart Run clears Run-LOCAL progression: the
+  // acquired UPGRADEs go with the abandoned Run and are NOT retained. It then
+  // reinitializes at the initial Path Choice like any new Run, so Battle 1 is
+  // once again the fixed DOORMAN + THRESHOLD encounter with an UPGRADE choice.
+  // (A RETRY of the same step keeps everything; that path is
+  // wizardRestartLostBattle above.)
+  const run = openPathChoice(
+    {
+      ...session,
+      step: 1,
+      build: defaultBuild(ids.hackerId, ids.deckId),
+      buildOrigin: 'DEFAULT',
+      upgradeIds: [],
+    },
+    1,
+  );
+  session = run;
   pending = null;
   game = null;
+  build = null;
+  pathPick = null;
   view.clearBoard();
-  const s = beginBuild('RUN_BETWEEN', ids.hackerId, ids.deckId, session.build, 'DEFAULT');
-  openBuild(s);
-  persistBuildIfCommitted();
-  logBuildOpened(s);
+  persistSession();
+  logPathOffered(run.pendingPath!);
+  showPathChoice();
 }
 
 function showResultModal(): void {

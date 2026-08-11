@@ -182,7 +182,18 @@ export interface BattleIdentity {
   // (§14). There is no default and no fallback (§41).
   systemId: string;
   systemSelectionSource: SystemSelectionSource;
-  skillIds: string[]; // ordered; duplicates are meaningful (§6.4)
+  // Alpha 0.6.0 §7/§13 — the HOST this battle is fought on. A first-class
+  // causal source alongside the two agents, not a property of either; every
+  // battle has exactly one, Quick Match included.
+  hostId: string;
+  // §12/§32 — the Hacker's acquired UPGRADEs in ACQUISITION order, which is
+  // their START_OF_TURN resolution order (§15.3). Always empty in Quick Match
+  // (§37 — no UPGRADE selection there). Never contains a duplicate ID (§43).
+  upgradeIds: string[];
+  // §6 — the selected Hacker's ordered PASSIVE references, snapshotted the same
+  // way the build and rosters are so a save can be revalidated against current
+  // content. Duplicates are meaningful and stack (§11).
+  passiveIds: string[];
   deckFunctionId: string;
   // Alpha 0.4.0 §5.3 — the ACTIVE BUILD: exactly four distinct inventory
   // Programs in explicit top-to-bottom order. This order is authoritative for
@@ -254,8 +265,24 @@ export function gridViewOf(board: Board): (TileView | null)[][] {
 }
 
 // Alpha 0.3.0 §7.1 — an activation's owner is either a Program or the Deck.
-// Runtime, save, targeting, metrics, and logs must distinguish them.
-export type OwnerKind = 'program' | 'deck';
+// Alpha 0.6.0 §23 adds the PASSIVE carrier: a Function invoked by a triggered
+// PASSIVE, which pays no cost and owns no charge pool (§16). Runtime, save,
+// targeting, metrics, and logs must distinguish all three.
+export type OwnerKind = 'program' | 'deck' | 'passive';
+
+// Alpha 0.6.0 §11/§47 — which content kind supplied a PASSIVE instance.
+export type PassiveSourceKind = 'HAK' | 'SYS' | 'HST' | 'UPG';
+
+// §14/§47 — the CAUSAL source of an effect that a PASSIVE produced. It travels
+// ALONGSIDE the event's `side`, which is the resolution owner, precisely so the
+// two facts a HOST trigger produces both survive: WEEDS/GREENING caused the
+// transformation, and the active-turn agent owns the Syncs it created. Never
+// collapse the two into one field (§14).
+export interface PassiveCause {
+  passiveId: string;
+  sourceKind: PassiveSourceKind;
+  sourceId: string;
+}
 
 // Alpha 0.4.0 §12 — what the player picked for a targeted activation. A
 // Function needs zero targets, exactly one opposing Program slot (Drain), or
@@ -271,7 +298,10 @@ export type ActivationTarget = { kind: 'unit'; idx: number } | { kind: 'packet';
 export type ChargeStreamSource =
   | 'SYNC'
   | 'CASCADE'
-  | 'SKILL_MODIFIED_SYNC'
+  // Alpha 0.6.0 — renamed from SKILL_MODIFIED_SYNC with the Skill->PASSIVE
+  // migration. Same meaning: a qualifying Sync stream a PASSIVE inflated or
+  // dampened before routing (§18/§19).
+  | 'PASSIVE_MODIFIED_SYNC'
   | 'EFFECT_DESTRUCTION'
   // Alpha 0.5.0 — charge from a Sync an EFFECT_TRANSFORM created. ALLOCATION is
   // the ordinary top-to-bottom queue rule (§30.1 — the BOUNCER synergy must
@@ -325,14 +355,18 @@ export type GameEvent =
   // (MK7.5); cascadeRaw = pre-floor damage from tiles destroyed exclusively
   // by STOCHASTIC refill matches (MK7.3 cross-cut); programId = the acting
   // Program for Function-caused damage (attacker fire / bomb detonation);
-  // skillRaw = the Hacker-Skill portion of `amount`, its own disjoint bucket
-  // (Alpha 0.3.0 §6.4/§11.3 — never merged into base Sync damage).
-  | { t: 'damage'; target: Side; amount: number; label: string; source: DamageSource; programId?: string; fnId?: string; effectId?: EffectId; critExtra?: number; buffBonus?: number; colorRaw?: number; shapeRaw?: number; cascadeRaw?: number; skillRaw?: number }
+  // passiveRaw = the PASSIVE-contributed portion of `amount`, its own disjoint
+  // bucket (§17/§20/§48 — never merged into base Sync or Function damage);
+  // cause = the PASSIVE that produced this damage where one did (§14).
+  | { t: 'damage'; target: Side; amount: number; label: string; source: DamageSource; programId?: string; fnId?: string; effectId?: EffectId; critExtra?: number; buffBonus?: number; colorRaw?: number; shapeRaw?: number; cascadeRaw?: number; passiveRaw?: number; cause?: PassiveCause }
   | { t: 'msg'; text: string }
   | { t: 'over'; winner: Side }
   // Alpha §7.5/§13.4 — one per parent Function ACTIVATION (the paid event);
   // `fn` is the activated Function, `name` the owner's display name.
-  | { t: 'ability'; side: Side; ownerKind: OwnerKind; programId: string; fn: string; name: string }
+  // Alpha 0.6.0 §16/§49 — `cause` names the PASSIVE instance that invoked this
+  // Function when a trigger did. `side` remains the RESOLUTION owner, so a HOST
+  // carrier firing on the Hacker's turn reads side=player, cause=HST/PSV.
+  | { t: 'ability'; side: Side; ownerKind: OwnerKind; programId: string; fn: string; name: string; cause?: PassiveCause }
   // Alpha §7.5 — one per expanded payload OPERATION (child resolution attempt
   // / Effect execution). resolved=false is a LEGAL fizzle (no valid target or
   // placement); unexpected exceptions are implementation failures and
@@ -342,6 +376,7 @@ export type GameEvent =
   // which Program was hit, how ready it was, and the exact charge delta.
   | {
       t: 'op'; side: Side; ownerKind: OwnerKind; programId: string; fnId: string; effectId: EffectId; resolved: boolean;
+      cause?: PassiveCause;
       drained?: number;
       targetProgramId?: string;
       targetReadiness?: Readiness;
@@ -365,6 +400,7 @@ export type GameEvent =
   // chosen coordinate and the Packet's properties BEFORE mutation.
   | {
       t: 'targeted'; side: Side; ownerKind: OwnerKind; programId: string; fnId: string; effectId: EffectId;
+      cause?: PassiveCause;
       target: Pt | null; // null when no valid coordinate could be resolved
       targetTile: TileView | null; // color/shape/special as they were pre-slice
       dimension?: 'row' | 'column'; // EFFECT_LINESLICE only
@@ -377,7 +413,7 @@ export type GameEvent =
     }
   // MK9.1/9.2/9.3 — bombs or shield tiles actually placed by one activation
   // (may be fewer than requested if the Datastream lacks legal targets).
-  | { t: 'placed'; side: Side; ownerKind: OwnerKind; kind: 'bomb' | 'shield'; count: number; programId: string }
+  | { t: 'placed'; side: Side; ownerKind: OwnerKind; kind: 'bomb' | 'shield'; count: number; programId: string; cause?: PassiveCause }
   // Alpha 0.5.0 §37.1 — one per EFFECT_TRANSFORM activation. Enough to verify
   // the action without storing a board snapshot: what was asked for, what was
   // actually converted, and the authored axes. The damage and charge the
@@ -385,9 +421,16 @@ export type GameEvent =
   // duplicated here.
   | {
       t: 'transform'; side: Side; ownerKind: OwnerKind; programId: string; fnId: string;
-      axisTarget: string;
-      resultColor: Color;
-      resultShape: Shape;
+      cause?: PassiveCause;
+      axisTarget: string; // the authored token, e.g. NEU / ALL / GRE:TRI
+      axisResult: string; // the authored token, e.g. GRE / YEL:STR / NEU
+      // Alpha 0.6.0 §24 — a single-axis result leaves the other axis to the
+      // Packet (or randomizes it on a neutral target), so neither is guaranteed.
+      resultColor?: Color;
+      resultShape?: Shape;
+      // §24 — the two-tier candidate split, so a log can show WHY a Function
+      // converted fewer Packets than its quantity asked for.
+      tier2Used: number; // conversions drawn from the shares-one-axis fallback
       requested: number; // authored quantity (the maximum, §2.5)
       converted: number; // Packets actually transformed
       candidates: number; // eligible Packets that existed
@@ -426,8 +469,18 @@ export type GameEvent =
   // wave. Retained for causal/logging purposes even where the sliced tiles at
   // an intersection are deduplicated.
   | { t: 'lineClear'; side: Side; orientation: 'h' | 'v'; index: number }
-  // Alpha 0.3.0 §21.3 — one per qualifying Hacker Skill trigger.
-  | { t: 'skill'; side: Side; skillId: string; effect: string; damage?: number; charge?: number }
+  // Alpha 0.6.0 §47/§48 — one per qualifying PASSIVE contribution to a
+  // calculation. `side` is the AFFECTED agent; `cause` names the exact instance
+  // that contributed, so several PASSIVEs modifying one calculation stay
+  // individually attributable instead of collapsing into an unexplained
+  // aggregate (§47). Replaces the Alpha 0.3-0.5 `skill` event.
+  | {
+      t: 'passive'; side: Side; cause: PassiveCause; effect: string;
+      damage?: number;
+      charge?: number;
+      shield?: number; // Shield value contributed to a prevention (§21)
+      steps?: number; // named area-pattern steps contributed (§22)
+    }
   // Alpha 0.3.0 §21.3 — EFFECT_SHAKE outcome: `resolved` false is the legal
   // fizzle (no valid final arrangement; the Datastream is left unchanged).
   | { t: 'shake'; side: Side; resolved: boolean }

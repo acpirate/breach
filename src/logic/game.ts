@@ -12,7 +12,7 @@
 // (never as a PRG_H_*) in runtime, save, targeting, metrics, and logs (§7.1).
 
 import { BOARD_HEIGHT, BOARD_WIDTH, ENEMY_TIMER_CHARGE_RATE } from './constants';
-import { AREA_PATTERNS, AreaPatternId } from './data/areas';
+import { AREA_PATTERNS, AreaPatternId, advanceAreaPattern } from './data/areas';
 import type { TargetKind } from './data/effects';
 import {
   ActivationEligibility,
@@ -25,10 +25,12 @@ import {
   TARGETING_TARGETED,
   deckById,
   functionTargetKind,
+  getContent,
   planIsAllDrain,
   programById,
   targetKindOf,
 } from './data/content';
+import { causeOf, passivesAffecting, startOfTurnPassives } from './passive';
 import { generateInitialBoard, shakeBoard, swap } from './board';
 import { pickBotMove } from './bot';
 import { BattleEventEntry, TurnLogEntry, TurnLogger } from './logger';
@@ -44,7 +46,7 @@ import {
   resolveDetonation,
   resolveLineSlice,
   settleAfterEffect,
-  transformCandidates,
+  transformCandidateCount,
 } from './resolve';
 import { makeRNG } from './rng';
 import {
@@ -54,6 +56,7 @@ import {
   GameEvent,
   GameState,
   OwnerKind,
+  PassiveCause,
   Pt,
   Readiness,
   Side,
@@ -116,9 +119,14 @@ function unitFor(programId: string): UnitState {
 // identity differs (§7.1).
 interface Actor {
   kind: OwnerKind;
-  id: string; // stable PRG_* or DEK_* ID
+  id: string; // stable PRG_*, DEK_*, or (Alpha 0.6.0 §23) PSV_* ID
   name: string;
   fn: ResolvedFunction;
+  // §14/§16 — set only for a PASSIVE-triggered activation: the causal source,
+  // carried alongside the resolution owner so both survive into every event
+  // this activation emits. Its presence is also what makes the activation
+  // cost-free — the caller never debits a pool for one (§16).
+  cause?: PassiveCause;
 }
 
 // §8.6 — translate the resolved Shake cascade mode into a resolution budget.
@@ -170,7 +178,8 @@ export class Game {
       deckCharge: deck.fn.startCharged ? deck.fn.cost : 0,
       identity: {
         ...identity,
-        skillIds: [...identity.skillIds],
+        passiveIds: [...identity.passiveIds],
+        upgradeIds: [...identity.upgradeIds],
         hackerPrograms: [...identity.hackerPrograms],
         inventory: [...identity.inventory],
         systemPrograms: [...identity.systemPrograms],
@@ -240,18 +249,48 @@ export class Game {
     return events;
   }
 
-  // 1.6.1.a — Hacker phase start: tick Hacker-owned countdowns (oldest first,
-  // each detonation fully resolving before the next tick), then open the
-  // pre-Sync Function window.
+  // 1.6.1.a — Hacker phase start: resolve START_OF_TURN PASSIVEs, then tick
+  // Hacker-owned countdowns (oldest first, each detonation fully resolving
+  // before the next tick), then open the pre-Sync Function window.
   startPlayerPhase(): GameEvent[] {
     const s = this.state;
     const events: GameEvent[] = [];
     if (s.winner) return events;
     s.phase = 'resolving';
     events.push({ t: 'msg', text: `Turn ${s.turn} — your move` });
-    this.tickCountdowns('player', events);
+    this.runStartOfTurnPassives('player', events);
+    if (!s.winner) this.tickCountdowns('player', events);
     if (!s.winner) s.phase = 'playerPre';
     return this.collect(events);
+  }
+
+  // Alpha 0.6.0 §15 — START_OF_TURN PASSIVEs, in the one authoritative order:
+  // HOST, then the active agent's identity, then the Hacker's UPGRADEs in
+  // acquisition order (Hacker turns only), each source's own list in authored
+  // order. passive.ts owns that ordering; this owns WHEN it happens, which is
+  // strictly BEFORE countdown ticking (§15.5).
+  //
+  // Each triggered Function resolves COMPLETELY — Effect resolution, immediate
+  // Syncs, cascades, damage, charge — before the next PASSIVE begins (§15).
+  // If a battle reaches its terminal state part-way through, the established
+  // terminal rules win and nothing further mutates a finished battle (§15).
+  private runStartOfTurnPassives(active: Side, events: GameEvent[]): void {
+    const s = this.state;
+    for (const inst of startOfTurnPassives(s.identity, active)) {
+      if (s.winner) break;
+      if (inst.passive.effectType !== 'PSV_CARRIER') continue;
+      const fn = getContent().functions.get(inst.passive.functionId!);
+      if (!fn) continue; // the loader guarantees resolution; defensive only
+      // §14 — the ACTIVE agent is the resolution owner even when a HOST caused
+      // the trigger, so damage profile, charge routing, and owner-scoped
+      // PASSIVEs all follow the agent whose turn is beginning. `cause` carries
+      // the causal fact (which HOST, which PASSIVE) alongside it.
+      this.castActor(
+        active,
+        { kind: 'passive', id: inst.passive.id, name: fn.name, fn, cause: causeOf(inst) },
+        events,
+      );
+    }
   }
 
   private findBySeq(seq: number): Pt | null {
@@ -390,7 +429,10 @@ export class Game {
   // (§7.4). Unexpected exceptions propagate to the app failure boundary — they
   // are NOT converted into fizzles.
   private castActor(owner: Side, actor: Actor, events: GameEvent[], target?: ActivationTarget): void {
-    events.push({ t: 'ability', side: owner, ownerKind: actor.kind, programId: actor.id, fn: actor.fn.id, name: actor.name });
+    events.push({
+      t: 'ability', side: owner, ownerKind: actor.kind, programId: actor.id, fn: actor.fn.id, name: actor.name,
+      ...(actor.cause ? { cause: actor.cause } : {}),
+    });
     for (const op of actor.fn.plan) {
       if (this.state.winner) break;
       this.castOp(owner, actor, op, events, target);
@@ -438,6 +480,7 @@ export class Game {
       t: 'targeted',
       side: owner,
       ownerKind: actor.kind,
+      ...(actor.cause ? { cause: actor.cause } : {}),
       programId: actor.id,
       fnId: op.fnId,
       effectId: op.effectId,
@@ -481,6 +524,22 @@ export class Game {
     return resolved;
   }
 
+  // Alpha 0.6.0 §22 — the effective Bomb footprint after PSV_BIGGER_BOMB.
+  // Each active instance affecting `owner` advances ONE named step along the
+  // area registry's canonical order, saturating at the largest registered
+  // pattern. Edge clipping is irrelevant to the step count: this operates on
+  // NAMES, not on how many cells survive the board bounds (§22.1).
+  private effectiveBombArea(owner: Side, authored: AreaPatternId, events: GameEvent[]): AreaPatternId {
+    const instances = passivesAffecting(this.state.identity, 'PSV_BIGGER_BOMB', owner);
+    if (!instances.length) return authored;
+    const upgraded = advanceAreaPattern(authored, instances.length);
+    if (upgraded === authored) return authored; // already saturated
+    for (const inst of instances) {
+      events.push({ t: 'passive', side: owner, cause: causeOf(inst), effect: inst.passive.effectType, steps: 1 });
+    }
+    return upgraded;
+  }
+
   // Coded Effect behavior, selected by the stable EffectId the data supplied.
   private castOp(owner: Side, actor: Actor, op: PlanOp, events: GameEvent[], target?: ActivationTarget): void {
     const s = this.state;
@@ -489,6 +548,7 @@ export class Game {
       t: 'op',
       side: owner,
       ownerKind: actor.kind,
+      ...(actor.cause ? { cause: actor.cause } : {}),
       programId: actor.id,
       fnId: op.fnId,
       effectId: op.effectId,
@@ -499,15 +559,25 @@ export class Game {
       case 'EFFECT_BOMB': {
         const bp = op.params.bomb!;
         const countdown = op.params.countdown ?? 0;
+        // Alpha 0.6.0 §22 — PSV_BIGGER_BOMB advances the effective named area
+        // pattern for EVERY qualifying EFFECT_BOMB, whichever Function invoked
+        // it, resolved ONCE here so both the immediate and the delayed branch
+        // use the same answer. It changes area only: quantity, countdown,
+        // damage, targeting, and the charge tuple are untouched.
+        const effectiveArea = this.effectiveBombArea(owner, op.params.areaPattern!, events);
         // §14.3 — a positive countdown deploys the established overlay; blank
         // or zero resolves the blast immediately with no overlay at all.
         if (countdown > 0) {
+          // §22.2 — the UPGRADED pattern is stamped on the delayed object at
+          // ARMING time through the established delayed-payload contract, so a
+          // save/resume and a later detonation stay deterministic even if the
+          // supplying PASSIVE were to change in between.
           const placed = this.placeSpecials({
             type: 'bomb',
             owner,
             count: op.params.quantity ?? 1,
             countdown,
-            areaPattern: op.params.areaPattern,
+            areaPattern: effectiveArea,
             dealDamage: bp.dealDamage,
             gainCharge: bp.gainCharge,
             fnId: op.fnId,
@@ -527,7 +597,7 @@ export class Game {
             const before = s.board[p.y][p.x];
             const beforeView = before ? tileViewOf(before) : null;
             const cellsBefore = new Set<number>();
-            for (const d of AREA_PATTERNS[op.params.areaPattern!]) {
+            for (const d of AREA_PATTERNS[effectiveArea]) {
               const nx = p.x + d.x;
               const ny = p.y + d.y;
               if (nx >= 0 && nx < BOARD_WIDTH && ny >= 0 && ny < BOARD_HEIGHT && s.board[ny][nx]) {
@@ -537,7 +607,7 @@ export class Game {
             const hpBefore = s.hp[opponentOf(owner)];
             detonateAt(s, p, {
               owner,
-              areaPattern: op.params.areaPattern!,
+              areaPattern: effectiveArea,
               programId: actor.id,
               fnId: op.fnId,
               dealDamage: bp.dealDamage,
@@ -618,6 +688,7 @@ export class Game {
           {
             owner,
             params: tp,
+            axisTarget: op.params.axisTarget!,
             axisResult: op.params.axisResult!,
             quantity: op.params.quantity ?? 1,
             programId: actor.id,
@@ -629,11 +700,14 @@ export class Game {
           t: 'transform',
           side: owner,
           ownerKind: actor.kind,
+          ...(actor.cause ? { cause: actor.cause } : {}),
           programId: actor.id,
           fnId: op.fnId,
-          axisTarget: op.params.axisTarget!,
+          axisTarget: op.params.axisTarget!.token,
+          axisResult: op.params.axisResult!.token,
           resultColor: op.params.axisResult!.color,
           resultShape: op.params.axisResult!.shape,
+          tier2Used: outcome.tier2Used,
           requested: op.params.quantity ?? 1,
           converted: outcome.cells.length,
           candidates: outcome.candidates,
@@ -648,11 +722,11 @@ export class Game {
           // player activation: the established legal-fizzle semantics apply
           // rather than a second rollback model.
           events.push(opEvent(false));
-          events.push({ t: 'msg', text: `${who} ${actor.name} found nothing to coerce` });
+          events.push({ t: 'msg', text: `${who} ${actor.name} found nothing to transform` });
           break;
         }
         events.push(opEvent(true));
-        events.push({ t: 'msg', text: `${who} coerced ${outcome.cells.length} Packet${outcome.cells.length === 1 ? '' : 's'}` });
+        events.push({ t: 'msg', text: `${who} ${actor.name} transformed ${outcome.cells.length} Packet${outcome.cells.length === 1 ? '' : 's'}` });
         // §24/§25 — detection runs only AFTER every selected Packet has
         // changed. Any Sync this creates is owned by the activating side and
         // resolves through the normal owner-scoped pipeline: normal strong/weak
@@ -925,9 +999,12 @@ export class Game {
     for (const op of prog.fn.plan) {
       switch (op.effectId) {
         case 'EFFECT_TRANSFORM':
-          // §26 — COERCE with zero eligible Packets keeps its charge and
-          // mutates nothing.
-          if (transformCandidates(s).length === 0) {
+          // §26 — a Transform with zero eligible Packets keeps its charge and
+          // mutates nothing. Alpha 0.6.0: eligibility is the ROW's own
+          // target/result grammar, including the §24 exclusion rule, so a
+          // Function whose only reachable Packets already match its result is
+          // correctly withheld rather than fizzling.
+          if (transformCandidateCount(s, { axisTarget: op.params.axisTarget!, axisResult: op.params.axisResult! }) === 0) {
             return { eligible: false, reason: 'no valid Packet to transform' };
           }
           break;
@@ -1031,6 +1108,13 @@ export class Game {
     if (s.winner) return events;
     s.phase = 'enemy';
     events.push({ t: 'msg', text: 'System turn' });
+
+    // §15 — the same ordering the Hacker's turn uses: HOST and identity
+    // START_OF_TURN PASSIVEs resolve fully, THEN countdowns tick. A HOST
+    // carrier fires at the start of BOTH agents' turns (§13); the resolution
+    // owner here is the System.
+    this.runStartOfTurnPassives('enemy', events);
+    if (s.winner) return this.collect(events);
 
     this.tickCountdowns('enemy', events);
     if (s.winner) return this.collect(events);

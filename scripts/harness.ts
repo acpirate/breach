@@ -4,12 +4,27 @@
 // identity are never re-implemented here.
 
 import { DEFAULT_BATTLE_SETTINGS } from '../src/logic/constants';
-import { HEADLESS_SYSTEM_ID, deckById, defaultBuild, hackerById, inventoryProgramIds, systemById } from '../src/logic/data/content';
+import {
+  HEADLESS_HOST_ID,
+  HEADLESS_SYSTEM_ID,
+  deckById,
+  defaultBuild,
+  hackerById,
+  hostById,
+  inventoryProgramIds,
+  systemById,
+} from '../src/logic/data/content';
 import { Game } from '../src/logic/game';
 import { SelectedSystem, createQuickMatchBattle, defaultIdentity } from '../src/logic/session';
 import { BattleSettings, BuildOrigin } from '../src/logic/types';
 
 export const D: BattleSettings = DEFAULT_BATTLE_SETTINGS;
+
+// Alpha 0.6.0 — the pre-0.6 default, kept as an EXPLICIT named mode. System
+// matching is now the default (director ruling 2026-08-11), so timer-charge
+// mode needs a name of its own to stay measurable side by side rather than
+// quietly disappearing from the instruments.
+export const TIMER_MODE: BattleSettings = { ...DEFAULT_BATTLE_SETTINGS, enemyMatching: false };
 
 // Alpha 0.5.0 §44 — simulations PIN one System rather than rolling per battle.
 // Random encounter selection is gameplay/setup behavior; a measurement
@@ -18,6 +33,13 @@ export const D: BattleSettings = DEFAULT_BATTLE_SETTINGS;
 // TESTER System in a future build.
 export function headlessSystem(systemId: string = HEADLESS_SYSTEM_ID): SelectedSystem {
   return { systemId: systemById(systemId).id, source: 'HEADLESS_PINNED' };
+}
+
+// Alpha 0.6.0 — the same reasoning for the environment layer: the pinned HOST
+// is the zero-PASSIVE THRESHOLD, so headless output moves only when combat
+// changes and never because a battlefield rolled differently.
+export function headlessHost(hostId: string = HEADLESS_HOST_ID): string {
+  return hostById(hostId).id;
 }
 
 // Alpha 0.4.0 — the default identity's fixed six-Program inventory and the
@@ -44,8 +66,9 @@ export function newBattle(
   build: readonly string[] = defaultActiveBuild(),
   origin: BuildOrigin = 'DEFAULT',
   system: SelectedSystem = headlessSystem(),
+  hostId: string = headlessHost(),
 ): Game {
-  return createQuickMatchBattle(settings, defaultIdentity(), system, build, origin, seed);
+  return createQuickMatchBattle(settings, defaultIdentity(), system, hostId, build, origin, seed);
 }
 
 // Settings with Normal LINK OFF and explicit manual maxima — the only way to

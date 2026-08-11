@@ -1,0 +1,6 @@
+HOST_ID,name,passives,in_pool,display_text,graphics_ref,notes
+HST_01,THRESHOLD,,n,,,host for first battle with no passives
+HST_02,BITMIRE,PSV_003,,,,
+HST_03,ARENA,PSV_004,,,,
+HST_04,VERDUN,PSV_007,,,,
+HST_05,WEEDS,PSV_008,,,,

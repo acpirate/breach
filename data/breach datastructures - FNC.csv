@@ -11,6 +11,8 @@ FNC_009,ONESHIELD,5,EFFECT_SHIELD,chained function payload,1,,,2,,,,,
 FNC_010,SCRAMBLE,3,EFFECT_SHAKE,re-arrange the packets on the whole screen - see param notes,,,,,,Y,,,0:0:0:0
 FNC_011,DATACUT,7,EFFECT_LINESLICE,"slice targeted row, deal damage, no charge",1,,,,,,,,0:1:0:0:1
 FNC_012,PLINK,5,EFFECT_BOMB,slice cross centered on target,1,,AREA_CARDINAL_1,,,,,,1:0:1
-FNC_013,COERCE,7,EFFECT_TRANSFORM,turn neutral packets into attacker axes,99,,,,,Y,NEU,YEL:STR,0:1
+FNC_013,COERCE,7,EFFECT_TRANSFORM,turn neutral packets into attacker axes,99,,,,,Y,NEU,YEL:STR,0:0
 FNC_014,EBUFF,9,EFFECT_BUFF,when countdown goes off those same packets become the buff,3,2,,5,,,,,
 FNC_015,SPAM,7,EFFECT_BOMB,"many small bombs, charges",3,1,AREA_CARDINAL_1,,,,,,0:0:0
+FNC_016,GREENING,0,EFFECT_TRANSFORM,turn other packets into green,3,,,,,,ALL,GRE,0:1
+FNC_017,SNEAK,0,EFFECT_TRANSFORM,turn other packets into magenta,2,,,,,,ALL,MAG,0:1

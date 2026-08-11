@@ -9,19 +9,24 @@
 // play, setup UI, battle construction, saves, logs, and headless tools consume
 // these shared resolved definitions rather than reparsing CSV or keeping
 // hardcoded copies (§4.8).
+//
+// Alpha 0.6.0 replaces Skill with the shared PASSIVE layer and adds HOST and
+// UPGRADE as first-class content, taking the runtime to nine required datasets
+// (§0.2). They join this same model and the same loader; there is no parallel
+// content authority for the new kinds.
 
 import { AreaPatternId } from './areas';
 import { EffectId, EffectParamName, TargetKind } from './effects';
-import { SkillEffectId } from './skills';
+import { AgentScope, PassiveActivation, PassiveEffectId } from './passives';
 import type { Color, Shape, Side } from '../types';
 
-export const GAME_VERSION = 'alpha-0.5.0';
-// Alpha 0.5.0 §31 — schema 4: authored System identity (`SYS`) as the System-
-// side authority for ICE, strong/weak axes, and the ordered System Program
-// build, plus the selected System persisted in battle identity and pending Run
-// build state. Alpha 0.4.x saves (schema 3) lack an authoritative SYS_ID and
-// are rejected, never migrated (§31.1).
-export const DATA_SCHEMA_VERSION = 4;
+export const GAME_VERSION = 'alpha-0.6.0';
+// Alpha 0.6.0 §40 — schema 5: PASSIVE authority after the Skill migration, HOST
+// identity, acquired UPGRADEs, pending route offers, and the committed path
+// package. Alpha 0.5 active saves (schema 4) cannot faithfully represent any of
+// them and are rejected through the established incompatible-save path, never
+// migrated and never back-filled with synthesized THRESHOLD/no-UPGRADE state.
+export const DATA_SCHEMA_VERSION = 5;
 
 // §5.1/§4.4/§4.5 — every Hacker and every Deck contributes exactly this many
 // ordered Programs; the two portfolios combine into the Run inventory.
@@ -47,6 +52,24 @@ export const SYSTEM_BUILD_SIZE = 4;
 // and does not belong in a measurement instrument. Designer note (2026-08-07):
 // a purpose-built TESTER System should replace this in a future build.
 export const HEADLESS_SYSTEM_ID = 'SYS_01';
+// Alpha 0.6.0 — the same reasoning for the new environment layer: headless runs
+// pin the zero-PASSIVE HOST so ladder/batch output moves only when combat
+// changes, never because an encounter rolled a different battlefield.
+export const HEADLESS_HOST_ID = 'HST_01';
+
+// Alpha 0.6.0 §29 — Battle 1 is a FIXED encounter identity on both offered
+// paths: only the UPGRADE differs. Named constants, never inferred from a row
+// position, and validated at startup exactly like the default Hacker/Deck.
+export const INITIAL_SYSTEM_ID = 'SYS_03'; // DOORMAN
+export const INITIAL_HOST_ID = 'HST_01'; // THRESHOLD
+
+// §8 — fewer than this many valid UPGRADE rows is a blocking startup error: the
+// Run offers four acquisition decisions and the exhaustion edge case (§31) is
+// deliberate content, not an accident to be papered over.
+export const MIN_UPGRADE_ROWS = 4;
+
+// §29/§30 — how many paths a Path Choice screen offers.
+export const PATH_CHOICE_COUNT = 2;
 
 // ---- EFFECT_SHAKE typed parameters (§8.2-8.6) ----
 
@@ -110,16 +133,43 @@ export interface TransformParams {
   specialPacketTreatment: 0 | 1 | 2;
 }
 
-// §22.1 — the authored source axis. Alpha 0.5 supports exactly one value; a
-// future build may generalize the field without changing its shape here.
-export const AXIS_TARGET_NEUTRAL = 'NEU';
-export type AxisTarget = typeof AXIS_TARGET_NEUTRAL;
+// Alpha 0.6.0 §24 (director override 2026-08-11, superseding handoff §24's
+// narrower `ANY` wording) — the Transform axis GRAMMAR. Both columns resolve
+// once at startup into the typed objects below; runtime never re-parses the
+// authored strings.
+//
+//   axisTarget:  NEU | ALL | <COLOR> | <SHAPE> | <COLOR>:<SHAPE>
+//   axisResult:  NEU | <COLOR> | <SHAPE> | <COLOR>:<SHAPE>
+//
+// The colon is INTERSECTION in both columns — `GRE:TRI` means "green triangles",
+// never "green or triangular". There is deliberately no OR targeting, no
+// multi-value axis, and no negation: this is a fixed grammar, not a query
+// language.
+export const AXIS_NEUTRAL = 'NEU';
+export const AXIS_ALL = 'ALL';
 
-// §22.2 — the resolved `<COLOR>:<SHAPE>` result identity, parsed once at
-// startup into typed enum values. Runtime never re-parses the authored string.
+// Which Packets an EFFECT_TRANSFORM may target.
+//   'NEU'  — neutral Packets only.
+//   'ALL'  — every Packet on the Datastream, neutrals included.
+//   'AXIS' — standard Packets matching every authored axis; a single authored
+//            axis leaves the other free. Neutrals are NEVER eligible here: a
+//            neutral has no axis to match against.
+export interface AxisTarget {
+  token: string; // authored text, retained for logs and tooling
+  kind: 'NEU' | 'ALL' | 'AXIS';
+  color?: Color;
+  shape?: Shape;
+}
+
+// What a targeted Packet becomes. A single authored axis PRESERVES the other —
+// except on a neutral target, which has no axis to preserve, so the unauthored
+// axis is randomized per Packet from the battle's gameplay RNG (§24).
+// `neutral` turns the Packet neutral and clears both axes.
 export interface AxisResult {
-  color: Color;
-  shape: Shape;
+  token: string; // authored text, retained for logs and tooling
+  neutral?: true;
+  color?: Color;
+  shape?: Shape;
 }
 
 // One validated leaf operation of a Function's payload plan. A leaf Function
@@ -181,16 +231,58 @@ export interface ResolvedProgram {
   notes: string;
 }
 
-// §4.8 — a resolved Hacker Skill. The parsed contract, NOT the display string,
-// controls behavior (§4.4).
-export interface ResolvedSkill {
+// Alpha 0.6.0 §5/§53 — a resolved PASSIVE. The parsed contract, NOT the display
+// string, controls behavior. One row can be referenced by any number of HAK,
+// SYS, HST, and UPG records; the SOURCE that supplied an instance lives in the
+// runtime instance model (logic/passive.ts), never here — this is the shared
+// immutable definition (§11).
+export interface ResolvedPassive {
   id: string;
-  effectType: SkillEffectId;
-  color: Color; // typed parameter 0 for both current Skill effects
-  magnitude: number; // typed parameter 1
+  effectType: PassiveEffectId;
+  activation: PassiveActivation;
+  // §5.4 — meaningful for HAK/SYS/UPG instances; IGNORED for HST instances,
+  // whose scope is defined by §13. Retained verbatim either way so a log can
+  // show what the data actually said.
+  agentScope: AgentScope;
+  // Typed parameter 0, present iff this effect's tuple declares a color.
+  color?: Color;
+  // True iff typed parameter 0 is the ALL wildcard.
+  allScope?: true;
+  // The magnitude parameter, present iff the tuple declares one.
+  magnitude?: number;
+  // §23 — the carrier's payload Function, present iff the contract requires it.
+  functionId?: string;
   display: string; // resolved player-facing text (presentation only)
   displayTemplate: string; // authored template, retained for tooling
   paramTokens: ReadonlyArray<string>; // authored tuple tokens, in order
+}
+
+// §7 — an authored HOST: the battlefield/environment a battle is fought on.
+// A first-class causal source, NOT a Hacker- or System-owned effect bundle
+// (§13). Alpha 0.6 HOSTs have no active abilities beyond their PASSIVEs.
+export interface ResolvedHost {
+  id: string;
+  name: string;
+  passiveIds: ReadonlyArray<string>; // authored order; may be empty (THRESHOLD)
+  passives: ReadonlyArray<ResolvedPassive>;
+  // Director addition (2026-08-11) — whether random encounter generation may
+  // offer this HOST. Blank/`y` includes, `n` excludes. Deliberate selection
+  // screens ignore it; only the random pools consult it.
+  inPool: boolean;
+  displayText: string; // presentation only; may be blank
+  graphics: string; // placeholder only — no asset loading in Alpha 0.6
+}
+
+// §8 — an authored UPGRADE: Run-local reward state, ALWAYS Hacker-owned (§12).
+// Acquired at a Path Choice, active for the rest of that Run, never acquired
+// twice, and never present in Quick Match.
+export interface ResolvedUpgrade {
+  id: string;
+  name: string;
+  passiveIds: ReadonlyArray<string>;
+  passives: ReadonlyArray<ResolvedPassive>;
+  displayText: string; // presentation only; may be blank
+  graphics: string; // placeholder only
 }
 
 export interface ResolvedHacker {
@@ -204,8 +296,11 @@ export interface ResolvedHacker {
   weakColors: ReadonlyArray<Color>;
   strongShapes: ReadonlyArray<Shape>;
   weakShapes: ReadonlyArray<Shape>;
-  skillIds: ReadonlyArray<string>; // authored order, duplicates meaningful (§6.4)
-  skills: ReadonlyArray<ResolvedSkill>;
+  // Alpha 0.6.0 §6 — the `PASSIVES` column: an ordered list of zero or more
+  // PSV references. Authored order is gameplay-relevant (it is the resolution
+  // order within this source, §15.4) and is fingerprinted. Duplicates stack.
+  passiveIds: ReadonlyArray<string>;
+  passives: ReadonlyArray<ResolvedPassive>;
   // §4.4/§5.1 — the ordered three-Program portfolio from PRG_SET. Order is
   // gameplay-significant: it drives default-build derivation (§5.4) and
   // inventory presentation, and it is fingerprinted (§4.12).
@@ -235,11 +330,17 @@ export interface ResolvedSystem {
   // initialization, charge-routing priority, display order, save identity, and
   // fingerprinting. It is NOT Function-activation priority (§2.11).
   programIds: ReadonlyArray<string>;
-  // §2.2 — reserved for future System passives. Alpha 0.5 requires it blank;
-  // a nonblank value is unsupported content and a startup error, so this is
-  // always empty here and exists to keep the schema honest.
-  skillIds: ReadonlyArray<string>;
-  bio: string; // §5.2 placeholder only — never displayed in Alpha 0.5
+  // Alpha 0.6.0 §6 — System PASSIVEs are LIVE now. Through Alpha 0.5 a nonblank
+  // value here was a startup error; the column is the same `PASSIVES` list the
+  // Hacker uses and resolves through the same shared PSV dataset. No authored
+  // System currently references one, which is content, not a rule.
+  passiveIds: ReadonlyArray<string>;
+  passives: ReadonlyArray<ResolvedPassive>;
+  // Director addition (2026-08-11) — whether random encounter generation may
+  // offer this System. DOORMAN is excluded because it is the fixed Battle 1
+  // opponent (§29); deliberate selection screens still list it.
+  inPool: boolean;
+  bio: string; // §5.2 placeholder only — never displayed
   graphics: string; // §5.2 placeholder only — no asset loading
 }
 
@@ -265,13 +366,17 @@ export interface ResolvedContent {
   functions: ReadonlyMap<string, ResolvedFunction>;
   programsById: ReadonlyMap<string, ResolvedProgram>;
   hackers: ReadonlyMap<string, ResolvedHacker>;
-  skills: ReadonlyMap<string, ResolvedSkill>;
+  passives: ReadonlyMap<string, ResolvedPassive>; // Alpha 0.6.0 §5
   decks: ReadonlyMap<string, ResolvedDeck>;
   systems: ReadonlyMap<string, ResolvedSystem>; // Alpha 0.5.0 §5
+  hosts: ReadonlyMap<string, ResolvedHost>; // Alpha 0.6.0 §7
+  upgrades: ReadonlyMap<string, ResolvedUpgrade>; // Alpha 0.6.0 §8
   // Authored row order, for deterministic selection-screen presentation.
   hackerOrder: ReadonlyArray<string>;
   deckOrder: ReadonlyArray<string>;
   systemOrder: ReadonlyArray<string>; // §15 — System Selection listing order
+  hostOrder: ReadonlyArray<string>; // §38 — HOST Selection listing order
+  upgradeOrder: ReadonlyArray<string>; // §30.2 — eligible-pool iteration order
 }
 
 // ---- active-content registry (set once at startup, read-only afterwards) ----
@@ -319,11 +424,55 @@ export function systemById(id: string): ResolvedSystem {
   return s;
 }
 
-// §11.1/§13 — the complete valid System catalog in authored order. Random
-// encounter selection samples from exactly this list.
+// §11.1/§13 — the complete valid System catalog in authored order. Deliberate
+// selection screens list exactly this; random generation uses poolSystems().
 export function allSystems(): ResolvedSystem[] {
   const c = getContent();
   return c.systemOrder.map((id) => c.systems.get(id)!);
+}
+
+// Alpha 0.6.0 §7/§8 — the same unknown-ID contract as systemById: a missing
+// HOST or UPGRADE is broken content or a broken save, not a playable state, so
+// there is deliberately no fallback to a default or to the first row.
+export function hostById(id: string): ResolvedHost {
+  const h = getContent().hosts.get(id);
+  if (!h) throw new Error(`unknown host id: ${id}`);
+  return h;
+}
+
+export function upgradeById(id: string): ResolvedUpgrade {
+  const u = getContent().upgrades.get(id);
+  if (!u) throw new Error(`unknown upgrade id: ${id}`);
+  return u;
+}
+
+export function passiveById(id: string): ResolvedPassive {
+  const p = getContent().passives.get(id);
+  if (!p) throw new Error(`unknown passive id: ${id}`);
+  return p;
+}
+
+// §38 — every valid HOST, in authored order, for the deliberate selection
+// screen. `in_pool` is deliberately NOT consulted here.
+export function allHosts(): ResolvedHost[] {
+  const c = getContent();
+  return c.hostOrder.map((id) => c.hosts.get(id)!);
+}
+
+export function allUpgrades(): ResolvedUpgrade[] {
+  const c = getContent();
+  return c.upgradeOrder.map((id) => c.upgrades.get(id)!);
+}
+
+// Director addition (2026-08-11) — the RANDOM pools. Route offer generation and
+// Random Quick Match sample from these; the loader guarantees each is nonempty,
+// so a content mistake surfaces at startup rather than as an empty path screen.
+export function poolSystems(): ResolvedSystem[] {
+  return allSystems().filter((s) => s.inPool);
+}
+
+export function poolHosts(): ResolvedHost[] {
+  return allHosts().filter((h) => h.inPool);
 }
 
 // Ordered selection lists for the setup screens (§13.1/§14.1 — every loaded
@@ -434,7 +583,12 @@ export interface ContentStamp {
   functions: { id: string; cost: number }[];
   hackers: string[];
   decks: string[];
-  skills: string[];
+  passives: string[];
+  // Alpha 0.6.0 §46/§47 — the environment and reward catalogs a record was
+  // produced against. Battle-level only: HOST and UPGRADE identity is
+  // battle-static and is never copied into turn records (§35).
+  hosts: string[];
+  upgrades: string[];
   // §4.12/§18.2 — ordered portfolios, so a record identifies the content that
   // produced its inventory and default build.
   portfolios: { id: string; programs: string[] }[];
@@ -460,7 +614,9 @@ export function contentStamp(): ContentStamp {
     functions: [...c.functions.values()].map((f) => ({ id: f.id, cost: f.cost })),
     hackers: [...c.hackerOrder],
     decks: [...c.deckOrder],
-    skills: [...c.skills.keys()],
+    passives: [...c.passives.keys()],
+    hosts: [...c.hostOrder],
+    upgrades: [...c.upgradeOrder],
     systems: c.systemOrder.map((id) => {
       const s = c.systems.get(id)!;
       return { id: s.id, baseIce: s.baseIce, programs: [...s.programIds] };

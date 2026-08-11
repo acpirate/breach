@@ -4,13 +4,13 @@
 // from the same CSV datasets as the browser; the summary header stamps the
 // content identity (§13.2). Run with `npm run batch`.
 
-import { contentStamp, deckById, getContent, programsFor, systemById } from '../src/logic/data/content';
+import { contentStamp, deckById, getContent, hostById, programsFor, systemById } from '../src/logic/data/content';
 import { BattleMetrics } from '../src/logic/metrics';
 import { defaultIdentity } from '../src/logic/session';
 import { BattleSettings } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { initContentOrExit } from './dataNode';
-import { D, defaultActiveBuild, defaultInventory, headlessSystem, newBattle } from './harness';
+import { D, TIMER_MODE, defaultActiveBuild, defaultInventory, headlessHost, headlessSystem, newBattle } from './harness';
 
 initContentOrExit();
 
@@ -50,9 +50,9 @@ function report(label: string, group: BattleMetrics[]): void {
         ? ((x.attackerDamage + x.bombDamage + x.linesliceDamage + x.transformDamage) / x.totalDamage) * 100
         : 0,
     );
-    // MK7.3/7.4 + §11.3 + §15.3: SIX DISJOINT causal buckets
-    // (sync + bomb + atk + slice + buffer + skill = total)
-    console.log(`  Total damage: ${f1(avg(s.map((x) => x.totalDamage)))}  [sync ${f1(avg(s.map((x) => x.matchDamage)))} | bomb ${f1(avg(s.map((x) => x.bombDamage)))} | atk ${f1(avg(s.map((x) => x.attackerDamage)))} | slice ${f1(avg(s.map((x) => x.linesliceDamage)))} | xform ${f1(avg(s.map((x) => x.transformDamage)))} | buffer ${f1(avg(s.map((x) => x.bufferDamageAdded)))} | skill ${f1(avg(s.map((x) => x.skillDamage)))}]  Function share ${f1(avg(abilityPcts))}%`);
+    // MK7.3/7.4 + §11.3 + §15.3: SEVEN DISJOINT causal buckets
+    // (sync + bomb + atk + slice + xform + buffer + passive = total)
+    console.log(`  Total damage: ${f1(avg(s.map((x) => x.totalDamage)))}  [sync ${f1(avg(s.map((x) => x.matchDamage)))} | bomb ${f1(avg(s.map((x) => x.bombDamage)))} | atk ${f1(avg(s.map((x) => x.attackerDamage)))} | slice ${f1(avg(s.map((x) => x.linesliceDamage)))} | xform ${f1(avg(s.map((x) => x.transformDamage)))} | buffer ${f1(avg(s.map((x) => x.bufferDamageAdded)))} | passive ${f1(avg(s.map((x) => x.passiveDamage)))}]  Function share ${f1(avg(abilityPcts))}%`);
     console.log(`  Cascade (RNG-refill) damage, any cause: ${f1(avg(s.map((x) => x.cascadeDamage)))}`);
     console.log(`  Sync dmg by axis: color ${f1(avg(s.map((x) => x.matchDamageColor)))} / shape ${f1(avg(s.map((x) => x.matchDamageShape)))}`);
     // §9.5 — line-clear frequency, so B1 board churn is observable
@@ -78,8 +78,8 @@ function report(label: string, group: BattleMetrics[]): void {
       const fizzles = avg(s.map((x) => x.units[p.id]?.fizzles ?? 0));
       console.log(`  ${p.name} [${p.id}]: fires ${f1(fires)}, effect ${f1(effect)}, fizzles ${f1(fizzles)}`);
     }
-    // §21.3 — the Deck-owned Function and Hacker Skills report separately from
-    // the Programs; only the Hacker side carries them.
+    // §21.3 — the Deck-owned Function reports separately from the Programs;
+    // only the Hacker side carries it.
     if (side === 'player') {
       const deck = deckById(defaultIdentity().deckId);
       console.log(
@@ -88,16 +88,18 @@ function report(label: string, group: BattleMetrics[]): void {
           ` shake ${f1(avg(s.map((x) => x.deck.shakeSuccesses)))}/${f1(avg(s.map((x) => x.deck.shakeAttempts)))}` +
           ` (legal fizzles ${f1(avg(s.map((x) => x.deck.shakeFizzles)))})`,
       );
-      for (const sid of Object.keys(getContent().skills)) void sid; // (skills map, iterated below)
-      const skillIds = new Set<string>();
-      for (const x of s) for (const k of Object.keys(x.skills)) skillIds.add(k);
-      for (const sid of [...skillIds].sort()) {
-        console.log(
-          `  Skill ${sid}: triggers ${f1(avg(s.map((x) => x.skills[sid]?.triggers ?? 0)))},` +
-            ` damage ${f1(avg(s.map((x) => x.skills[sid]?.damage ?? 0)))},` +
-            ` charge ${f1(avg(s.map((x) => x.skills[sid]?.charge ?? 0)))}`,
-        );
-      }
+    }
+    // Alpha 0.6.0 §47 — PASSIVE rows for BOTH sides, keyed by INSTANCE
+    // (source + PASSIVE) so stacking from different sources stays visible.
+    const keys = new Set<string>();
+    for (const x of s) for (const k of Object.keys(x.passives)) keys.add(k);
+    for (const key of [...keys].sort()) {
+      console.log(
+        `  Passive ${key}: triggers ${f1(avg(s.map((x) => x.passives[key]?.triggers ?? 0)))},` +
+          ` damage ${f1(avg(s.map((x) => x.passives[key]?.damage ?? 0)))},` +
+          ` charge ${f1(avg(s.map((x) => x.passives[key]?.charge ?? 0)))},` +
+          ` shield ${f1(avg(s.map((x) => x.passives[key]?.shield ?? 0)))}`,
+      );
     }
   }
 }
@@ -135,16 +137,23 @@ const sim = systemById(headlessSystem().systemId);
 console.log(`system: ${sim.id} ${sim.name} | base ICE ${sim.baseIce} | build: ${sim.programIds.join(', ')}`);
 console.log(`system strong: colors=[${sim.strongColors.join(',')}] shapes=[${sim.strongShapes.join(',')}]`);
 console.log(`functions: ${stamp.functions.map((f) => `${f.id}=${f.cost}`).join(', ')}`);
-console.log(`identity: ${ids.hackerId}/${ids.deckId} (${ids.selectionSource}) skills=[${stamp.skills.join(', ')}]`);
+console.log(`identity: ${ids.hackerId}/${ids.deckId} (${ids.selectionSource}) passives=[${stamp.passives.join(', ')}]`);
+// Alpha 0.6.0 §44 — the HOST is pinned for the same reason the System is, and
+// is reported so a batch run states the whole encounter it measured.
+const simHost = hostById(headlessHost());
+console.log(`host: ${simHost.id} ${simHost.name} | passives: ${simHost.passiveIds.join(', ') || 'none'}`);
 console.log(`fingerprint: ${getContent().fingerprint}`);
 
 console.log(`inventory: ${defaultInventory().join(', ')}`);
 
-// Alpha matrix: data-driven costs (7/8/10/9) across the main modes
-runMode('DEFAULT (cap-0, data costs, Normal LINK)', { ...D });
-runMode('SYSTEM_MATCHING ON', { ...D, enemyMatching: true });
+// Alpha matrix: data-driven costs (7/8/10/9) across the main modes.
+// Alpha 0.6.0 — System matching is now the DEFAULT, so the old
+// 'SYSTEM_MATCHING ON' cell is the default cell. Timer-charge mode keeps an
+// explicit named cell so the pre-0.6 behavior stays measurable side by side.
+runMode('DEFAULT (system matching, cap-0, data costs, Normal LINK)', { ...D });
+runMode('TIMER SYSTEM (system matching OFF)', { ...TIMER_MODE });
 runMode('REINFORCED_CONNECTION ON (charge-aware bot)', { ...D, reinforcedConnection: true });
-runMode('REINFORCED_CONNECTION + SYSTEM_MATCHING (charge-aware bot)', { ...D, reinforcedConnection: true, enemyMatching: true });
+runMode('REINFORCED_CONNECTION + TIMER SYSTEM (charge-aware bot)', { ...TIMER_MODE, reinforcedConnection: true });
 
 // Alpha 0.4.0 — the default build leaves NINJA and WEASEL in the inventory, so
 // these two cells are what actually exercise DATACUT, PLINK, and overlapping

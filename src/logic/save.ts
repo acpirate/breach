@@ -70,8 +70,8 @@ export function isValidIdentity(raw: unknown): boolean {
   if (!id || typeof id !== 'object') return false;
   if (typeof id.hackerId !== 'string' || typeof id.deckId !== 'string') return false;
   if (typeof id.deckFunctionId !== 'string') return false;
-  if (!isStringArray(id.skillIds) || !isStringArray(id.hackerPrograms) || !isStringArray(id.systemPrograms)) return false;
-  if (!isStringArray(id.inventory)) return false;
+  if (!isStringArray(id.passiveIds) || !isStringArray(id.hackerPrograms) || !isStringArray(id.systemPrograms)) return false;
+  if (!isStringArray(id.inventory) || !isStringArray(id.upgradeIds)) return false;
   if (id.selectionSource !== 'EXPLICIT_SELECTION' && id.selectionSource !== 'QUICK_MATCH_DEFAULT') return false;
   if (typeof id.buildOrigin !== 'string') return false;
   // Alpha 0.5.0 §32/§41 — an active save MUST name a System that still
@@ -79,15 +79,23 @@ export function isValidIdentity(raw: unknown): boolean {
   // invitation to substitute a default or reroll the encounter.
   if (typeof id.systemId !== 'string') return false;
   if (!isSystemSelectionSource(id.systemSelectionSource)) return false;
+  // Alpha 0.6.0 §7/§40 — the HOST is battle identity on exactly the System's
+  // terms: it must name a HST_ID that still resolves. There is no default.
+  if (typeof id.hostId !== 'string') return false;
   const c = getContent();
   const hacker = c.hackers.get(id.hackerId);
   const deck = c.decks.get(id.deckId);
   const system = c.systems.get(id.systemId);
-  if (!hacker || !deck || !system) return false;
-  // ordered Skill IDs must match the referenced Hacker exactly (§17.3)
-  if (id.skillIds.length !== hacker.skillIds.length) return false;
-  if (id.skillIds.some((s, i) => s !== hacker.skillIds[i])) return false;
-  if (id.skillIds.some((s) => !c.skills.has(s))) return false;
+  const host = c.hosts.get(id.hostId);
+  if (!hacker || !deck || !system || !host) return false;
+  // ordered PASSIVE IDs must match the referenced Hacker exactly (§17.3)
+  if (id.passiveIds.length !== hacker.passiveIds.length) return false;
+  if (id.passiveIds.some((s, i) => s !== hacker.passiveIds[i])) return false;
+  if (id.passiveIds.some((s) => !c.passives.has(s))) return false;
+  // §43 — acquired UPGRADEs must all resolve and must be unique. A duplicate is
+  // a corrupt save, never something to silently deduplicate.
+  if (id.upgradeIds.some((u) => !c.upgrades.has(u))) return false;
+  if (new Set(id.upgradeIds).size !== id.upgradeIds.length) return false;
   if (id.deckFunctionId !== deck.fn.id) return false;
   // Alpha 0.4.0 §17.2 — the saved inventory must be exactly what this
   // Hacker/Deck pairing derives from CURRENT portfolio content, and the saved

@@ -13,7 +13,7 @@ import { defaultIdentity, deserializeSession, serializeSession } from '../src/lo
 import { BattleSettings } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { initContentOrExit } from './dataNode';
-import { D, deckCost, defaultHackerLink, headlessSystem, manualLink, newBattle } from './harness';
+import { D, deckCost, defaultHackerLink, headlessHost, headlessSystem, manualLink, newBattle } from './harness';
 
 initContentOrExit();
 
@@ -163,7 +163,7 @@ function runBattle(label: string, settings: BattleSettings, seed: number): void 
       sm.linesliceDamage +
       sm.transformDamage +
       sm.bufferDamageAdded +
-      sm.skillDamage;
+      sm.passiveDamage;
     assert(
       Math.abs(tallied - sm.totalDamage) < 1e-9,
       `${side} causal buckets (${tallied}) must sum to total (${sm.totalDamage})`,
@@ -172,8 +172,8 @@ function runBattle(label: string, settings: BattleSettings, seed: number): void 
   if (settings.enemyMatching) {
     assert(m.sides.enemy.tilesDestroyed > 0, 'a matching System should have sliced Packets');
   }
-  // §11.2: base Sync damage is suppressed for BOTH sides; Skill-originated
-  // damage still resolves, and bombs still deal detonation damage.
+  // §11.2/§17: base Sync damage is suppressed for BOTH sides; match-triggered
+  // PASSIVE damage still resolves, and bombs still deal detonation damage.
   if (settings.reinforcedConnection) {
     assert(
       m.sides.player.matchDamage === 0 && m.sides.enemy.matchDamage === 0,
@@ -181,16 +181,17 @@ function runBattle(label: string, settings: BattleSettings, seed: number): void 
     );
     const p = m.sides.player;
     assert(
-      Math.abs(p.totalDamage - (p.attackerDamage + p.bombDamage + p.bufferDamageAdded + p.skillDamage)) < 1e-9,
-      'Reinforced Connection: Hacker damage must come only from Functions, buffer, and Skills',
+      Math.abs(p.totalDamage - (p.attackerDamage + p.bombDamage + p.bufferDamageAdded + p.passiveDamage)) < 1e-9,
+      'Reinforced Connection: Hacker damage must come only from Functions, buffer, and PASSIVEs',
     );
-    // the System has no Hacker identity, so it has no Skill damage at all (§6.2)
-    assert(m.sides.enemy.skillDamage === 0, 'Reinforced Connection: the System must never accrue Hacker-Skill damage');
+    // Alpha 0.6.0 §12 — the headless System fields no PASSIVEs and the pinned
+    // HOST has none, so nothing can contribute PASSIVE damage on that side.
+    assert(m.sides.enemy.passiveDamage === 0, 'Reinforced Connection: the pinned System must accrue no PASSIVE damage');
   }
   console.log(
     `${label} seed=${seed}: winner=${g.state.winner} turns=${g.state.turn} ` +
       `link=${Math.max(0, g.state.hp.player)} ice=${Math.max(0, g.state.hp.enemy)}` +
-      ` skillDmg=${m.sides.player.skillDamage} lineClears=${m.sides.player.lineClears}` +
+      ` passiveDmg=${m.sides.player.passiveDamage} lineClears=${m.sides.player.lineClears}` +
       ` deckNeutral=${m.sides.player.deck.chargeFromNeutral}` +
       `${settings.reinforcedConnection ? ` [bombDmg H:${m.sides.player.bombDamage} S:${m.sides.enemy.bombDamage}]` : ''}`,
   );
@@ -221,6 +222,9 @@ function testSaveRoundTrip(): void {
     // Alpha 0.5.0 §32 — the session's opponent must agree with the battle's own
     // identity, or the envelope legitimately fails its consistency check.
     system: { systemId: g.state.identity.systemId, source: g.state.identity.systemSelectionSource },
+    // Alpha 0.6.0 §44 — the HOST is part of Quick Match session identity on the
+    // System's terms and must likewise agree with the battle's own identity.
+    hostId: g.state.identity.hostId,
     build: [...g.state.identity.hackerPrograms],
     buildOrigin: g.state.identity.buildOrigin,
   };
@@ -259,8 +263,8 @@ function testSaveRoundTrip(): void {
     if (!rg.state.winner) rg.startPlayerPhase();
   }
   assert(rg.state.winner, 'restored game plays to completion');
-  // §17.1: pre-Alpha-0.4.0 saves reject cleanly (no migration, no partial load)
-  for (const old of ['mk9', 'alpha-0.1.0', 'alpha-0.2.0', 'alpha-0.3.0']) {
+  // §17.1/§40: earlier saves reject cleanly (no migration, no partial load)
+  for (const old of ['mk9', 'alpha-0.1.0', 'alpha-0.2.0', 'alpha-0.3.0', 'alpha-0.5.0']) {
     const preAlpha = JSON.parse(json) as { version: string };
     preAlpha.version = old;
     assert(deserializeSession(JSON.stringify(preAlpha)) === null, `${old} save -> no save`);
@@ -275,11 +279,11 @@ function testSaveRoundTrip(): void {
   console.log('save round-trip OK');
 }
 
-assert(SAVE_VERSION === 'alpha-0.5.0', 'save version must be alpha-0.5.0');
+assert(SAVE_VERSION === 'alpha-0.6.0', 'save version must be alpha-0.6.0');
 console.log(`content fingerprint: ${getContent().fingerprint}`);
-// §44 — every simulation in this file runs against the PINNED headless System,
-// so results stay comparable between runs.
-console.log(`headless System: ${headlessSystem().systemId}`);
+// §44 — every simulation in this file runs against the PINNED headless System
+// and HOST, so results stay comparable between runs.
+console.log(`headless System: ${headlessSystem().systemId} | headless HOST: ${headlessHost()}`);
 console.log(`default identity LINK: ${defaultHackerLink()} (deck function cost ${DECK_COST})`);
 
 // defaults (cap-0, Normal LINK on) — standard and low-LINK

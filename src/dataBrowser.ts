@@ -9,9 +9,11 @@ import fncText from '../data/breach datastructures - FNC.csv?raw';
 import hackerText from '../data/breach datastructures - PRG_H.csv?raw';
 import systemText from '../data/breach datastructures - PRG_S.csv?raw';
 import hakText from '../data/breach datastructures - HAK.csv?raw';
-import sklText from '../data/breach datastructures - SKL.csv?raw';
+import psvText from '../data/breach datastructures - PSV.csv?raw';
 import dekText from '../data/breach datastructures - DEK.csv?raw';
 import sysText from '../data/breach datastructures - SYS.csv?raw';
+import hstText from '../data/breach datastructures - HST.csv?raw';
+import upgText from '../data/breach datastructures - UPG.csv?raw';
 import { DataFiles } from './logic/data/load';
 
 // The manifest: each dataset's ROLE is declared here and independently
@@ -22,8 +24,10 @@ export function browserDataFiles(): DataFiles {
     system: { name: 'breach datastructures - PRG_S.csv', text: systemText },
     functions: { name: 'breach datastructures - FNC.csv', text: fncText },
     hackers: { name: 'breach datastructures - HAK.csv', text: hakText },
-    skills: { name: 'breach datastructures - SKL.csv', text: sklText },
+    passives: { name: 'breach datastructures - PSV.csv', text: psvText },
     decks: { name: 'breach datastructures - DEK.csv', text: dekText },
     systems: { name: 'breach datastructures - SYS.csv', text: sysText },
+    hosts: { name: 'breach datastructures - HST.csv', text: hstText },
+    upgrades: { name: 'breach datastructures - UPG.csv', text: upgText },
   };
 }

@@ -80,7 +80,14 @@ export const CHARGE_CAP_EQUALS_COST = true;
 // ============================================================================
 
 export const DEFAULT_BATTLE_SETTINGS: BattleSettings = {
-  enemyMatching: false,
+  // Alpha 0.6.0 (director ruling, 2026-08-11) — System matching is ON by
+  // default. The System now takes a REAL turn: it ticks countdowns, runs its
+  // Function phase, and makes one Sync, instead of receiving the flat
+  // ENEMY_TIMER_CHARGE_RATE. Timer mode remains fully supported and is still
+  // measured explicitly by the headless instruments; it is simply no longer the
+  // default. This is a deliberate difficulty change, deferred for tuning to the
+  // post-beta content/balance pass.
+  enemyMatching: true,
   singleAxisPayout: false,
   maxCascadeSteps: 0, // MK6.3: cap-0 is the default (null = infinite)
   reinforcedConnection: false, // §11 (formerly No Match Damage)

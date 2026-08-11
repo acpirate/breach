@@ -1,35 +1,35 @@
-# Breach — Alpha 0.5.0
+# Breach — Alpha 0.6.0
 
-Breach is a mobile-first match-3 combat game with a cyberpunk hacking theme. Alpha 0.5.0 gives the opposing System a real identity: Systems are authored external content with their own durability, strength profile, and ordered Program build, and the System you face is chosen before you build against it.
+Breach is a mobile-first match-3 combat game with a cyberpunk hacking theme. Alpha 0.6.0 adds the environment and reward layers around the established combat model: every battle is now fought on a HOST, every Run is a sequence of path choices, and one shared PASSIVE framework replaces the Hacker-only Skill mechanic.
 
 The project remains a whitebox development build rather than a complete game. It supports browser play, deterministic headless simulation, four-battle Runs, Quick Matches, persistent in-progress state, event-sourced metrics, and validated external content.
 
 ## Current status
 
-**Build:** `alpha-0.5.0`
-**Active save schema:** `4`
+**Build:** `alpha-0.6.0`
+**Active save schema:** `5`
 
-Alpha 0.5.0 adds:
+Alpha 0.6.0 adds:
 
-- a seventh required dataset (`SYS`) defining authored Systems
-- two authored Systems, BOUNCER and MIDNIGHT
-- System-specific base ICE and independent strong/weak axes
-- ordered four-Program System builds drawn from eight System Programs
-- explicit System Selection before Constructed Quick Match Build
-- random System selection before every Run battle, persisted and never rerolled
-- automatic System selection for Random Quick Match
-- `EFFECT_TRANSFORM` and the COERCE Function
-- delayed Buff delivery through the existing countdown architecture (EBUFF)
-- a charge-granting Bomb variant (SPAM) and three new System Programs
-- dynamic System Function readiness within a single System turn
-- a universal "valid target or don't fire" activation rule for the System
-- one canonical side-level charge-waste metric
-- compact-log classification and rendering fixes
+- a unified `PSV` PASSIVE framework replacing the retired `SKL` Skill dataset
+- PASSIVEs referenced by Hackers, Systems, HOSTs, and UPGRADEs alike, stacking by source
+- HOST (`HST`) as a first-class environment source with its own causal attribution
+- UPGRADE (`UPG`) as persistent Run-local reward state, always Hacker-owned
+- a Path Choice before every Run battle, committing a `SYS + HST + UPG` package
+- a fixed DOORMAN + THRESHOLD Battle 1 whose paths differ only by UPGRADE
+- randomized System/HOST route offers for Battles 2-4, with an `in_pool` authoring flag
+- `START_OF_TURN` carrier PASSIVEs that invoke a Function at no cost
+- continual PASSIVEs for match damage, match charge, charge dampening, Function damage, permanent Shield, and Bomb area
+- four new named area patterns and the `PSV_BIGGER_BOMB` progression
+- a generalized `EFFECT_TRANSFORM` axis grammar with neutral results and a two-tier target rule
+- HOST Selection in Constructed Quick Match and automatic HOST selection in Random Quick Match
+- System matching ON by default
+- a `PENDING_PATH` save phase with exact, never-rerolled offers
 
 The current implementation requirements are documented in:
 
 ```text
-breach-alpha-0.5.0-coding-agent-handoff.md
+staging/breach-alpha-0.6.0-coding-agent-handoff.md
 ```
 
 Earlier Alpha, PoC, and MK requirements remain useful as development history but are not the current implementation specification.
@@ -62,29 +62,28 @@ npm run typecheck  # TypeScript validation
 npm run build      # production bundle
 ```
 
-Alpha 0.5.0 handoff results:
+Alpha 0.6.0 handoff results:
 
 | Command | Result |
 |---|---|
 | `npm run typecheck` | pass |
-| `npm test` | 200 passed, 0 failed |
+| `npm test` | 237 passed, 0 failed |
 | `npm run smoke` | `SMOKE OK` |
 | `npm run batch` | pass across 6 cells |
-| `npm run hpladder` | pass — 76/74/85% with System matching off; 39/37/29% with matching on |
-| `npm run build` | pass — 145.32 kB, 46.34 kB gzip |
+| `npm run hpladder` | pass — 76/74/85% in timer mode; 39/37/29% with System matching |
+| `npm run build` | pass — 170.02 kB, 53.18 kB gzip |
 
-Balance figures moved from Alpha 0.4.1 because Alpha 0.5 deliberately changes System identity and content. Two changes account for most of it: Quick Match System ICE is now the System's own `BASE_ICE` (100) instead of a mirror of the Hacker's maximum LINK (150), and the authored Systems field new Functions.
+Alpha 0.6 is a framework and content-structure build, not a balance pass. The player-facing default now runs with System matching ON, which is a deliberate difficulty change: the System takes a real turn instead of receiving a flat timer charge. Tuning is deferred to the post-beta content and balance pass. The ladder still reports both modes so the pre-0.6 numbers stay comparable.
 
-Headless simulations pin one System (`SYS_01`) so their output stays comparable between runs; random selection is gameplay behavior and does not belong in a measurement instrument.
+Headless simulations pin one System (`SYS_01`) and one HOST (`HST_01` THRESHOLD, which has no PASSIVEs) so their output stays comparable between runs; random selection is gameplay behavior and does not belong in a measurement instrument.
 
-The current content loads with zero errors and six expected warnings:
+The current content loads with zero errors and five expected warnings:
 
 - duplicate display name `ATTACKER` across Hacker and System Programs
 - duplicate display name `DISABLER` across Hacker and System Programs
 - unreferenced showcase Functions `FNC_007`, `FNC_008`, and `FNC_009`
-- `PRG_S_004` DISABLER is not fielded by any authored System
 
-These are warnings rather than startup blockers. The last one is a deliberate content consequence: neither authored System currently fields DISABLER, so the System does not Drain in Alpha 0.5.
+These are warnings rather than startup blockers. The Alpha 0.5 warning about `PRG_S_004` DISABLER being unfielded is gone: DOORMAN fields it, so the System now Drains in live play.
 
 ## Systems
 
@@ -103,10 +102,15 @@ The authored Systems are:
 |---|---|---|---|---|
 | `SYS_01` BOUNCER | 100 | Red, Green, Yellow | Triangle, Square, Star | ATTACKER, MUSCLE, ENHANCE, E-BOMBER |
 | `SYS_02` MIDNIGHT | 100 | Red, Magenta, Blue | Triangle, Square, Star | SPAMBOT, THROWER, E-BOMBER, SHIELDER |
+| `SYS_03` DOORMAN | 100 | Green, Yellow, Blue | Circle, Cross, Star | E-BOMBER, SHIELDER, ATTACKER, DISABLER |
+
+DOORMAN is the fixed Battle 1 opponent and is excluded from the random pool by its `in_pool` flag. It is also the first authored System to field DISABLER, so System Drain now happens in live play rather than only in tests.
 
 `PRG_SET` order is charge-routing priority, display order, and save identity. It is **not** Function-activation priority.
 
-There is no System portfolio, System inventory, System Build screen, or System Program reordering in Alpha 0.5. System passive Skills are deferred; the `SKILL` column must be blank, and a populated value is a startup error rather than silently ignored content.
+There is no System portfolio, System inventory, System Build screen, or System Program reordering in Alpha 0.6. System PASSIVEs are supported — the `PASSIVES` column resolves through the shared `PSV` dataset exactly as the Hacker's does — but no authored System currently references one. The retired `SKILL` header is not accepted as an alias; a stale export fails the header check.
+
+Each System and HOST also carries an `in_pool` flag. Blank or `y` includes the row in random route generation and Random Quick Match; `n` excludes it. Deliberate selection screens ignore the flag and always list everything.
 
 ### Effective ICE
 
@@ -119,6 +123,29 @@ Run battle N: BASE_ICE + run-step modifier   (+0, +50, +100, +150)
 
 A `BASE_ICE = 100` System therefore still produces the established 100 / 150 / 200 / 250 Run ladder, while a future System with different durability escalates correctly without redesigning Run progression. With Normal LINK off, the manual System ICE setting replaces both the base and the step modifier; the values are never combined.
 
+## HOSTs and UPGRADEs
+
+A **HOST** is the battlefield a battle is fought on. It is a first-class causal source alongside the two agents — not a property of either — and it contributes PASSIVEs that affect the encounter. Every battle has exactly one HOST, Quick Match included.
+
+| HOST | PASSIVE |
+|---|---|
+| `HST_01` THRESHOLD | none — the fixed Battle 1 battlefield |
+| `HST_02` BITMIRE | `PSV_003` all Syncs generate 1 fewer charge |
+| `HST_03` ARENA | `PSV_004` Function damage +2 |
+| `HST_04` VERDUN | `PSV_007` bigger Bombs |
+| `HST_05` WEEDS | `PSV_008` carries GREENING at every turn start |
+
+An **UPGRADE** is Run-local reward state, always Hacker-owned. One is acquired at every Path Choice, it applies to that battle and every later battle of the Run, and no UPGRADE is ever acquired twice.
+
+| UPGRADE | PASSIVE |
+|---|---|
+| `UPG_01` BRACER | `PSV_005` permanent Shield 1 |
+| `UPG_02` GRACE | `PSV_006` +1 charge on a Yellow Sync |
+| `UPG_03` L33TSK1LL | `PSV_003` the opponent's Syncs generate 1 fewer charge |
+| `UPG_04` SNEAKERS | `PSV_009` carries SNEAK at every Hacker turn start |
+
+There are four UPGRADEs and four acquisition decisions, so before Battle 4 exactly one remains and both final path cards legitimately offer it. Choosing either acquires it once; the log records that the duplicate came from pool exhaustion.
+
 ## Play modes
 
 ### New Run
@@ -127,39 +154,47 @@ A `BASE_ICE = 100` System therefore still produces the established 100 / 150 / 2
 Title
 → Hacker Selection
 → Deck Selection
-→ resolve Battle 1 System
+→ Path Choice          (commits the Run and replaces the save)
 → Build
 → Battle 1
-→ resolve Battle 2 System
+→ Result
+→ Path Choice
 → Build
 → Battle 2
 → ...
 ```
 
-Each Run battle draws one valid System at random, with replacement — repeats are allowed and there is no shuffle bag or anti-repeat rule. The opponent is resolved **before** the Build screen so the player can build against it, and the Build screen shows the upcoming System's ICE, strong and weak axes, and ordered Programs.
+Every battle is preceded by a Path Choice offering two `SYS + HST + UPG` packages. Selecting one is immediate and final for that battle: it acquires the UPGRADE, commits the System and HOST, and opens the Build screen — so the player always edits the build against a fully known encounter.
 
-Once resolved, that choice is persisted. Reopening Build, Save and Quit followed by Continue, and retrying after a defeat all face the same System. Only successful progression to a new Run step draws a new one.
+Battle 1 is fixed: both paths are DOORMAN on THRESHOLD, and the only difference is the UPGRADE. Battles 2-4 randomize System and HOST independently from the `in_pool` subsets, avoiding two identical `SYS + HST` pairs within one offer when another combination exists. Repeating a previous battle's System or HOST is allowed.
+
+Entering the **initial** Path Choice is the destructive commitment boundary: it creates the Run, replaces the previous save, generates the two offers, and persists them immediately. Reloading on a Path Choice restores exactly the same two cards — offers are never rerolled.
+
+Retrying a lost battle preserves the committed System, HOST, and every acquired UPGRADE, and generates no new path. A full Restart Run clears Run-local progression: the acquired UPGRADEs go with the abandoned Run.
 
 ### Quick Match
 
-- **Random Quick Match** generates a random build and order, chooses a System automatically, and begins immediately without opening any selection screen.
-- **Constructed Quick Match** opens System Selection first, then the Build screen.
+- **Random Quick Match** generates a random build and order, chooses a System and a HOST automatically, and begins immediately without opening any selection screen.
+- **Constructed Quick Match** opens System Selection, then HOST Selection, then the Build screen.
 
 ```text
 Quick Match
 → Constructed Quick Match
 → System Selection
+→ HOST Selection
 → Build
 → Battle
 ```
 
-System Selection lists every valid loaded System with its Quick Match ICE, strong and weak axes, and ordered Programs, and offers the shared Program inspection modal. Selection is explicit and there is no confirmation modal. Back from Build returns to System Selection; Back from System Selection returns to the Quick Match submenu.
+System Selection lists every valid loaded System with its Quick Match ICE, strong and weak axes, and ordered Programs. HOST Selection lists every valid loaded HOST with its resolved PASSIVE text — or, for a carrier with no authored display, its payload Function name. Both ignore `in_pool`: that flag governs random generation only, so a tester can always field a specific encounter deliberately.
 
-Constructed Quick Match still remembers the last valid Hacker build and order. Alpha 0.5 adds no remembered System preference — the opponent is chosen each time.
+There is no UPGRADE selection in Quick Match and no Run UPGRADE state in a Quick Match save.
+
+Constructed Quick Match still remembers the last valid Hacker build and order, independent of Run progression. There is no remembered System or HOST preference.
 
 ### Selection randomness
 
-Encounter selection uses an isolated setup random source, never the battle's gameplay stream. Choosing a System cannot perturb the board, refills, or AI sequence for a given gameplay seed, and neither can the number of setup selections that preceded a battle.
+Route and encounter selection use an isolated setup/route random source, never the battle's gameplay stream. Choosing a System or HOST cannot perturb the board, refills, or AI sequence for a given gameplay seed. A Run's route RNG state is persisted with the Run, so a save and resume produces the same route sequence an uninterrupted Run would.
 
 ## Hacker, Deck, inventory, and build
 
@@ -227,7 +262,72 @@ Line-clear qualification uses the combined directly matched footprint for each r
 
 ### Reinforced Connection
 
-Reinforced Connection suppresses base Sync damage for both sides. Match-triggered Skills and Functions still resolve. This includes Syncs created by `EFFECT_TRANSFORM`, whose base damage is suppressed like any other Sync.
+Reinforced Connection suppresses base Sync damage for both sides. Match-triggered PASSIVEs and Functions still resolve. This includes Syncs created by `EFFECT_TRANSFORM`, whose base damage is suppressed like any other Sync.
+
+## PASSIVEs
+
+One external `PSV` dataset defines every passive in the game. Hackers, Systems, HOSTs, and UPGRADEs all reference rows from it, and the same row referenced by two different sources is **two instances that both apply** — PASSIVEs stack by source and are never deduplicated by ID.
+
+A PASSIVE instance carries its source kind (`HAK`/`SYS`/`HST`/`UPG`), its source ID, and its PASSIVE ID everywhere it appears: in combat resolution, in logs, and in metrics.
+
+### Scope
+
+`agent_scope` is `OWNER` or `ENEMY` and resolves against the supplying agent. UPGRADEs are always Hacker-owned whichever agent their effect lands on. A HOST is not an agent: HOST instances **ignore** `agent_scope` and apply to both agents symmetrically.
+
+### Continual PASSIVEs
+
+| Effect | Behavior |
+|---|---|
+| `PSV_EXTRA_MATCH_DAMAGE` | adds raw Sync damage once per qualifying color-axis Sync, before crit, flooring, Buff, and Shield |
+| `PSV_EXTRA_MATCH_CHARGE` | inflates the qualifying Sync's charge stream before routing, rather than opening a second pool |
+| `PSV_CHARGE_DAMPEN` | reduces qualifying charge streams |
+| `PSV_FUNCTION_DAMAGE_INCREASE` | adds to raw Function damage before Buff/Shield handling |
+| `PSV_PERM_SHIELD` | non-removable Shield value stacked with Packet Shield |
+| `PSV_BIGGER_BOMB` | advances every qualifying Bomb one named area-pattern step |
+
+Charge arithmetic is order-independent:
+
+```text
+finalGenerated = max(0, baseGenerated + extra-charge bonuses − dampening)
+```
+
+Only the final amount is routed, through the ordinary top-to-bottom queue.
+
+Permanent Shield is not a Packet: it cannot be sliced, blasted, or transformed away, it stacks with Packet Shield, and it is included in the displayed effective total.
+
+`PSV_BIGGER_BOMB` advances the **named** pattern by one step per active instance and saturates at the largest registered pattern. Edge clipping does not change the step. A countdown Bomb is stamped with its upgraded pattern at arming time, so a save, a resume, and a later detonation all agree. It changes area only — never quantity, countdown, damage, targeting, or the charge tuple.
+
+The area registry is cumulative, each entry a strict superset of the one before it:
+
+| Pattern | Cells (unclipped) |
+|---|---|
+| `AREA_SELF` | 1 |
+| `AREA_CARDINAL_1` | 5 |
+| `AREA_SQUARE_3X3` | 9 |
+| `AREA_SQUARE_3X3_CARDINAL_2` | 13 |
+| `AREA_FAT_CROSS_2` | 21 |
+| `AREA_SQUARE_5X5` | 25 |
+| `AREA_FAT_CROSS_3` | 37 |
+| `AREA_SQUARE_7X7_CROSS_4` | 69 |
+
+The last two exceed half the 8×8 Datastream; with one VERDUN as the only BIGGER_BOMB source, a single step is the practical ceiling today.
+
+### START_OF_TURN carriers
+
+A carrier PASSIVE invokes its `function_payload` at the start of a turn and **pays no Function cost** — no pool is required and none is debited. The Function otherwise uses the ordinary expansion, targeting, atomic resolution, immediate-Sync, and cascade machinery, and its activation is logged with its PASSIVE source.
+
+At the beginning of every agent turn, in this order:
+
+1. HOST `START_OF_TURN` PASSIVEs
+2. the active agent's own identity PASSIVEs
+3. the Hacker's UPGRADE PASSIVEs, in acquisition order (Hacker turns only)
+4. within one source, in authored reference order
+
+Each triggered Function resolves completely — Effect, immediate Syncs, cascades, damage, charge — before the next begins. Only then do countdowns tick. A battle that reaches its terminal state part-way through stops rather than continuing to mutate.
+
+### HOST causal source vs. Sync owner
+
+A HOST trigger produces two distinct facts and both are preserved. WEEDS firing GREENING at the Hacker's turn start is *caused* by the HOST PASSIVE, but the Hacker is the **resolution owner** of any Sync it creates: damage profile, charge routing, and owner-scoped PASSIVEs all follow the Hacker. The same trigger on the System's turn makes the System the owner. Logs carry both the causal source and the resolution owner; they are never collapsed into one field.
 
 ## The System turn
 
@@ -257,16 +357,31 @@ If another Function later creates a valid target, a previously blocked Program m
 
 This is a deliberate change from Alpha 0.4.1, where placement Functions fired into a full board and legally fizzled with the charge already spent.
 
-## New Alpha 0.5 content
+## Effects and delayed delivery
 
-### COERCE (`EFFECT_TRANSFORM`)
+### `EFFECT_TRANSFORM` and its axis grammar
 
-COERCE changes the underlying color/shape identity of Packets matching an authored source axis.
+A Transform changes the underlying color/shape identity of Packets matching an authored target spec. Alpha 0.6 generalizes both axis columns (director override, 2026-08-11):
 
-- `axisTarget` selects the eligible pool; Alpha 0.5 supports `NEU` (neutral Packets)
-- `axisResult` is exactly one color and one shape — `YEL:STR` for current content
+```text
+axisTarget:  NEU | ALL | <COLOR> | <SHAPE> | <COLOR>:<SHAPE>
+axisResult:  NEU | <COLOR> | <SHAPE> | <COLOR>:<SHAPE>
+```
+
+The colon is **intersection** in both columns — `GRE:TRI` means "green triangles", never "green or triangular". There is no OR targeting, no multi-value axis, and no negation.
+
+- `NEU` targets neutral Packets; `ALL` targets every Packet including neutrals
+- a single axis value targets that value on one axis, any value on the other, and **excludes neutrals** (a neutral has no axis to match)
+- a single-axis **result** preserves the other axis — or, when the target was neutral and so has none to preserve, randomizes it per Packet
+- a `NEU` result turns the Packet neutral and always destroys any overlay, since a neutral tile cannot carry one
 - `quantity` is an ordinary maximum: up to that many valid targets, fewer if fewer exist
 - the typed tuple is `targeting:specialPacketTreatment`
+
+**Target exclusion.** A Packet that already matches every result axis is a no-op and is never a valid target. Candidates fall into two tiers: those sharing *no* result axis, and — only for a two-axis result — those sharing exactly one. Tier 1 is drawn first and tier 2 tops up whatever quantity remains, so a Function never converts fewer Packets than it could. A row whose target constraints are identical to its result can never have a valid target and fails validation at startup.
+
+Because axis-specific and `ALL` targeting can now reach standard Packets, `specialPacketTreatment` is live behavior for the first time: an overlay-carrying Packet can be transformed with its bomb, buff, or shield riding along.
+
+Current content: COERCE is `NEU` → `YEL:STR`; GREENING is `ALL` → `GRE`; SNEAK is `ALL` → `MAG`.
 
 All selected Packets change **before** any Sync detection runs, so target iteration order is never mechanically significant. Any Sync created belongs to the activating side and resolves through the ordinary pipeline: normal strong/weak damage from that side's profile, normal crit tiers, normal B1 qualification, normal charge routing, normal cascades.
 
@@ -296,7 +411,7 @@ The Bomb tuple remains `targeting:dealDamage:gainCharge`, with each Function's `
 
 System Drain considers only charged active Hacker Programs. It does not target inactive inventory Programs or the Deck Function. Target priority is fully charged Programs first, then highest charge, then highest Function cost, then a random tie break.
 
-Neither authored System currently fields DISABLER, so this path is exercised by tests rather than by live Alpha 0.5 play. The behavior and its telemetry are retained for a future Disabler-using System.
+DOORMAN fields DISABLER, so this path is exercised by live play from Battle 1 of every Run, not only by tests.
 
 ## Controls
 
@@ -312,8 +427,10 @@ Neither authored System currently fields DISABLER, so this path is exercised by 
 ### Setup screens
 
 - System Selection: tap a System to select it, inspect its Programs, then confirm.
+- HOST Selection: tap a HOST to see its PASSIVEs, then confirm.
+- Path Choice: tap a path card to see its full package, then take it. Selection is final for that battle; there is no Back.
 - Build screen: inspect, replace, and reorder the four active Programs.
-- The Run Build screen shows the upcoming opponent in a collapsible panel.
+- The Run Build screen shows the committed System and the committed HOST plus acquired UPGRADEs in collapsible panels.
 
 ### Functions
 
@@ -326,22 +443,24 @@ Neither authored System currently fields DISABLER, so this path is exercised by 
 
 - **Continue** appears only for a compatible active save.
 - **Save and Quit** is available at supported battle and between-battle boundaries.
-- Restarting a Run returns to the default build and draws a new Battle 1 System.
+- Restarting a Run clears acquired UPGRADEs and returns to the initial Path Choice.
 - Settings retain Normal LINK and Reinforced Connection controls.
 
 ## Data-driven content
 
 Runtime source files are stored under `data/`.
 
-The seven required datasets define:
+The nine required datasets define:
 
 ```text
 Hackers
-Hacker Skills
+PASSIVEs
 Decks
 Hacker Programs
 System Programs
 Systems
+HOSTs
+UPGRADEs
 Functions
 ```
 
@@ -349,16 +468,20 @@ Stable IDs preserve content identity:
 
 ```text
 HAK_...      Hacker
-SKL_...      Hacker Skill
+PSV_...      PASSIVE
 DEK_...      Deck
 SYS_...      System
+HST_...      HOST
+UPG_...      UPGRADE
 PRG_H_...    Hacker Program
 PRG_S_...    System Program
 FNC_...      Function
 EFFECT_...   coded Effect
 ```
 
-Hackers define LINK, strong color and shape sets, ordered Skills, and an ordered three-Program portfolio. Decks add LINK, an ordered three-Program portfolio, and one Deck Function. Systems define base ICE, strong color and shape sets, and an ordered four-Program build. Programs define identity, charge bindings, and one active Function. Functions define activation cost, payload, common fields, transform axes, and typed Effect-specific parameter tuples. Effects remain coded TypeScript actions rather than spreadsheet scripting.
+Hackers define LINK, strong color and shape sets, ordered PASSIVEs, and an ordered three-Program portfolio. Decks add LINK, an ordered three-Program portfolio, and one Deck Function. Systems define base ICE, strong color and shape sets, an ordered four-Program build, ordered PASSIVEs, and a pool flag. HOSTs define ordered PASSIVEs and a pool flag. UPGRADEs define ordered PASSIVEs. PASSIVEs define a coded effect, typed parameters, an activation, an agent scope, and an optional Function payload. Programs define identity, charge bindings, and one active Function. Functions define activation cost, payload, common fields, transform axes, and typed Effect-specific parameter tuples. Effects remain coded TypeScript actions rather than spreadsheet scripting.
+
+A Function cost of `0` is legal so a PASSIVE carrier payload can state its true cost, but a zero-cost Function may **not** be assigned to a Program or Deck: a charge pool's capacity is its Function's cost, so such a Program would hold no pool and fire free every turn. That assignment is a blocking startup error.
 
 A single leading apostrophe in any dataset cell is treated as spreadsheet-protection syntax and removed before trimming, parsing, reference resolution, validation, and fingerprinting. Apostrophes elsewhere in a value are preserved.
 
@@ -379,10 +502,15 @@ Validation includes:
 - side-specific Program prefixes
 - data types and numeric ranges
 - enum and area-pattern values
-- typed Effect parameter tuples and transform axes
+- typed Effect parameter tuples and the transform axis grammar
 - positive integer `BASE_ICE`
 - exactly four distinct System Programs in each `PRG_SET`
-- blank System `SKILL` (passive Skills are unsupported in Alpha 0.5)
+- PASSIVE activation, agent scope, typed params, and required/forbidden Function payloads
+- `START_OF_TURN` payloads that are executable without player targeting
+- PASSIVE references from every source kind
+- at least four valid UPGRADE rows
+- a nonempty random pool for both Systems and HOSTs
+- zero-cost Functions not assigned to a Program or Deck
 - broken references
 - invalid Function composition
 - targeting-order and targeted-quantity restrictions
@@ -403,19 +531,22 @@ Data loads once at application startup and is not reloaded during an active sess
 
 ## Persistence
 
-Alpha 0.5 uses save schema `4`.
+Alpha 0.6 uses save schema `5`.
 
 Supported active-save phases are:
 
 - `ACTIVE_BATTLE`
 - `PENDING_RESULT`
 - `PENDING_BUILD` for Run state between battles
+- `PENDING_PATH` for a committed Run sitting on a Path Choice
 
-Saves include the selected Hacker, Deck, and System, how the System was chosen, the six-Program inventory, the ordered four-Program active build, the System's ordered build, battle identity, board and special state (including armed countdowns), LINK/ICE, Program and Deck charge, configuration, metrics, content fingerprint, and deterministic RNG state where applicable.
+Saves include the selected Hacker, Deck, System, and HOST, how the System was chosen, the acquired UPGRADEs in acquisition order, the six-Program inventory, the ordered four-Program active build, the System's ordered build, battle identity, board and special state (including armed countdowns and their stamped area patterns), LINK/ICE, Program and Deck charge, configuration, metrics, content fingerprint, the isolated route RNG state, and deterministic gameplay RNG state where applicable.
 
-System identity is stored as a stable ID plus its selection source. Immutable System definitions are not copied into the save; they resolve through the matching content fingerprint.
+A `PENDING_PATH` save carries no battle and holds the two exact offers, which restore verbatim — a reload never rerolls them.
 
-Alpha 0.4.x saves are rejected cleanly. There is no migration and no partial restore: an old save has no authoritative System identity, and restoring one would mean inventing an encounter. Saves with stale inventory, an unknown `SYS_ID`, a System build that no longer matches, or a mismatched gameplay-content fingerprint are rejected rather than silently defaulted.
+System, HOST, and UPGRADE identity are stored as stable IDs. Immutable definitions are not copied into the save; they resolve through the matching content fingerprint.
+
+Alpha 0.5 saves are rejected cleanly. There is no migration and no partial restore: an old save cannot represent PASSIVE authority, HOST identity, acquired UPGRADEs, pending offers, or a committed path package, and restoring one would mean inventing them. Saves with stale inventory, an unknown `SYS_ID`/`HST_ID`/`UPG_ID`, a duplicate acquired UPGRADE, structurally incomplete offers, an exhaustion flag that disagrees with the offers, a System build that no longer matches, or a mismatched gameplay-content fingerprint are rejected rather than silently defaulted.
 
 The remembered Constructed Quick Match preset is stored separately under its own versioned preference key and survives the schema bump. It holds a Hacker build only.
 
@@ -426,18 +557,24 @@ Human play and automated simulations consume the same logic-layer events.
 Current instrumentation includes:
 
 - battle outcomes and turn counts
-- source-specific damage attribution across disjoint buckets: Sync, Bomb, Attack, line-slice, Transform, Buffer, and Skill
+- source-specific damage attribution across disjoint buckets: Sync, Bomb, Attack, line-slice, Transform, Buffer, and PASSIVE
 - Function activation, Effect operation, and fizzle counts
 - Hacker, Deck, inventory, active build, and Program order
 - System identity, selection source, strong axes, and ordered build
-- Transform activations with converted count, eligible count, and result axes
+- HOST identity and selection source; acquired UPGRADEs in acquisition order
+- route offers and commitments: target battle, both offered `SYS`/`HST`/`UPG` packages, the pool-exhaustion flag, the selected path, and the acquired list afterwards
+- PASSIVE contributions keyed by INSTANCE — source kind, source ID, and PASSIVE ID — so several PASSIVEs modifying one calculation stay individually attributable
+- HOST causal source alongside the agent that owned the resulting Sync
+- Transform activations with converted count, eligible count, fallback-tier usage, and both axis tokens
 - countdown deliveries
 - withheld System activations, as a battle-level count
 - charge-stream generation and top-to-bottom routing
 - Disabler target ID and readiness data
 - cascade behavior, think time, save schema, and content fingerprint
 
-System identity is battle-static: it lives once on the battle-level record and joins to turn and event records by `battleId` rather than being repeated per turn.
+System, HOST, and UPGRADE identity are battle-static: they live once on the battle-level record and join to turn and event records by `battleId` rather than being repeated per turn.
+
+The base event always keeps its own mechanism attribution and a PASSIVE's increment is recorded separately, so metric totals still reconcile exactly after PASSIVE modifiers.
 
 Charge waste is one canonical side-level total per battle, covering every source of Program-pool charge that could not be stored — end-of-stream routing discard and flat/timer overflow alike. Per-Program charge waste has been removed as an analytical authority; the Deck Function keeps its own separate bucket. Axis-specific waste remains deferred.
 
@@ -456,7 +593,11 @@ The compact exporter classifies every record it reads as rendered, summarized, i
 
 ```text
 data/
-  Authoritative Hacker, Skill, Deck, System, Program, and Function CSV resources
+  Authoritative Hacker, PASSIVE, Deck, System, HOST, UPGRADE, Program, and
+  Function CSV resources — the nine required runtime datasets
+
+staging/
+  Handoff specifications and the authoring workbook they were exported from
 
 src/logic/data/
   Shared CSV parsing, normalization, validation, resolution, and fingerprinting
@@ -468,7 +609,8 @@ scripts/dataNode.ts
   Node filesystem content-loading adapter
 
 src/logic/
-  Pure deterministic combat, build state, saves, metrics, and events
+  Pure deterministic combat, build state, PASSIVE runtime, route/Run state,
+  saves, metrics, and events
 
 src/render/
   Canvas rendering and animation playback
@@ -488,10 +630,14 @@ Effect validation is centralized in the Effect registry. Runtime Effect dispatch
 
 The automated suite and desktop-browser checks pass, but the following should still be checked manually:
 
-- a real phone or tablet, especially Build-screen reorder and System Selection controls
-- a complete four-battle Run through every Build and result transition
+- a real phone or tablet, and any narrow viewport, especially the path cards, HOST Selection, the Build context panels, and the Settings accordion
+- a complete four-battle Run through every Path Choice, Build, and result transition
+- the final Path Choice showing the one remaining UPGRADE on both cards
 - Save and Quit from a between-battle Build, followed by resume
-- retry-after-defeat retaining the same System
+- retry-after-defeat retaining the same encounter package and UPGRADE list
+- VERDUN/`PSV_BIGGER_BOMB` visibly enlarging a detonation
+- SNEAKERS/SNEAK firing at Hacker turn start
+- a START_OF_TURN carrier resolving before a countdown ticks, in a setup that shows it
 - EBUFF countdown overlays becoming live Buffs in the browser
 - SPAM detonations and their charge generation in the browser
 - a same-phase second System activation driven by Function-created charge
@@ -500,21 +646,24 @@ The development-only Find Sync control may overlap status text on a narrow viewp
 
 ## Current scope
 
-Alpha 0.5 establishes System identity as a data-driven encounter layer while preserving the Alpha 0.4 Hacker build system.
+Alpha 0.6 establishes the environment, reward, and passive layers around the Alpha 0.5 encounter model.
 
 Not included yet:
 
-- System passive Skills
+- boss mechanics, boss-specific route rules, or boss battlefields
+- permanent account progression, or rewards outside the Run-local UPGRADE layer
+- reward rarity or economy
+- a procedural map beyond the two-option path screen
 - System build editing, System portfolios, or System Program acquisition
-- rewards, Program acquisition, or permanent progression
-- Run path choice, curated introductory encounters, or anti-repeat selection
-- boss mechanics and battlefields
+- HOST active abilities outside PASSIVEs
+- UPGRADE selection in Quick Match
+- PASSIVE anti-stacking rules, passive cooldowns, or generalized trigger/rule scripting
 - multiple active Functions per Program, or Program passives
 - multi-Packet targeting
-- transform sources beyond `NEU`, or arbitrary transform scripting
 - a generalized delayed-Function graph
-- broad balance changes
+- broad balance changes — Alpha 0.6 is a framework build and tuning is deferred to the post-beta content and balance pass
+- runtime-editable content in a production bundle: `data/*.csv` are read from disk by the headless tools and re-read on reload in `npm run dev`, but `npm run build` still inlines them
 - axis-specific charge-waste metrics
 - final art, animation, audio, accessibility, or production polish
 
-The next build can expand System content, passives, rewards, or encounter curation without replacing the Alpha 0.5 System identity, selection, transform, or countdown-delivery foundations.
+The next build can add boss rules, more PASSIVE content, or encounter curation without replacing the Alpha 0.6 PASSIVE framework, HOST/UPGRADE layers, or route state.

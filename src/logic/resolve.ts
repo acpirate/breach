@@ -8,8 +8,9 @@
 //    the magnitude stamped on each special tile at placement (Function data),
 //  - bomb detonations slice their own data-defined footprint as normal tiles
 //    (no chains, no charge),
-//  - Alpha 0.3.0: the selected Hacker's coded SKILLS trigger from qualifying
-//    owner-scoped Sync events (§6), the active Deck Function earns charge from
+//  - Alpha 0.6.0: coded PASSIVES from every active source (Hacker, System,
+//    HOST, acquired UPGRADEs) trigger from qualifying Sync events scoped to the
+//    resolution owner (§11-§19), the active Deck Function earns charge from
 //    neutral Packets sliced in owned Sync resolution (§7.3), and row/column
 //    clears qualify from the wave's COMBINED direct footprint (§9).
 
@@ -18,6 +19,8 @@ import {
   BOARD_WIDTH,
   CHARGE_PER_TILE_COLOR_MATCH,
   CHARGE_PER_TILE_SHAPE_MATCH,
+  COLOR_COUNT,
+  SHAPE_COUNT,
   DAMAGE_PER_TILE_HIGH_COLOR,
   DAMAGE_PER_TILE_HIGH_SHAPE,
   DAMAGE_PER_TILE_LOW_COLOR,
@@ -30,13 +33,14 @@ import {
 } from './constants';
 import { AREA_PATTERNS, AreaPatternId } from './data/areas';
 import type { EffectId } from './data/effects';
+import { PassiveInstance, causeOf, chargeDampen, passivesAffecting, permanentShield } from './passive';
 import {
   AxisResult,
+  AxisTarget,
   GAIN_CHARGE_YES,
   DEAL_DAMAGE_YES,
   LINE_DIMENSION_COLUMN,
   LineSliceParams,
-  ResolvedSkill,
   SPECIALS_RETAIN_ALL,
   SPECIALS_RETAIN_OWN,
   TransformParams,
@@ -53,7 +57,9 @@ import {
   DamageSource,
   GameEvent,
   GameState,
+  PassiveCause,
   Pt,
+  Shape,
   Side,
   Tile,
   UnitState,
@@ -88,7 +94,12 @@ export function buffBonus(state: GameState, side: Side): number {
 // its shield tiles currently on the Datastream. Measured live at damage-
 // application time, so a shield sliced away no longer protects the next
 // instance.
-export function shieldValue(state: GameState, side: Side): number {
+// Alpha 0.6.0 §21 — PSV_PERM_SHIELD contributes NON-REMOVABLE Shield value on
+// top of the Packet Shield, through this one function so every consumer (damage
+// application, the HUD total, metrics) agrees. It is not a Packet: it cannot be
+// sliced, blasted, or transformed away, and it lasts as long as the supplying
+// instance is active.
+export function packetShieldValue(state: GameState, side: Side): number {
   let n = 0;
   for (const row of state.board) {
     for (const t of row) {
@@ -96,6 +107,10 @@ export function shieldValue(state: GameState, side: Side): number {
     }
   }
   return n;
+}
+
+export function shieldValue(state: GameState, side: Side): number {
+  return packetShieldValue(state, side) + permanentShield(state.identity, side);
 }
 
 // Per-Packet damage for COLLATERAL destruction — Bomb blasts and LineSlice
@@ -167,24 +182,29 @@ export function addDeckCharge(state: GameState, owner: Side, amount: number): nu
   return before + amount - state.deckCharge;
 }
 
-// §6.2 owner scope — a Hacker Skill triggers ONLY from a qualifying Sync event
-// owned by the side using that Hacker. System-owned and environment-owned
-// resolution never triggers Hacker Skills.
-const NO_SKILLS: ReadonlyArray<ResolvedSkill> = [];
-function skillsFor(state: GameState, owner: Side): ReadonlyArray<ResolvedSkill> {
-  if (owner !== 'player') return NO_SKILLS;
-  return hackerById(state.identity.hackerId).skills;
+// Alpha 0.6.0 §11/§12 — owner scope is no longer "Hacker only". A qualifying
+// Sync consults every ACTIVE PASSIVE instance that affects the RESOLUTION
+// OWNER of that Sync, whichever source supplied it: the Hacker's own, the
+// System's, the HOST's (which affect both agents, §13), and the Hacker's
+// acquired UPGRADEs. The migrated Hacker Red rows behave exactly as they did,
+// because HAK-supplied OWNER instances resolve to the same answer they always
+// did — only the authority moved (§17).
+function matchPassivesFor(
+  state: GameState,
+  owner: Side,
+  effect: 'PSV_EXTRA_MATCH_DAMAGE' | 'PSV_EXTRA_MATCH_CHARGE',
+): PassiveInstance[] {
+  return passivesAffecting(state.identity, effect, owner);
 }
 
-// §6.3 — the qualifying match-event identity for the current Skill contracts:
-// a RESOLVED color-axis Sync of the Skill's color. Same-axis runs the engine
-// merged into one player-visible blob count ONCE; multiple distinct resolved
-// blobs each qualify independently; a shape-axis Sync never qualifies (even
-// when caused by moving a Packet of that color); and line-clear collateral,
-// Bomb slices, and Function slices create no qualifying event because they are
-// not detected Syncs.
-function skillQualifies(skill: ResolvedSkill, match: Match): boolean {
-  return match.condition === 'color' && (match.value as Color) === skill.color;
+// §17 — the qualifying match-event identity: a RESOLVED color-axis Sync of the
+// PASSIVE's color. Same-axis runs the engine merged into one player-visible
+// blob count ONCE; multiple distinct resolved blobs each qualify independently;
+// a shape-axis Sync never qualifies (even when caused by moving a Packet of
+// that color); and line-clear collateral, Bomb slices, and Function slices
+// create no qualifying event because they are not detected Syncs.
+function passiveQualifies(inst: PassiveInstance, match: Match): boolean {
+  return match.condition === 'color' && (match.value as Color) === inst.passive.color;
 }
 
 export interface DamageInfo {
@@ -198,11 +218,41 @@ export interface DamageInfo {
   colorRaw?: number; // MK7.5: pre-floor damage paid via the color axis (Sync cause only)
   shapeRaw?: number; // MK7.5: pre-floor damage paid via the shape axis (Sync cause only)
   cascadeRaw?: number; // MK7.3: pre-floor damage from stochastic-only tiles
-  skillRaw?: number; // §6.4: the Hacker-Skill portion of `amount` (its own bucket)
+  passiveRaw?: number; // §17/§20: the PASSIVE portion of `amount` (its own bucket)
+  cause?: PassiveCause; // §14: the PASSIVE that caused this damage, where one did
 }
+
+// Alpha 0.6.0 §20 — the damage buckets PSV_FUNCTION_DAMAGE_INCREASE qualifies
+// against: direct damage a Function caused. A Transform-created Sync is
+// deliberately NOT one of them — mechanically it is an ordinary Sync that the
+// Alpha 0.5 ledger credits to the Effect (§20 "Function-originated DIRECT
+// damage"), and match-triggered PASSIVEs already cover the Sync path.
+const FUNCTION_DAMAGE_SOURCES: ReadonlyArray<DamageSource> = ['attacker', 'bomb', 'lineslice'];
 
 export function dealDamage(state: GameState, target: Side, amount: number, info: DamageInfo, events: GameEvent[]): void {
   if (state.winner || amount <= 0) return;
+
+  // §20 — applied to RAW Function damage BEFORE ordinary Buff/Shield defensive
+  // processing, exactly as the match bonus joins raw Sync damage. Applied in
+  // ONE place so every Function damage site (ATTACK, Bomb blasts, LineSlice)
+  // gets it without three parallel implementations. The base event keeps its
+  // original Function/Effect attribution and each instance's increment is
+  // recorded separately (§48), so stacking PASSIVEs never collapse into an
+  // unexplained aggregate.
+  if (FUNCTION_DAMAGE_SOURCES.includes(info.source)) {
+    const attacker = opponentOf(target);
+    let added = 0;
+    for (const inst of passivesAffecting(state.identity, 'PSV_FUNCTION_DAMAGE_INCREASE', attacker)) {
+      const mag = inst.passive.magnitude ?? 0;
+      if (mag <= 0) continue;
+      added += mag;
+      events.push({ t: 'passive', side: attacker, cause: causeOf(inst), effect: inst.passive.effectType, damage: mag });
+    }
+    if (added > 0) {
+      amount += added;
+      info = { ...info, passiveRaw: (info.passiveRaw ?? 0) + added };
+    }
+  }
 
   let finalAmount = amount;
   let buffFinal = info.buffBonus ?? 0;
@@ -210,20 +260,31 @@ export function dealDamage(state: GameState, target: Side, amount: number, info:
   let colorFinal = info.colorRaw;
   let shapeFinal = info.shapeRaw;
   let cascadeFinal = info.cascadeRaw;
-  let skillFinal = info.skillRaw;
+  let passiveFinal = info.passiveRaw;
 
   // §3.1/§9.5: every separate damage instance is reduced by the DEFENDER's
   // live total shield (min 0), AFTER base+buff are computed (already folded
   // into `amount`) but BEFORE LINK/ICE is touched. Shield prevention is NOT
   // damage dealt — reported separately, never added to a damage-source bucket.
+  // §21 — that total now includes permanent PASSIVE Shield.
   const shield = shieldValue(state, target);
   if (shield > 0) {
     const prevented = Math.min(amount, shield);
     finalAmount = amount - prevented;
     events.push({ t: 'shield', target, source: info.source, preShield: amount, shield, prevented, final: finalAmount });
+    // §48 — report the permanent contribution to THIS prevention separately
+    // from removable Packet Shield, so metrics can tell the two apart. The
+    // permanent share is what the Packet Shield alone could not have stopped.
+    const packet = packetShieldValue(state, target);
+    const fromPassive = Math.max(0, prevented - Math.min(amount, packet));
+    if (fromPassive > 0) {
+      for (const inst of passivesAffecting(state.identity, 'PSV_PERM_SHIELD', target)) {
+        events.push({ t: 'passive', side: target, cause: causeOf(inst), effect: inst.passive.effectType, shield: inst.passive.magnitude ?? 0 });
+      }
+    }
     // Shield eats the causal (base) portion first and the buff portion last,
     // so the disjoint metric buckets still sum exactly to the dealt amount.
-    // Pre-floor analytical splits — including the Skill portion — scale with it.
+    // Pre-floor analytical splits — including the PASSIVE portion — scale with it.
     const base = amount - (info.buffBonus ?? 0);
     buffFinal = Math.min(info.buffBonus ?? 0, finalAmount);
     const causalFinal = finalAmount - buffFinal;
@@ -232,7 +293,7 @@ export function dealDamage(state: GameState, target: Side, amount: number, info:
     if (colorFinal !== undefined) colorFinal *= scale;
     if (shapeFinal !== undefined) shapeFinal *= scale;
     if (cascadeFinal !== undefined) cascadeFinal *= scale;
-    if (skillFinal !== undefined) skillFinal *= scale;
+    if (passiveFinal !== undefined) passiveFinal *= scale;
   }
 
   if (finalAmount <= 0) return; // fully absorbed: shield event emitted, nothing dealt
@@ -252,7 +313,8 @@ export function dealDamage(state: GameState, target: Side, amount: number, info:
     colorRaw: colorFinal,
     shapeRaw: shapeFinal,
     cascadeRaw: cascadeFinal,
-    skillRaw: skillFinal,
+    passiveRaw: passiveFinal,
+    ...(info.cause ? { cause: info.cause } : {}),
   });
   if (state.hp[target] <= 0) {
     state.winner = opponentOf(target);
@@ -306,11 +368,38 @@ export function addStream(
     return;
   }
   cur.amount += amount;
-  // §10.6 — a Skill that inflates an existing qualifying stream re-labels it
+  // §18 — a PASSIVE that inflates an existing qualifying stream re-labels it
   // rather than opening a second pool that charges every compatible Program.
-  if (source === 'SKILL_MODIFIED_SYNC') {
+  if (source === 'PASSIVE_MODIFIED_SYNC') {
     cur.source = source;
     cur.sourceId = sourceId;
+  }
+}
+
+// Alpha 0.6.0 §19 — PSV_CHARGE_DAMPEN, applied to every qualifying stream AFTER
+// all generation (Packets and any extra-charge PASSIVE) and BEFORE routing:
+//
+//   finalGenerated = max(0, baseGenerated + extra-charge bonuses - dampening)
+//
+// The formula is order-independent, which is why dampening is a single pass
+// here rather than a subtraction interleaved with the bonuses. `ALL` covers
+// every stream of the affected agent; a HOST instance dampens BOTH agents
+// because affects() ignores its authored scope (§13).
+function applyChargeDampen(state: GameState, owner: Side, streams: StreamMap, events: GameEvent[]): void {
+  const instances = passivesAffecting(state.identity, 'PSV_CHARGE_DAMPEN', owner);
+  if (!instances.length || !streams.size) return;
+  const total = chargeDampen(state.identity, owner);
+  if (total <= 0) return;
+  for (const stream of streams.values()) {
+    const before = stream.amount;
+    stream.amount = Math.max(0, before - total);
+    if (stream.amount === before) continue;
+    stream.source = 'PASSIVE_MODIFIED_SYNC';
+    // §47 — every contributing instance is recorded individually, so several
+    // dampening PASSIVEs on one stream stay distinguishable.
+    for (const inst of instances) {
+      events.push({ t: 'passive', side: owner, cause: causeOf(inst), effect: inst.passive.effectType, charge: -(inst.passive.magnitude ?? 0) });
+    }
   }
 }
 
@@ -538,7 +627,8 @@ export function resolveCascades(
 ): { steps: number; stochasticRounds: number } {
   let steps = 0;
   let stochasticRounds = 0;
-  const skills = skillsFor(state, owner);
+  const matchDamagePassives = matchPassivesFor(state, owner, 'PSV_EXTRA_MATCH_DAMAGE');
+  const matchChargePassives = matchPassivesFor(state, owner, 'PSV_EXTRA_MATCH_CHARGE');
   while (!state.winner) {
     const matches = detectMatches(state.board);
     if (!matches.length) break;
@@ -617,7 +707,7 @@ export function resolveCascades(
     const oppShapes = boundShapes(state, opponentOf(owner));
 
     let raw = 0; // base Sync damage (pre-floor)
-    let skillRaw = 0; // §6.4 Skill-originated damage (pre-floor)
+    let passiveRaw = 0; // §17 PASSIVE-originated damage (pre-floor)
     let critExtra = 0; // damage added by the 1.5x multiplier only (pre-floor)
     let contested = 0; // MK5.6: sliced tiles bound to the OPPOSING side's Programs
     let colorRaw = 0; // MK7.5: pre-floor damage paid via the color axis
@@ -628,8 +718,8 @@ export function resolveCascades(
     const destroyed: Pt[] = [];
     const waste = new Map<string, number>();
     // §10.3/§10.5 — charge GENERATED this wave, gathered per axis token and
-    // routed together below, after any Skill has had its chance to inflate a
-    // stream (§10.6). A cascade wave is labelled as such for telemetry.
+    // routed together below, after every PASSIVE has had its chance to inflate
+    // or dampen a stream (§18/§19). A cascade wave is labelled for telemetry.
     const streams: StreamMap = new Map();
     const isCascadeWave = steps > 1 || stochastic.some(Boolean);
     const streamSource: ChargeStreamSource = isCascadeWave
@@ -651,45 +741,50 @@ export function resolveCascades(
       accumulateTileCharge(state, t, axes, streams, streamSource, isCascadeWave ? undefined : origin?.sourceId);
     }
 
-    // ---- §6 Hacker Skills: owner-scoped, once per qualifying Sync event ----
-    // Duplicate qualifying Skills stack additively simply by iterating the
-    // Hacker's ordered Skill list (repeats are meaningful content, §6.4).
-    for (const skill of skills) {
+    // ---- §11-§18 PASSIVES: scoped to the RESOLUTION OWNER, once per ----
+    // ---- qualifying Sync event ----
+    // Duplicate qualifying instances stack additively simply by iterating the
+    // list: repeats across sources are meaningful content and are never
+    // deduplicated by PASSIVE_ID (§11).
+    for (const inst of matchDamagePassives) {
       for (const match of matches) {
-        if (!skillQualifies(skill, match)) continue;
+        if (!passiveQualifies(inst, match)) continue;
+        // §17 — the bonus joins RAW Sync damage BEFORE the critical multiplier,
+        // flooring, Buffer addition, and Shield reduction, so it participates in
+        // exactly the damage order the former inherent passive did.
+        const magnitude = inst.passive.magnitude ?? 0;
         const mult = matchMultiplier(match);
-        switch (skill.effectType) {
-          case 'SKL_EXTRA_MATCH_DAMAGE': {
-            // §6.4 — the bonus joins RAW Sync damage BEFORE the critical
-            // multiplier, flooring, Buffer addition, and Shield reduction, so
-            // it participates in exactly the damage order the former inherent
-            // passive did.
-            const add = skill.magnitude * mult;
-            skillRaw += add;
-            if (mult > 1) critExtra += skill.magnitude * (mult - 1);
-            events.push({ t: 'skill', side: owner, skillId: skill.id, effect: skill.effectType, damage: add });
-            break;
-          }
-          case 'SKL_EXTRA_MATCH_CHARGE': {
-            // §6.5/§10.6 — increase this event's normal qualifying color-axis
-            // stream BEFORE it is routed, then let the ordinary top-to-bottom
-            // rule place it. It does NOT open a separate pool that
-            // independently charges every compatible Program.
-            //
-            // Alpha 0.4 note: `charge` reports what the Skill contributed to
-            // the stream. Where that charge finally LANDS (and any discard) is
-            // recorded by the chargeRoute event for this stream.
-            addStream(streams, 'color', skill.color, skill.magnitude, 'SKILL_MODIFIED_SYNC', skill.id);
-            events.push({ t: 'skill', side: owner, skillId: skill.id, effect: skill.effectType, charge: skill.magnitude });
-            break;
-          }
-        }
+        const add = magnitude * mult;
+        passiveRaw += add;
+        if (mult > 1) critExtra += magnitude * (mult - 1);
+        events.push({ t: 'passive', side: owner, cause: causeOf(inst), effect: inst.passive.effectType, damage: add });
+      }
+    }
+    for (const inst of matchChargePassives) {
+      for (const match of matches) {
+        if (!passiveQualifies(inst, match)) continue;
+        // §18 — increase this event's normal qualifying color-axis stream
+        // BEFORE it is routed, then let the ordinary top-to-bottom rule place
+        // it. It does NOT open a separate pool that independently charges every
+        // compatible Program.
+        //
+        // `charge` reports what the PASSIVE contributed to the stream. Where
+        // that charge finally LANDS (and any discard) is recorded by the
+        // chargeRoute event for this stream.
+        const magnitude = inst.passive.magnitude ?? 0;
+        addStream(streams, 'color', inst.passive.color!, magnitude, 'PASSIVE_MODIFIED_SYNC', inst.passive.id);
+        events.push({ t: 'passive', side: owner, cause: causeOf(inst), effect: inst.passive.effectType, charge: magnitude });
       }
     }
 
-    // §10.3/§10.4 — all generation for this wave is complete (Packets and any
-    // Skill inflation), so route the streams now: colors first, then shapes,
-    // each top-to-bottom through the ordered active build.
+    // §19 — dampening runs after ALL generation, so the order-independent
+    // max(0, base + bonuses - dampening) formula holds however the content is
+    // arranged.
+    applyChargeDampen(state, owner, streams, events);
+
+    // §10.3/§10.4 — all generation for this wave is complete (Packets, PASSIVE
+    // inflation, PASSIVE dampening), so route the streams now: colors first,
+    // then shapes, each top-to-bottom through the ordered active build.
     routeStreams(state, owner, streams, events, waste);
 
     // §7.3 — Deck Function charge from neutral Packets sliced anywhere in this
@@ -712,19 +807,19 @@ export function resolveCascades(
     if (shieldsRemoved > 0) events.push({ t: 'shieldRemoved', count: shieldsRemoved });
 
     // §11.2 REINFORCED CONNECTION: ordinary BASE Sync damage is suppressed for
-    // both sides — but the Sync event still exists, so Skill-originated damage
-    // still resolves and is attributed to its own metric bucket (§11.3).
-    // Charge, destruction, contention, Deck charge, and cascading above are
-    // untouched; bomb DETONATIONS are unaffected (resolveDetonation).
+    // both sides — but the Sync event still exists, so match-triggered PASSIVE
+    // damage still resolves and is attributed to its own metric bucket
+    // (§11.3/§17). Charge, destruction, contention, Deck charge, and cascading
+    // above are untouched; bomb DETONATIONS are unaffected (resolveDetonation).
     // The buff bonus deliberately does NOT apply here: it amplifies base Sync
     // damage, which is exactly what this mode suppresses.
     const suppressBase = state.config.reinforcedConnection;
-    const causalRaw = suppressBase ? skillRaw : raw + skillRaw;
-    // Fractional crit sums are floored (documented in README). The Skill
+    const causalRaw = suppressBase ? passiveRaw : raw + passiveRaw;
+    // Fractional crit sums are floored (documented in README). The PASSIVE
     // portion is allocated as an integer so the disjoint metric buckets stay
     // exact and base Sync damage records as a clean zero under suppression.
     const total = Math.floor(causalRaw);
-    const skillPortion = Math.min(total, Math.floor(skillRaw));
+    const passivePortion = Math.min(total, Math.floor(passiveRaw));
     if (total > 0 || (!suppressBase && bonus > 0)) {
       dealDamage(
         state,
@@ -742,14 +837,14 @@ export function resolveCascades(
             : {}),
           // Under suppression the crit cross-cut reports 0: the multiplier's
           // contribution to BASE Sync damage is exactly what is suppressed, and
-          // the surviving Skill contribution is reported in its own bucket. This
-          // never over-reports crit against damage that was not dealt.
+          // the surviving PASSIVE contribution is reported in its own bucket.
+          // This never over-reports crit against damage that was not dealt.
           critExtra: suppressBase ? 0 : critExtra,
           buffBonus: suppressBase ? 0 : bonus,
           colorRaw: cause === 'match' && !suppressBase ? colorRaw : undefined,
           shapeRaw: cause === 'match' && !suppressBase ? shapeRaw : undefined,
           cascadeRaw: suppressBase ? 0 : cascadeRaw,
-          skillRaw: skillPortion,
+          passiveRaw: passivePortion,
         },
         events,
       );
@@ -994,6 +1089,7 @@ export function resolveLineSlice(
 export interface TransformSpec {
   owner: Side;
   params: TransformParams;
+  axisTarget: AxisTarget;
   axisResult: AxisResult;
   quantity: number;
   programId: string;
@@ -1003,21 +1099,71 @@ export interface TransformSpec {
 export interface TransformOutcome {
   candidates: number; // eligible Packets on the board at activation time
   cells: Pt[]; // what was actually transformed
+  tier2Used: number; // how many came from the shares-one-axis fallback tier
   specialsRetained: number;
   specialsDestroyed: number;
 }
 
-// §22.1 — the eligible pool for the current `axisTarget` contract. Alpha 0.5
-// supports NEU only: Packets whose underlying board identity is neutral.
-export function transformCandidates(state: GameState): Pt[] {
-  const out: Pt[] = [];
+// Alpha 0.6.0 §24 — does this Packet satisfy the authored `axisTarget`?
+//   NEU  — the Packet is neutral.
+//   ALL  — any Packet, neutral included.
+//   AXIS — a STANDARD Packet matching every authored axis (intersection). A
+//          neutral is never eligible here: it has no axis to match.
+function matchesAxisTarget(t: Tile, target: AxisTarget): boolean {
+  if (target.kind === 'NEU') return t.kind === 'neutral';
+  if (target.kind === 'ALL') return true;
+  if (t.kind === 'neutral') return false;
+  if (target.color !== undefined && t.color !== target.color) return false;
+  if (target.shape !== undefined && t.shape !== target.shape) return false;
+  return true;
+}
+
+// §24 (director ruling 2026-08-11) — how many axes of the RESULT this Packet
+// already has. A Packet sharing every result axis is a pure no-op and is never
+// a valid target; one sharing exactly one axis of a two-axis result is the
+// FALLBACK tier, used only to top up after the clean tier is exhausted.
+function sharedResultAxes(t: Tile, result: AxisResult): number {
+  if (result.neutral) return t.kind === 'neutral' ? 1 : 0;
+  if (t.kind === 'neutral') return 0; // a neutral shares no color or shape
+  let n = 0;
+  if (result.color !== undefined && t.color === result.color) n++;
+  if (result.shape !== undefined && t.shape === result.shape) n++;
+  return n;
+}
+
+const resultAxisCount = (result: AxisResult): number =>
+  result.neutral ? 1 : (result.color !== undefined ? 1 : 0) + (result.shape !== undefined ? 1 : 0);
+
+// §24 — the eligible pool, split into the two tiers. Tier 1 is Packets sharing
+// NO result axis; tier 2 is Packets sharing exactly one axis of a TWO-axis
+// result. Anything matching every result axis is excluded outright, so
+// `quantity` always means "up to this many real transformations".
+export interface TransformCandidates {
+  tier1: Pt[];
+  tier2: Pt[];
+}
+
+export function transformCandidates(state: GameState, spec: { axisTarget: AxisTarget; axisResult: AxisResult }): TransformCandidates {
+  const tier1: Pt[] = [];
+  const tier2: Pt[] = [];
+  const axes = resultAxisCount(spec.axisResult);
   for (let y = 0; y < BOARD_HEIGHT; y++) {
     for (let x = 0; x < BOARD_WIDTH; x++) {
       const t = state.board[y][x];
-      if (t && t.kind === 'neutral') out.push({ x, y });
+      if (!t || !matchesAxisTarget(t, spec.axisTarget)) continue;
+      const shared = sharedResultAxes(t, spec.axisResult);
+      if (shared === 0) tier1.push({ x, y });
+      else if (axes === 2 && shared === 1) tier2.push({ x, y });
+      // shared === axes: already identical on every result axis — never valid.
     }
   }
-  return out;
+  return { tier1, tier2 };
+}
+
+// The total eligible count, for valid-target gating (§19.4 withhold checks).
+export function transformCandidateCount(state: GameState, spec: { axisTarget: AxisTarget; axisResult: AxisResult }): number {
+  const { tier1, tier2 } = transformCandidates(state, spec);
+  return tier1.length + tier2.length;
 }
 
 // §24 — ATOMIC transformation. Every selected Packet changes BEFORE any Sync
@@ -1029,44 +1175,76 @@ export function transformCandidates(state: GameState): Pt[] {
 // caller runs the resulting Sync wave. Splitting it that way keeps the "all
 // transforms, then detection" ordering impossible to get wrong.
 export function applyTransform(state: GameState, spec: TransformSpec, events: GameEvent[]): TransformOutcome {
-  const candidates = transformCandidates(state);
-  const outcome: TransformOutcome = { candidates: candidates.length, cells: [], specialsRetained: 0, specialsDestroyed: 0 };
-  if (!candidates.length) return outcome;
+  const { tier1, tier2 } = transformCandidates(state, spec);
+  const outcome: TransformOutcome = {
+    candidates: tier1.length + tier2.length,
+    cells: [],
+    tier2Used: 0,
+    specialsRetained: 0,
+    specialsDestroyed: 0,
+  };
+  if (!outcome.candidates) return outcome;
 
   // §23.1 — up to `quantity` distinct targets, drawn without replacement.
-  // When every eligible Packet will be transformed anyway, the selection is a
-  // complete set and its order is irrelevant, so NO gameplay RNG is consumed
-  // merely to permute it (§45.13). RNG is only gameplay-affecting when the
-  // choice actually excludes something.
-  let chosen: Pt[];
-  if (candidates.length <= spec.quantity) {
-    chosen = candidates;
-  } else {
-    const pool = [...candidates];
-    chosen = [];
-    for (let i = 0; i < spec.quantity; i++) chosen.push(pool.splice(state.rng.int(pool.length), 1)[0]);
-  }
+  // When every eligible Packet in a tier will be transformed anyway, the
+  // selection is a complete set and its order is irrelevant, so NO gameplay RNG
+  // is consumed merely to permute it (§45.13). RNG is only gameplay-affecting
+  // when the choice actually excludes something.
+  //
+  // §24 — tier 1 is drawn first and tier 2 TOPS UP whatever quantity remains
+  // (director ruling 2026-08-11), so a Function never converts fewer Packets
+  // than it could merely because the clean pool ran short.
+  const draw = (pool: Pt[], want: number): Pt[] => {
+    if (want <= 0 || !pool.length) return [];
+    if (pool.length <= want) return [...pool];
+    const rest = [...pool];
+    const out: Pt[] = [];
+    for (let i = 0; i < want; i++) out.push(rest.splice(state.rng.int(rest.length), 1)[0]);
+    return out;
+  };
+  const fromTier1 = draw(tier1, spec.quantity);
+  const fromTier2 = draw(tier2, spec.quantity - fromTier1.length);
+  outcome.tier2Used = fromTier2.length;
+  const chosen = [...fromTier1, ...fromTier2];
 
   for (const p of chosen) {
     const t = state.board[p.y][p.x]!;
     // §23.2 — special-overlay treatment, sharing the established SPECIALS_*
     // enum. Retaining preserves the overlay's ownership and Effect-specific
     // state (countdown, magnitude, attribution) while the UNDERLYING Packet
-    // changes identity (§22.3). Neutral Packets cannot currently carry an
-    // overlay, so this is contract completeness rather than live behavior.
+    // changes identity (§22.3). Alpha 0.6.0 makes this LIVE behavior for the
+    // first time: with axis-specific and ALL targeting, an overlay-carrying
+    // standard Packet is now reachable, where NEU-only targeting could never
+    // select one.
     if (t.special) {
+      // A neutral RESULT is the exception: a neutral tile structurally cannot
+      // carry an overlay, so retention is impossible whatever the tuple says.
+      // The loader warns about that authoring; here it simply always destroys.
       const keep =
-        spec.params.specialPacketTreatment === SPECIALS_RETAIN_ALL ||
-        (spec.params.specialPacketTreatment === SPECIALS_RETAIN_OWN && t.special.owner === spec.owner);
+        !spec.axisResult.neutral &&
+        (spec.params.specialPacketTreatment === SPECIALS_RETAIN_ALL ||
+          (spec.params.specialPacketTreatment === SPECIALS_RETAIN_OWN && t.special.owner === spec.owner));
       if (keep) outcome.specialsRetained++;
       else {
         delete t.special;
         outcome.specialsDestroyed++;
       }
     }
-    t.kind = 'standard';
-    t.color = spec.axisResult.color;
-    t.shape = spec.axisResult.shape;
+    if (spec.axisResult.neutral) {
+      t.kind = 'neutral';
+      delete t.color;
+      delete t.shape;
+    } else {
+      // §24 — a single-axis result PRESERVES the other axis. A neutral target
+      // has no axis to preserve, so the unauthored one is randomized per Packet
+      // from the battle's gameplay RNG (director ruling 2026-08-11).
+      const wasNeutral = t.kind === 'neutral';
+      t.kind = 'standard';
+      if (spec.axisResult.color !== undefined) t.color = spec.axisResult.color;
+      else if (wasNeutral) t.color = state.rng.int(COLOR_COUNT) as Color;
+      if (spec.axisResult.shape !== undefined) t.shape = spec.axisResult.shape;
+      else if (wasNeutral) t.shape = state.rng.int(SHAPE_COUNT) as Shape;
+    }
     outcome.cells.push(p);
     events.push({ t: 'setTile', p, view: tileViewOf(t) });
   }

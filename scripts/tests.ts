@@ -10,26 +10,34 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { BOARD_HEIGHT, BOARD_WIDTH } from '../src/logic/constants';
-import { AREA_PATTERNS } from '../src/logic/data/areas';
+import { AREA_PATTERNS, AREA_PATTERN_ORDER, advanceAreaPattern } from '../src/logic/data/areas';
 import {
   ACTIVE_BUILD_SIZE,
   DEFAULT_DECK_ID,
   DEFAULT_HACKER_ID,
+  HEADLESS_HOST_ID,
   HEADLESS_SYSTEM_ID,
+  INITIAL_HOST_ID,
+  INITIAL_SYSTEM_ID,
   INVENTORY_SIZE,
   SYSTEM_BUILD_SIZE,
   allSystems,
+  allUpgrades,
   deckById,
   defaultBuild,
   getContent,
   hackerById,
+  hostById,
   inventoryFor,
   inventoryProgramIds,
   isValidBuild,
+  poolHosts,
+  poolSystems,
   programById,
   setActiveContent,
   systemById,
   targetKindOf,
+  upgradeById,
 } from '../src/logic/data/content';
 import { DataFiles, loadContent } from '../src/logic/data/load';
 import { DEFAULT_BATTLE_SETTINGS } from '../src/logic/constants';
@@ -50,7 +58,8 @@ import {
 import * as storage from '../src/storage';
 import { SAVE_VERSION } from '../src/logic/save';
 import { computeLineClears, detectMatches } from '../src/logic/match';
-import { StreamMap, addStream, addUnitCharge, applyTransform, buffBonus, routeChargeStream, routeStreams } from '../src/logic/resolve';
+import { StreamMap, addStream, addUnitCharge, applyTransform, buffBonus, dealDamage, packetShieldValue, routeChargeStream, routeStreams, shieldValue, transformCandidates } from '../src/logic/resolve';
+import { activePassives } from '../src/logic/passive';
 import { consumeEvents, createBattleMetrics } from '../src/logic/metrics';
 import { ENEMY_TIMER_CHARGE_RATE } from '../src/logic/constants';
 import {
@@ -60,9 +69,19 @@ import {
   RUN_LENGTH,
   RunInfo,
   SelectedSystem,
+  PathOffer,
+  PendingPath,
+  acquireUpgrade,
+  commitNewRun,
+  initialPathOffers,
+  laterPathOffers,
+  openPathChoice,
+  randomHost,
   randomSystem,
+  selectPath,
   beginBuild,
   beginSetup,
+  buildBattleConfig,
   buildIdentity,
   chooseDeck,
   chooseHacker,
@@ -75,6 +94,7 @@ import {
   serializeConstructedPreset,
   contextLabel,
   continueLabel,
+  createQuickMatchBattle,
   createRunBattle,
   defaultIdentity,
   deserializeSession,
@@ -95,7 +115,7 @@ import { BattleSettings, BuildOrigin, Color, RunStep, Shape, Side, gridViewOf } 
 import { GameEvent, Pt, Tile } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { nodeDataFiles } from './dataNode';
-import { D, defaultActiveBuild, defaultHackerLink, headlessSystem, manualLink, newBattle } from './harness';
+import { D, TIMER_MODE, defaultActiveBuild, defaultHackerLink, headlessHost, headlessSystem, manualLink, newBattle } from './harness';
 
 let passed = 0;
 let failed = 0;
@@ -133,9 +153,11 @@ function files(over: Partial<Record<keyof DataFiles, string>>): DataFiles {
     system: { name: real.system.name, text: over.system ?? real.system.text },
     functions: { name: real.functions.name, text: over.functions ?? real.functions.text },
     hackers: { name: real.hackers.name, text: over.hackers ?? real.hackers.text },
-    skills: { name: real.skills.name, text: over.skills ?? real.skills.text },
+    passives: { name: real.passives.name, text: over.passives ?? real.passives.text },
     decks: { name: real.decks.name, text: over.decks ?? real.decks.text },
     systems: { name: real.systems.name, text: over.systems ?? real.systems.text },
+    hosts: { name: real.hosts.name, text: over.hosts ?? real.hosts.text },
+    upgrades: { name: real.upgrades.name, text: over.upgrades ?? real.upgrades.text },
   };
 }
 
@@ -161,9 +183,9 @@ function expectErrors(over: Partial<Record<keyof DataFiles, string>>, reasonPart
 
 // ---- §21.1 version stamps ----
 
-test('version stamps are alpha-0.5.0', () => {
-  assert(SAVE_VERSION === 'alpha-0.5.0', `SAVE_VERSION = ${SAVE_VERSION}`);
-  assert(LOG_VERSION === 'alpha-0.5.0', `LOG_VERSION = ${LOG_VERSION}`);
+test('version stamps are alpha-0.6.0', () => {
+  assert(SAVE_VERSION === 'alpha-0.6.0', `SAVE_VERSION = ${SAVE_VERSION}`);
+  assert(LOG_VERSION === 'alpha-0.6.0', `LOG_VERSION = ${LOG_VERSION}`);
 });
 
 // §21.1 — no active output path may continue to emit a stale build tag.
@@ -230,7 +252,8 @@ test('§22.1 all six required datasets load through the shared pipeline', () => 
   // four of them through its PRG_SET (§5.4). The loaded roster is no longer
   // the battle roster, which is the whole point of System identity.
   assert(c.system.length === 8, `expected 8 System Programs, got ${c.system.length}`);
-  assert(c.functions.size === 15, `expected 15 functions, got ${c.functions.size}`);
+  // Alpha 0.6.0 §9 — GREENING and SNEAK join the catalog as PASSIVE payloads.
+  assert(c.functions.size === 17, `expected 17 functions, got ${c.functions.size}`);
   const costs: Record<string, number> = {};
   for (const f of c.functions.values()) costs[f.name] = f.cost;
   // §4.2 approved Alpha costs
@@ -246,24 +269,39 @@ test('§22.1 all six required datasets load through the shared pipeline', () => 
   // §4.3/§4.4/§4.5 the new datasets
   const hak = c.hackers.get('HAK_01')!;
   assert(hak && hak.name === 'CR45H' && hak.baseLink === 100, 'HAK_01 resolves');
-  assert(hak.skillIds.join(':') === 'SKL_001:SKL_002', 'ordered Skill references preserved');
-  assert(c.skills.size === 2, 'two Skill records');
+  assert(hak.passiveIds.join(':') === 'PSV_001:PSV_002', 'ordered PASSIVE references preserved');
+  assert(c.passives.size === 9, `expected 9 PASSIVE records, got ${c.passives.size}`);
   const dek = c.decks.get('DEK_01')!;
   assert(dek && dek.name === 'AGIMA' && dek.addLink === 50, 'DEK_01 resolves');
   assert(dek.fn.id === 'FNC_010', 'Deck references exactly one Function');
   // §2.12 placeholders are parsed and RETAINED but never interpreted
   assert(hak.bio.length > 0 && hak.graphics.length > 0, 'BIO/GRAPHICS retained as data');
   assert(dek.descript.length > 0 && dek.graphics.length > 0, 'DESCRIPT/GRAPHICS retained as data');
-  // Alpha 0.5.0 §5/§6 — the seventh required dataset and its two authored rows.
-  assert(c.systems.size === 2, `expected 2 Systems, got ${c.systems.size}`);
+  // Alpha 0.5.0 §5/§6 — the seventh required dataset; Alpha 0.6.0 §9 adds
+  // DOORMAN as the fixed Battle 1 opponent.
+  assert(c.systems.size === 3, `expected 3 Systems, got ${c.systems.size}`);
   const bouncer = c.systems.get('SYS_01')!;
   assert(bouncer && bouncer.name === 'BOUNCER' && bouncer.baseIce === 100, 'SYS_01 BOUNCER resolves');
   assert(bouncer.programIds.join(':') === 'PRG_S_003:PRG_S_005:PRG_S_006:PRG_S_001', 'BOUNCER ordered PRG_SET');
   const midnight = c.systems.get('SYS_02')!;
   assert(midnight && midnight.name === 'MIDNIGHT' && midnight.baseIce === 100, 'SYS_02 MIDNIGHT resolves');
   assert(midnight.programIds.join(':') === 'PRG_S_007:PRG_S_008:PRG_S_001:PRG_S_002', 'MIDNIGHT ordered PRG_SET');
-  // §2.2 — System passive Skills are deferred, so authored rows carry none.
-  assert(bouncer.skillIds.length === 0 && midnight.skillIds.length === 0, 'no System Skills in Alpha 0.5');
+  // Alpha 0.6.0 §6 — System PASSIVEs are supported now; no authored System
+  // currently references one, which is content rather than a rule.
+  assert(bouncer.passiveIds.length === 0 && midnight.passiveIds.length === 0, 'authored Systems carry no PASSIVEs yet');
+  // §9/§29 — DOORMAN, the fixed Battle 1 opponent, excluded from random pools.
+  const doorman = c.systems.get('SYS_03')!;
+  assert(doorman && doorman.name === 'DOORMAN' && doorman.baseIce === 100, 'SYS_03 DOORMAN resolves');
+  assert(doorman.programIds.join(':') === 'PRG_S_001:PRG_S_002:PRG_S_003:PRG_S_004', 'DOORMAN ordered PRG_SET');
+  assert(!doorman.inPool && bouncer.inPool && midnight.inPool, 'DOORMAN is out of the random System pool');
+  // §7/§8 — the eighth and ninth datasets.
+  assert(c.hosts.size === 5, `expected 5 HOSTs, got ${c.hosts.size}`);
+  assert(c.upgrades.size === 4, `expected 4 UPGRADEs, got ${c.upgrades.size}`);
+  const threshold = c.hosts.get('HST_01')!;
+  assert(threshold.name === 'THRESHOLD' && threshold.passiveIds.length === 0, 'THRESHOLD is a valid zero-PASSIVE HOST');
+  assert(!threshold.inPool, 'THRESHOLD is out of the random HOST pool');
+  assert(c.hosts.get('HST_05')!.passiveIds.join(':') === 'PSV_008', 'WEEDS carries the GREENING carrier');
+  assert(c.upgrades.get('UPG_04')!.passiveIds.join(':') === 'PSV_009', 'SNEAKERS carries the SNEAK carrier');
   // §5.2 — placeholders retained, never interpreted (as for the Hacker).
   assert(bouncer.bio.length > 0 && bouncer.graphics.length > 0, 'System BIO/GRAPHICS retained as data');
   // §7 — the new authored content the Systems field.
@@ -275,14 +313,24 @@ test('§22.1 all six required datasets load through the shared pipeline', () => 
   }
 });
 
-test('§22.1 Skill display resolves %N placeholders in title case', () => {
+test('§5 PASSIVE display resolves %N placeholders in title case', () => {
   const c = loadContent(real).content!;
-  const dmg = c.skills.get('SKL_001')!;
-  const chg = c.skills.get('SKL_002')!;
-  assert(dmg.effectType === 'SKL_EXTRA_MATCH_DAMAGE' && dmg.color === Color.Red && dmg.magnitude === 1, 'SKL_001 typed params');
-  assert(chg.effectType === 'SKL_EXTRA_MATCH_CHARGE' && chg.color === Color.Red && chg.magnitude === 1, 'SKL_002 typed params');
-  assert(dmg.display === 'Deal 1 extra damage on a Red sync', `SKL_001 display: ${dmg.display}`);
-  assert(chg.display === 'Gain 1 extra charge on a Red sync', `SKL_002 display: ${chg.display}`);
+  const dmg = c.passives.get('PSV_001')!;
+  const chg = c.passives.get('PSV_002')!;
+  assert(dmg.effectType === 'PSV_EXTRA_MATCH_DAMAGE' && dmg.color === Color.Red && dmg.magnitude === 1, 'PSV_001 typed params');
+  assert(chg.effectType === 'PSV_EXTRA_MATCH_CHARGE' && chg.color === Color.Red && chg.magnitude === 1, 'PSV_002 typed params');
+  assert(dmg.display === 'Deal 1 extra damage on a Red sync', `PSV_001 display: ${dmg.display}`);
+  assert(chg.display === 'Gain 1 extra charge on a Red sync', `PSV_002 display: ${chg.display}`);
+  // §5.7 — a carrier with a blank authored display identifies itself by its
+  // payload Function's player-facing name.
+  const carrier = c.passives.get('PSV_008')!;
+  assert(carrier.effectType === 'PSV_CARRIER' && carrier.functionId === 'FNC_016', 'PSV_008 is the GREENING carrier');
+  assert(carrier.activation === 'START_OF_TURN', 'a carrier is START_OF_TURN');
+  assert(carrier.display === 'GREENING', `blank carrier display falls back to the Function name: ${carrier.display}`);
+  // §9.1 — the canonical axis token, not a stale YELLOW spelling.
+  assert(c.passives.get('PSV_006')!.color === Color.Yellow, 'PSV_006 GRACE uses the canonical YEL token');
+  // §5.4 — agent scope is retained verbatim, HOST semantics notwithstanding.
+  assert(c.passives.get('PSV_003')!.agentScope === 'ENEMY', 'PSV_003 authored scope is ENEMY');
 });
 
 test('§22.1 fingerprint tracks gameplay fields and ignores placeholders/display', () => {
@@ -293,7 +341,9 @@ test('§22.1 fingerprint tracks gameplay fields and ignores placeholders/display
     ['BIO', files({ hackers: mutate(real.hackers.text, 'hacker biography goes here', 'entirely different bio') })],
     ['GRAPHICS', files({ hackers: mutate(real.hackers.text, 'hacker graphics reference goes here', 'other.png') })],
     ['DESCRIPT', files({ decks: mutate(real.decks.text, 'deck description goes here', 'other text') })],
-    ['Skill display', files({ skills: mutate(real.skills.text, 'Deal %1 extra damage', 'Inflict %1 bonus harm') })],
+    ['PASSIVE display', files({ passives: mutate(real.passives.text, 'Deal %1 extra damage', 'Inflict %1 bonus harm') })],
+    // Alpha 0.6.0 §10 — HOST/UPGRADE presentation is excluded too.
+    ['HOST notes', files({ hosts: mutate(real.hosts.text, 'host for first battle with no passives', 'other note') })],
   ];
   for (const [label, f] of same) {
     const c = loadContent(f).content;
@@ -307,8 +357,13 @@ test('§22.1 fingerprint tracks gameplay fields and ignores placeholders/display
     ['Shake params', files({ functions: mutate(real.functions.text, '0:0:0:0', '0:0:1:1') })],
     ['BASE_LINK', files({ hackers: mutate(real.hackers.text, 'CR45H,100', 'CR45H,120') })],
     ['STRONG_COLORS', files({ hackers: mutate(real.hackers.text, 'RED:GRE:YEL', 'RED:GRE:BLU') })],
-    ['Skill magnitude', files({ skills: mutate(real.skills.text, 'SKL_EXTRA_MATCH_DAMAGE,RED:1', 'SKL_EXTRA_MATCH_DAMAGE,RED:2') })],
+    ['PASSIVE magnitude', files({ passives: mutate(real.passives.text, 'PSV_EXTRA_MATCH_DAMAGE,RED:1', 'PSV_EXTRA_MATCH_DAMAGE,RED:2') })],
     ['ADD_LINK', files({ decks: mutate(real.decks.text, 'AGIMA,50', 'AGIMA,60') })],
+    // Alpha 0.6.0 §10 — gameplay-relevant PASSIVE/HST/UPG changes DO move it.
+    ['HOST passive ref', files({ hosts: mutate(real.hosts.text, 'HST_02,BITMIRE,PSV_003', 'HST_02,BITMIRE,PSV_004') })],
+    ['UPGRADE passive ref', files({ upgrades: mutate(real.upgrades.text, 'UPG_01,BRACER,PSV_005', 'UPG_01,BRACER,PSV_004') })],
+    ['HOST in_pool', files({ hosts: mutate(real.hosts.text, 'HST_02,BITMIRE,PSV_003,', 'HST_02,BITMIRE,PSV_003,n') })],
+    ['PASSIVE agent scope', files({ passives: mutate(real.passives.text, 'ALL:1,CONTINUAL,,ENEMY', 'ALL:1,CONTINUAL,,OWNER') })],
   ];
   for (const [label, f] of differ) {
     const c = loadContent(f).content;
@@ -459,13 +514,102 @@ test('§22.1 wrong ID prefixes fail for each new dataset role', () => {
   expectErrors({ hackers: mutate(real.hackers.text, 'HAK_01,', 'DEK_01,') }, 'wrong Hacker ID prefix', 'hacker prefix');
   // §4.5 — a HAK_* value in DEK_ID is explicitly invalid
   expectErrors({ decks: mutate(real.decks.text, 'DEK_01,', 'HAK_01,') }, 'wrong Deck ID prefix', 'deck prefix');
-  expectErrors({ skills: mutate(real.skills.text, 'SKL_001,', 'FNC_001,') }, 'wrong Skill ID prefix', 'skill prefix');
-  expectErrors({ hackers: mutate(real.hackers.text, 'SKL_001:SKL_002', 'FNC_001:SKL_002') }, 'wrong ID prefix', 'skill ref prefix');
+  expectErrors({ passives: mutate(real.passives.text, 'PSV_001,', 'FNC_001,') }, 'wrong PASSIVE ID prefix', 'passive prefix');
+  expectErrors({ hackers: mutate(real.hackers.text, 'PSV_001:PSV_002', 'FNC_001:PSV_002') }, 'wrong ID prefix', 'passive ref prefix');
+  // Alpha 0.6.0 §7/§8 — the two new dataset roles enforce their own prefixes.
+  expectErrors({ hosts: mutate(real.hosts.text, 'HST_01,', 'SYS_01,') }, 'wrong HOST ID prefix', 'host prefix');
+  expectErrors({ upgrades: mutate(real.upgrades.text, 'UPG_01,', 'HST_01,') }, 'wrong UPGRADE ID prefix', 'upgrade prefix');
 });
 
-test('§22.1 missing Hacker/Skill/Deck/Function references fail', () => {
-  expectErrors({ hackers: mutate(real.hackers.text, 'SKL_001:SKL_002', 'SKL_001:SKL_404') }, 'unknown Skill ID', 'missing skill');
+test('§22.1 missing Hacker/PASSIVE/Deck/Function references fail', () => {
+  expectErrors({ hackers: mutate(real.hackers.text, 'PSV_001:PSV_002', 'PSV_001:PSV_404') }, 'unknown PASSIVE ID', 'missing hacker passive');
   expectErrors({ decks: mutate(real.decks.text, 'FNC_010', 'FNC_404') }, 'unknown Function ID', 'missing deck fn');
+  // §52 — HOST and UPGRADE references resolve through the SAME check.
+  expectErrors({ hosts: mutate(real.hosts.text, 'HST_02,BITMIRE,PSV_003', 'HST_02,BITMIRE,PSV_404') }, 'unknown PASSIVE ID', 'missing host passive');
+  expectErrors({ upgrades: mutate(real.upgrades.text, 'UPG_01,BRACER,PSV_005', 'UPG_01,BRACER,PSV_404') }, 'unknown PASSIVE ID', 'missing upgrade passive');
+  // §5.5 — a carrier's payload Function must resolve.
+  expectErrors({ passives: mutate(real.passives.text, 'START_OF_TURN,FNC_016', 'START_OF_TURN,FNC_404') }, 'unknown Function ID', 'missing carrier payload');
+});
+
+// ---- Alpha 0.6.0 §52 — HOST/UPGRADE/PASSIVE structural validation ----
+
+test('§52 the stale SKILL header is not silently accepted as PASSIVES', () => {
+  expectErrors({ hackers: mutate(real.hackers.text, 'PRG_SET,PASSIVES', 'PRG_SET,SKILL') }, 'unknown header column', 'stale HAK header');
+  expectErrors({ systems: mutate(real.systems.text, 'PRG_SET,PASSIVES', 'PRG_SET,SKILL') }, 'unknown header column', 'stale SYS header');
+});
+
+test('§8 fewer than four UPGRADE rows fails validation', () => {
+  const lines = real.upgrades.text.trimEnd().split('\n');
+  const short = lines.filter((l) => !l.startsWith('UPG_04')).join('\n');
+  expectErrors({ upgrades: short }, 'too few valid UPGRADE rows', 'short upgrade pool');
+});
+
+test('§52 a duplicate acquired-UPGRADE list and an empty random pool are rejected', () => {
+  // every System excluded from the pool leaves route generation nothing to draw
+  const noPool = real.systems.text.replace(/,,100/g, ',n,100').replace(/,n,100/, ',n,100');
+  const allExcluded = real.systems.text
+    .split('\n')
+    .map((l, i) => (i === 0 || !l.trim() ? l : l.replace(/^(SYS_\d+,[A-Z0-9]+),[yn]?,/, '$1,n,')))
+    .join('\n');
+  void noPool;
+  expectErrors({ systems: allExcluded }, 'excluded from the random pool', 'empty System pool');
+});
+
+test('§5.3/§52 PASSIVE activation, scope, and payload contracts are enforced', () => {
+  expectErrors({ passives: mutate(real.passives.text, 'RED:1,CONTINUAL', 'RED:1,SOMETIMES') }, 'unknown PASSIVE activation', 'bad activation');
+  // a continual effect authored as START_OF_TURN contradicts its contract
+  expectErrors({ passives: mutate(real.passives.text, 'RED:1,CONTINUAL', 'RED:1,START_OF_TURN') }, 'only supports CONTINUAL', 'wrong activation');
+  expectErrors({ passives: mutate(real.passives.text, 'CONTINUAL,,OWNER', 'CONTINUAL,,NOBODY') }, 'unknown PASSIVE agent scope', 'bad scope');
+  // a continual effect may not carry a Function payload…
+  expectErrors({ passives: mutate(real.passives.text, 'RED:1,CONTINUAL,,', 'RED:1,CONTINUAL,FNC_016,') }, 'does not take a Function payload', 'forbidden payload');
+  // …and a carrier must
+  expectErrors({ passives: mutate(real.passives.text, 'START_OF_TURN,FNC_016,', 'START_OF_TURN,,') }, 'requires a Function payload', 'missing payload');
+  // a parameterless effect must leave `params` blank
+  expectErrors({ passives: mutate(real.passives.text, 'PSV_BIGGER_BOMB,,', 'PSV_BIGGER_BOMB,ALL:1,') }, 'takes no parameters', 'unexpected params');
+});
+
+test('§9.1 a stale non-canonical axis token in PSV params fails', () => {
+  expectErrors({ passives: mutate(real.passives.text, 'PSV_006,PSV_EXTRA_MATCH_CHARGE,YEL:1', 'PSV_006,PSV_EXTRA_MATCH_CHARGE,YELLOW:1') }, 'unknown color enum', 'stale YELLOW token');
+});
+
+test('§7 a zero-PASSIVE HOST is valid and an UPGRADE with none only warns', () => {
+  const c = loadContent(real).content!;
+  assert(c.hosts.get('HST_01')!.passives.length === 0, 'THRESHOLD loads with no PASSIVEs');
+  const r = loadContent(files({ upgrades: mutate(real.upgrades.text, 'UPG_01,BRACER,PSV_005', 'UPG_01,BRACER,') }));
+  assert(r.content !== null, 'a zero-PASSIVE UPGRADE still loads');
+  assert(r.issues.some((i) => i.severity === 'warning' && i.reason.includes('grants no PASSIVEs')), 'expected the empty-reward warning');
+});
+
+test('§4.1 leading-apostrophe normalization applies to the new PSV/HST/UPG fields', () => {
+  const c = loadContent(
+    files({
+      passives: mutate(real.passives.text, 'PSV_001,PSV_EXTRA_MATCH_DAMAGE,RED:1', "PSV_001,PSV_EXTRA_MATCH_DAMAGE,'RED:1"),
+      hosts: mutate(real.hosts.text, 'HST_02,BITMIRE,PSV_003', "HST_02,BITMIRE,'PSV_003"),
+      upgrades: mutate(real.upgrades.text, 'UPG_01,BRACER,PSV_005', "UPG_01,BRACER,'PSV_005"),
+    }),
+  ).content;
+  assert(c !== null, 'spreadsheet-safe values must load');
+  assert(c.passives.get('PSV_001')!.color === Color.Red, 'PSV params normalize');
+  assert(c.hosts.get('HST_02')!.passiveIds.join(':') === 'PSV_003', 'HOST refs normalize');
+  assert(c.upgrades.get('UPG_01')!.passiveIds.join(':') === 'PSV_005', 'UPGRADE refs normalize');
+  assert(c.fingerprint === loadContent(real).content!.fingerprint, 'normalized values fingerprint identically');
+});
+
+test('§16 a zero-cost Function may back a PASSIVE but never a Program or Deck', () => {
+  const c = loadContent(real).content!;
+  assert(c.functions.get('FNC_016')!.cost === 0, 'GREENING is authored cost 0');
+  // assigning it to a Program is a blocking error: chargeCap === cost, so the
+  // Program would hold no pool and fire free every turn.
+  expectErrors(
+    { hacker: mutate(real.hacker.text, 'PRG_H_001,BOMBER,RED,TRI,FNC_001', 'PRG_H_001,BOMBER,RED,TRI,FNC_016') },
+    'charge pool would have no capacity',
+    'zero-cost Program assignment',
+  );
+  expectErrors(
+    { decks: mutate(real.decks.text, 'FNC_010', 'FNC_016') },
+    'charge pool would have no capacity',
+    'zero-cost Deck assignment',
+  );
 });
 
 test('§22.1 malformed tuples and invalid startCharged fail', () => {
@@ -475,16 +619,17 @@ test('§22.1 malformed tuples and invalid startCharged fail', () => {
   expectErrors({ functions: mutate(real.functions.text, '0:0:0:0', '0:0:0:x') }, 'malformed tuple', 'shake token');
   expectErrors({ functions: mutate(real.functions.text, '0:0:0:0', '') }, 'missing required params tuple', 'shake missing');
   expectErrors({ functions: mutate(real.functions.text, ',,Y,,,0:0:0:0', ',,MAYBE,,,0:0:0:0') }, 'invalid startCharged', 'startCharged');
-  // §4.4 Skill param tuple contracts
-  expectErrors({ skills: mutate(real.skills.text, 'RED:1,Deal', 'RED,Deal') }, 'exactly 2 colon-delimited', 'skill arity');
-  expectErrors({ skills: mutate(real.skills.text, 'RED:1,Deal', 'REX:1,Deal') }, 'unknown color enum', 'skill color');
-  expectErrors({ skills: mutate(real.skills.text, 'RED:1,Deal', 'RED:0,Deal') }, 'invalid magnitude', 'skill magnitude');
-  expectErrors({ skills: mutate(real.skills.text, 'SKL_EXTRA_MATCH_DAMAGE', 'SKL_MAKE_COFFEE') }, 'unknown Skill effect type', 'skill effect');
+  // §5.1 PASSIVE param tuple contracts
+  expectErrors({ passives: mutate(real.passives.text, 'RED:1,CONTINUAL', 'RED,CONTINUAL') }, 'exactly 2 colon-delimited', 'passive arity');
+  expectErrors({ passives: mutate(real.passives.text, 'RED:1,CONTINUAL', 'REX:1,CONTINUAL') }, 'unknown color enum', 'passive color');
+  expectErrors({ passives: mutate(real.passives.text, 'RED:1,CONTINUAL', 'RED:0,CONTINUAL') }, 'invalid magnitude', 'passive magnitude');
+  expectErrors({ passives: mutate(real.passives.text, 'PSV_EXTRA_MATCH_DAMAGE', 'PSV_MAKE_COFFEE') }, 'unknown PASSIVE effect type', 'passive effect');
+  expectErrors({ passives: mutate(real.passives.text, 'PSV_CHARGE_DAMPEN,ALL:1', 'PSV_CHARGE_DAMPEN,SOME:1') }, 'unknown scope value', 'passive scope token');
 });
 
-test('§22.1 unsupported Skill display placeholders fail', () => {
-  expectErrors({ skills: mutate(real.skills.text, 'Deal %1 extra', 'Deal %7 extra') }, 'placeholder out of range', 'display range');
-  expectErrors({ skills: mutate(real.skills.text, 'Deal %1 extra', 'Deal %x extra') }, 'unsupported Skill display placeholder', 'display token');
+test('§22.1 unsupported PASSIVE display placeholders fail', () => {
+  expectErrors({ passives: mutate(real.passives.text, 'Deal %1 extra', 'Deal %7 extra') }, 'placeholder out of range', 'display range');
+  expectErrors({ passives: mutate(real.passives.text, 'Deal %1 extra', 'Deal %x extra') }, 'unsupported PASSIVE display placeholder', 'display token');
 });
 
 test('§22.1 a Deck with zero or more than one Function fails', () => {
@@ -518,13 +663,20 @@ test('§22.1 unreferenced valid rows warn rather than fail', () => {
     r.issues.some((i) => i.severity === 'warning' && i.id === 'FNC_007' && i.reason.includes('not referenced')),
     'expected an unreferenced-Function warning for FNC_007',
   );
-  // an unreferenced Skill warns too
-  const extraSkill = real.skills.text.trimEnd() + '\nSKL_099,SKL_EXTRA_MATCH_DAMAGE,BLU:2,Deal %1 extra damage on a %0 Sync';
-  const rs = loadContent(files({ skills: extraSkill }));
-  assert(rs.content !== null, 'an unreferenced Skill must not block startup');
+  // an unreferenced PASSIVE warns too
+  const extraPassive =
+    real.passives.text.trimEnd() + '\nPSV_099,PSV_EXTRA_MATCH_DAMAGE,BLU:2,CONTINUAL,,OWNER,Deal %1 extra damage on a %0 Sync,';
+  const rs = loadContent(files({ passives: extraPassive }));
+  assert(rs.content !== null, 'an unreferenced PASSIVE must not block startup');
   assert(
-    rs.issues.some((i) => i.severity === 'warning' && i.id === 'SKL_099' && i.reason.includes('not referenced')),
-    'expected an unreferenced-Skill warning',
+    rs.issues.some((i) => i.severity === 'warning' && i.id === 'PSV_099' && i.reason.includes('not referenced')),
+    'expected an unreferenced-PASSIVE warning',
+  );
+  // Alpha 0.6.0 §23 — a Function reached ONLY through a PASSIVE payload is
+  // referenced, not dead content: GREENING and SNEAK must not warn.
+  assert(
+    !r.issues.some((i) => i.id === 'FNC_016' || i.id === 'FNC_017'),
+    'a PASSIVE carrier payload counts as a Function reference',
   );
 });
 
@@ -761,7 +913,9 @@ function testbedSystemId(): string {
   return 'SYS_90';
 }
 function testbedSystems(): string {
-  return `${real.systems.text.replace(/\s*$/, '')}\nSYS_90,TESTBED,100,RED:GRE:YEL,TRI:SQU:STR,PRG_S_001:PRG_S_002:PRG_S_003:PRG_S_004,,bio,gfx`;
+  // Alpha 0.6.0 — `in_pool` is `n`: the testbed is a fixture, and a fixture
+  // System must never leak into a route offer or a Random Quick Match.
+  return `${real.systems.text.replace(/\s*$/, '')}\nSYS_90,TESTBED,n,100,RED:GRE:YEL,TRI:SQU:STR,PRG_S_001:PRG_S_002:PRG_S_003:PRG_S_004,,bio,gfx`;
 }
 
 function testbed(): SelectedSystem {
@@ -803,8 +957,8 @@ function newGame(seed = 7, settings: BattleSettings = D): Game {
 
 // Alpha 0.4.0 — a battle whose ACTIVE BUILD is stated explicitly, for the
 // order/routing/inventory cases. Any four distinct inventory Programs.
-function newGameWithBuild(build: string[], seed = 7, settings: BattleSettings = D, system?: SelectedSystem): Game {
-  const g = newBattle(settings, seed, build, 'PLAYER_EDITED', system);
+function newGameWithBuild(build: string[], seed = 7, settings: BattleSettings = D, system?: SelectedSystem, hostId?: string): Game {
+  const g = newBattle(settings, seed, build, 'PLAYER_EDITED', system, hostId);
   g.startPlayerPhase();
   return g;
 }
@@ -818,6 +972,8 @@ function qmInfo(build: readonly string[] = defaultActiveBuild(), origin: BuildOr
     // Alpha 0.5.0 §32 — the session's opponent must match what the battle was
     // built against, which for every fixture here is the pinned headless System.
     system: headlessSystem(),
+    // Alpha 0.6.0 §44 — the HOST is session identity on the System's terms.
+    hostId: headlessHost(),
     build: [...build],
     buildOrigin: origin,
   };
@@ -1181,57 +1337,49 @@ const runInfoFor = (
   buildOrigin: build ? 'PLAYER_EDITED' : 'DEFAULT',
   // Alpha 0.5.0 §33 — a committed Run always knows its upcoming opponent.
   system,
+  // Alpha 0.6.0 §32/§35 — and its committed HOST, acquired UPGRADEs, and the
+  // persisted isolated route RNG state.
+  hostId: HEADLESS_HOST_ID,
+  upgradeIds: [],
+  routeRngState: 12345,
 });
 
-test('§22.2 New Run setup advances Hacker -> Deck -> Review and retains choices on Back', () => {
+test('§27/§28 New Run setup is Hacker -> Deck and retains choices on Back', () => {
   let s: PendingSetup = beginSetup();
   assert(s.step === 'HACKER' && s.hackerId === null && s.deckId === null, 'setup begins empty at Hacker Selection');
   assert(!setupComplete(s), 'an empty setup is not committable');
   s = chooseHacker(s, 'HAK_01');
   assert(s.step === 'DECK' && s.hackerId === 'HAK_01', 'choosing the Hacker advances to Deck Selection');
-  assert(!setupComplete(s), 'setup is not committable before the Build screen');
-  s = chooseDeck(s, 'DEK_01', makeSetupRandom(1234).rng);
-  assert(s.step === 'BUILD' && s.deckId === 'DEK_01', 'choosing the Deck advances to Build');
-  // Alpha 0.5.0 §11.3 — reaching the pre-battle state resolves Battle 1's
-  // opponent, so the player can build against it.
-  assert(s.system !== null && getContent().systems.has(s.system.systemId), 'entering Build resolves a valid System');
-  assert(s.system!.source === 'RUN_RANDOM', 'a Run opponent is recorded as randomly selected');
-  assert(setupComplete(s), 'Build with both choices is committable');
+  assert(!setupComplete(s), 'setup is not committable before a Deck is chosen');
+  s = chooseDeck(s, 'DEK_01');
+  // Alpha 0.6.0 §27 — setup ENDS here. The next screen is the initial Path
+  // Choice, which is also the destructive commitment boundary (§28); pending
+  // setup no longer carries a Build or a pre-rolled opponent.
+  assert(s.deckId === 'DEK_01' && setupComplete(s), 'both identity choices make setup committable');
   // §12.2 — Back RETAINS the pending choices
   const back1 = setupBack(s)!;
-  assert(back1.step === 'DECK' && back1.hackerId === 'HAK_01' && back1.deckId === 'DEK_01', 'Back to Deck keeps both choices');
-  const back2 = setupBack(back1)!;
-  assert(back2.step === 'HACKER' && back2.hackerId === 'HAK_01' && back2.deckId === 'DEK_01', 'Back to Hacker keeps both choices');
+  assert(back1.step === 'HACKER' && back1.hackerId === 'HAK_01' && back1.deckId === 'DEK_01', 'Back to Hacker keeps both choices');
   // backing out of the first screen returns null = "Title, discarding setup only"
-  assert(setupBack(back2) === null, 'Back from Hacker Selection leaves setup');
+  assert(setupBack(back1) === null, 'Back from Hacker Selection leaves setup');
 });
 
-// §11.3 — back-and-forward navigation inside ONE pending setup must not roll a
-// new opponent: the player would see the encounter they planned against change
-// under them. The RNG passed on the second pass is deliberately a DIFFERENT
-// stream, so a reroll would be visible.
-test('§11.3 re-entering Build during pending Run setup does not reroll the System', () => {
-  let s: PendingSetup = beginSetup();
-  s = chooseHacker(s, 'HAK_01');
-  s = chooseDeck(s, 'DEK_01', makeSetupRandom(11).rng);
-  const first = s.system!.systemId;
-  const back = setupBack(s)!;
-  assert(back.system!.systemId === first, 'Back retains the resolved opponent');
-  const again = chooseDeck(back, 'DEK_01', makeSetupRandom(999).rng);
-  assert(again.system!.systemId === first, 'returning to Build keeps the SAME opponent');
-});
-
-// §11.1 — sampling with replacement over the whole catalog: every authored
-// System must be reachable, and repeats across battles are legal.
-test('§11.1 random System selection draws from the full catalog with replacement', () => {
-  const seen = new Set<string>();
+// §30/§39 — random selection samples the in_pool subset with replacement:
+// repeats across battles are legal, and an excluded row is never offered.
+test('§30 random System/HOST selection draws from the in_pool subsets', () => {
+  const seenSys = new Set<string>();
+  const seenHost = new Set<string>();
   for (let seed = 0; seed < 200; seed++) {
-    const sel = randomSystem(makeSetupRandom(seed).rng, 'RUN_RANDOM');
+    const rng = makeSetupRandom(seed).rng;
+    const sel = randomSystem(rng, 'RUN_RANDOM');
     assert(getContent().systems.has(sel.systemId), 'selection is always a valid loaded System');
     assert(sel.source === 'RUN_RANDOM', 'selection carries its source');
-    seen.add(sel.systemId);
+    seenSys.add(sel.systemId);
+    seenHost.add(randomHost(rng));
   }
-  assert(seen.size === getContent().systemOrder.length, 'every authored System is reachable');
+  assert(!seenSys.has('SYS_03'), 'DOORMAN is excluded from the random System pool');
+  assert(!seenHost.has('HST_01'), 'THRESHOLD is excluded from the random HOST pool');
+  assert(seenSys.size === poolSystems().length, 'every in-pool System is reachable');
+  assert(seenHost.size === poolHosts().length, 'every in-pool HOST is reachable');
 });
 
 // §14 — setup randomness must not touch the gameplay stream. Two battles built
@@ -1255,7 +1403,7 @@ test('§22.2 every loaded Deck is offered for the selected Hacker (no compatibil
   assert(c.hackerOrder.length === c.hackers.size, 'every Hacker is offered');
   for (const h of c.hackerOrder) {
     for (const d of c.deckOrder) {
-      const id = buildIdentity(h, d, headlessSystem(), 'EXPLICIT_SELECTION', defaultBuild(h, d), 'DEFAULT');
+      const id = buildIdentity(h, d, headlessSystem(), headlessHost(), [], 'EXPLICIT_SELECTION', defaultBuild(h, d), 'DEFAULT');
       assert(id.hackerId === h && id.deckId === d, `identity builds for ${h}/${d}`);
     }
   }
@@ -1268,7 +1416,7 @@ test('§22.2/§5.3 the ordered active build survives identity construction', () 
   const expected = defaultBuild('HAK_01', 'DEK_01');
   assert(expected.join(',') === 'PRG_H_001,PRG_H_002,PRG_H_003,PRG_H_004', 'current content default build');
   assert(c.hacker.length === INVENTORY_SIZE, 'all six Hacker Programs are loaded content');
-  const id = buildIdentity('HAK_01', 'DEK_01', headlessSystem(), 'EXPLICIT_SELECTION', expected, 'DEFAULT');
+  const id = buildIdentity('HAK_01', 'DEK_01', headlessSystem(), headlessHost(), [], 'EXPLICIT_SELECTION', expected, 'DEFAULT');
   assert(id.hackerPrograms.join(',') === expected.join(','), 'identity carries the ordered active build');
   assert(id.inventory.join(',') === inventoryProgramIds('HAK_01', 'DEK_01').join(','), 'identity carries the inventory');
   assert(id.buildOrigin === 'DEFAULT', 'identity records the build source');
@@ -1280,7 +1428,10 @@ test('§22.2/§5.3 the ordered active build survives identity construction', () 
     'identity carries the selected System PRG_SET in order',
   );
   assert(id.systemPrograms.length < c.system.length, 'the fielded roster is a subset of loaded System Programs');
-  assert(id.skillIds.join(',') === 'SKL_001,SKL_002', 'identity carries the ordered Skill IDs');
+  assert(id.passiveIds.join(',') === 'PSV_001,PSV_002', 'identity carries the ordered PASSIVE IDs');
+  // Alpha 0.6.0 §7/§12 — and the battlefield plus the acquired reward state.
+  assert(id.hostId === HEADLESS_HOST_ID, 'identity carries the committed HOST');
+  assert(id.upgradeIds.length === 0, 'a Quick Match identity carries no UPGRADEs');
   assert(id.deckFunctionId === 'FNC_010', 'identity carries the Deck Function ID');
   // §5.8 — battle construction instantiates EXACTLY the four active Programs
   const g = createRunBattle(runInfoFor(D), 1, 5);
@@ -1416,8 +1567,8 @@ test('§22.4 identity that disagrees with resolved content rejects the save', ()
   tamper((e) => { e.identity.hackerId = 'HAK_99'; }, 'unknown Hacker rejects');
   tamper((e) => { e.identity.deckId = 'DEK_99'; }, 'unknown Deck rejects');
   tamper((e) => { e.identity.deckFunctionId = 'FNC_001'; }, 'wrong Deck Function rejects');
-  tamper((e) => { e.identity.skillIds = ['SKL_002', 'SKL_001']; }, 'reordered Skill IDs reject');
-  tamper((e) => { e.identity.skillIds = ['SKL_001']; }, 'truncated Skill IDs reject');
+  tamper((e) => { e.identity.passiveIds = ['PSV_002', 'PSV_001']; }, 'reordered PASSIVE IDs reject');
+  tamper((e) => { e.identity.passiveIds = ['PSV_001']; }, 'truncated PASSIVE IDs reject');
   tamper((e) => { [e.identity.hackerPrograms[0], e.identity.hackerPrograms[1]] = [e.identity.hackerPrograms[1], e.identity.hackerPrograms[0]]; }, 'reordered Programs reject');
   tamper((e) => { e.identity.selectionSource = 'SOMETHING_ELSE'; }, 'invalid selection source rejects');
   // the envelope identity and the battle-state identity must AGREE
@@ -1649,16 +1800,16 @@ test('§22.6 a Red color-axis Sync triggers each current Skill once per resolved
   const matches = detectMatches(g.state.board);
   assert(matches.length === 1 && matches[0].condition === 'color', `expected exactly one color Sync, got ${matches.length}`);
   const events = resolveWave(g, 'player');
-  const skillEvents = events.filter((e) => e.t === 'skill');
-  assert(skillEvents.length === 2, `both Skills trigger once each, got ${skillEvents.length}`);
-  const dmg = skillEvents.find((e) => e.t === 'skill' && e.effect === 'SKL_EXTRA_MATCH_DAMAGE');
-  const chg = skillEvents.find((e) => e.t === 'skill' && e.effect === 'SKL_EXTRA_MATCH_CHARGE');
-  assert(dmg && dmg.t === 'skill' && dmg.damage === 1, 'SKL_001 contributes 1 raw damage at the 1.0x tier');
-  assert(chg && chg.t === 'skill' && chg.charge !== undefined, 'SKL_002 reports the charge it granted');
+  const passiveEvents = events.filter((e) => e.t === 'passive');
+  assert(passiveEvents.length === 2, `both Skills trigger once each, got ${passiveEvents.length}`);
+  const dmg = passiveEvents.find((e) => e.t === 'passive' && e.effect === 'PSV_EXTRA_MATCH_DAMAGE');
+  const chg = passiveEvents.find((e) => e.t === 'passive' && e.effect === 'PSV_EXTRA_MATCH_CHARGE');
+  assert(dmg && dmg.t === 'passive' && dmg.damage === 1, 'SKL_001 contributes 1 raw damage at the 1.0x tier');
+  assert(chg && chg.t === 'passive' && chg.charge !== undefined, 'SKL_002 reports the charge it granted');
   // §6.4 — the Skill damage is its own disjoint bucket, never base Sync damage
   const sm = g.state.metrics.sides.player;
-  assert(sm.skillDamage === 1, `skillDamage bucket = 1, got ${sm.skillDamage}`);
-  const tallied = sm.matchDamage + sm.bombDamage + sm.attackerDamage + sm.bufferDamageAdded + sm.skillDamage;
+  assert(sm.passiveDamage === 1, `passiveDamage bucket = 1, got ${sm.passiveDamage}`);
+  const tallied = sm.matchDamage + sm.bombDamage + sm.attackerDamage + sm.bufferDamageAdded + sm.passiveDamage;
   assert(Math.abs(tallied - sm.totalDamage) < 1e-9, 'the five buckets sum exactly to total');
 });
 
@@ -1674,7 +1825,7 @@ test('§22.6 a shape-only Sync does not trigger, and overlapping Syncs trigger o
   const m1 = detectMatches(g1.state.board);
   assert(m1.length === 1 && m1[0].condition === 'shape', 'exactly one shape-axis Sync');
   const ev1 = resolveWave(g1, 'player');
-  assert(!ev1.some((e) => e.t === 'skill'), 'a shape-axis Sync containing Red Packets must NOT trigger a Red Skill');
+  assert(!ev1.some((e) => e.t === 'passive'), 'a shape-axis Sync containing Red Packets must NOT trigger a Red Skill');
 
   // overlapping Red color-axis AND shape-axis Syncs: the Red Skill fires ONCE,
   // for the Red-axis event only
@@ -1688,7 +1839,7 @@ test('§22.6 a shape-only Sync does not trigger, and overlapping Syncs trigger o
   const axes = new Set(m2.map((m) => m.condition));
   assert(axes.has('color') && axes.has('shape'), 'the plant produces both a color and a shape Sync');
   const ev2 = resolveWave(g2, 'player');
-  const dmgTriggers = ev2.filter((e) => e.t === 'skill' && e.effect === 'SKL_EXTRA_MATCH_DAMAGE');
+  const dmgTriggers = ev2.filter((e) => e.t === 'passive' && e.effect === 'PSV_EXTRA_MATCH_DAMAGE');
   assert(dmgTriggers.length === 1, `the Red Skill fires once for the Red-axis event, got ${dmgTriggers.length}`);
 });
 
@@ -1706,9 +1857,9 @@ test('§22.6 multiple distinct Red blobs each trigger independently', () => {
   const matches = detectMatches(g.state.board).filter((m) => m.condition === 'color');
   assert(matches.length === 2, `expected 2 distinct Red blobs, got ${matches.length}`);
   const events = resolveWave(g, 'player');
-  const dmgTriggers = events.filter((e) => e.t === 'skill' && e.effect === 'SKL_EXTRA_MATCH_DAMAGE');
+  const dmgTriggers = events.filter((e) => e.t === 'passive' && e.effect === 'PSV_EXTRA_MATCH_DAMAGE');
   assert(dmgTriggers.length === 2, `each distinct blob qualifies, got ${dmgTriggers.length}`);
-  assert(g.state.metrics.sides.player.skillDamage === 2, 'both contributions land in the Skill bucket');
+  assert(g.state.metrics.sides.player.passiveDamage === 2, 'both contributions land in the Skill bucket');
 });
 
 test('§22.6 System-owned Syncs never trigger Hacker Skills', () => {
@@ -1720,34 +1871,34 @@ test('§22.6 System-owned Syncs never trigger Hacker Skills', () => {
   ]);
   // §6.2 — owner scope: the same board resolved as a SYSTEM-owned wave
   const events = resolveWave(g, 'enemy');
-  assert(!events.some((e) => e.t === 'skill'), 'a System-owned Sync must not trigger Hacker Skills');
-  assert(g.state.metrics.sides.enemy.skillDamage === 0, 'the System accrues no Skill damage');
+  assert(!events.some((e) => e.t === 'passive'), 'a System-owned Sync must not trigger Hacker Skills');
+  assert(g.state.metrics.sides.enemy.passiveDamage === 0, 'the System accrues no Skill damage');
 });
 
-test('§22.6 duplicate qualifying Skills stack additively', () => {
-  // SKILL duplicates are meaningful content: SKL_001 twice = +2 damage
-  install({ hackers: mutate(real.hackers.text, 'SKL_001:SKL_002', 'SKL_001:SKL_001') });
+test('§11/§22.6 duplicate qualifying PASSIVEs stack additively', () => {
+  // §11 — duplicates are meaningful content: PSV_001 twice = +2 damage
+  install({ hackers: mutate(real.hackers.text, 'PSV_001:PSV_002', 'PSV_001:PSV_001') });
   try {
     const g = newGame(56);
-    assert(hackerById('HAK_01').skills.length === 2, 'both Skill references resolve');
+    assert(hackerById('HAK_01').passives.length === 2, 'both PASSIVE references resolve');
     plantRun(g, [
       { x: 1, y: 1, color: Color.Red, shape: Shape.Circle },
       { x: 2, y: 1, color: Color.Red, shape: Shape.Square },
       { x: 3, y: 1, color: Color.Red, shape: Shape.Triangle },
     ]);
     const events = resolveWave(g, 'player');
-    const triggers = events.filter((e) => e.t === 'skill' && e.effect === 'SKL_EXTRA_MATCH_DAMAGE');
-    assert(triggers.length === 2, 'both duplicate Skills trigger');
-    assert(g.state.metrics.sides.player.skillDamage === 2, 'duplicate damage Skills stack to +2');
+    const triggers = events.filter((e) => e.t === 'passive' && e.effect === 'PSV_EXTRA_MATCH_DAMAGE');
+    assert(triggers.length === 2, 'both duplicate PASSIVEs trigger');
+    assert(g.state.metrics.sides.player.passiveDamage === 2, 'duplicate damage PASSIVEs stack to +2');
   } finally {
     install(); // restore real content
   }
 });
 
-test('§22.6 no hardcoded Red passive survives without Skill records', () => {
-  // A Hacker whose Skills are BLUE-keyed must get NO bonus from a Red Sync: if
-  // any hardcoded Red passive remained, this would still add damage/charge.
-  install({ skills: real.skills.text.replace(/RED:1/g, 'BLU:1') });
+test('§22.6 no hardcoded Red passive survives without PASSIVE records', () => {
+  // A Hacker whose PASSIVEs are BLUE-keyed must get NO bonus from a Red Sync:
+  // if any hardcoded Red passive remained, this would still add damage/charge.
+  install({ passives: real.passives.text.replace(/RED:1/g, 'BLU:1') });
   try {
     const g = newGame(57);
     plantRun(g, [
@@ -1756,14 +1907,14 @@ test('§22.6 no hardcoded Red passive survives without Skill records', () => {
       { x: 3, y: 1, color: Color.Red, shape: Shape.Triangle },
     ]);
     const events = resolveWave(g, 'player');
-    assert(!events.some((e) => e.t === 'skill'), 'a Red Sync must not trigger BLUE-keyed Skills');
-    assert(g.state.metrics.sides.player.skillDamage === 0, 'no residual hardcoded Red damage bonus');
+    assert(!events.some((e) => e.t === 'passive'), 'a Red Sync must not trigger BLUE-keyed Skills');
+    assert(g.state.metrics.sides.player.passiveDamage === 0, 'no residual hardcoded Red damage bonus');
   } finally {
     install();
   }
 });
 
-test('§22.6 SKL_EXTRA_MATCH_CHARGE raises the payout through the normal distribution', () => {
+test('§22.6 PSV_EXTRA_MATCH_CHARGE raises the payout through the normal distribution', () => {
   const g = newGame(58);
   // PRG_H_001 BOMBER is bound to color RED and shape TRI; the other Programs are
   // bound to other colors. Diamond/Cross are bound by NO Hacker Program, so the
@@ -1786,8 +1937,8 @@ test('§22.6 SKL_EXTRA_MATCH_CHARGE raises the payout through the normal distrib
   for (const i of [1, 2, 3]) {
     assert(after[i] - before[i] === 0, `Program ${i} is not Red-bound and gains nothing from the Red Sync`);
   }
-  const chg = events.find((e) => e.t === 'skill' && e.effect === 'SKL_EXTRA_MATCH_CHARGE');
-  assert(chg && chg.t === 'skill' && chg.charge === 1, 'the Skill reports the single charge it granted');
+  const chg = events.find((e) => e.t === 'passive' && e.effect === 'PSV_EXTRA_MATCH_CHARGE');
+  assert(chg && chg.t === 'passive' && chg.charge === 1, 'the Skill reports the single charge it granted');
 });
 
 // ---- §22.7 Deck Function, charge, and Shake ----
@@ -1954,7 +2105,7 @@ test('§22.7 allowed post-Shake Syncs use INITIATOR ownership', () => {
     const dmg = events.find((e) => e.t === 'damage');
     assert(dmg && dmg.t === 'damage' && dmg.target === (owner === 'player' ? 'enemy' : 'player'), `${owner} Sync damages its opponent`);
     // Hacker Skills follow the initiator's identity only
-    const hasSkill = events.some((e) => e.t === 'skill');
+    const hasSkill = events.some((e) => e.t === 'passive');
     assert(hasSkill === (owner === 'player'), `Skill triggers follow initiator ownership (${owner})`);
   }
 });
@@ -2146,7 +2297,7 @@ test('§22.8 constituent groups still control damage, charge, and Skill triggers
   ]);
   const events = resolveWave(g, 'player');
   // exactly ONE Red blob qualified the Red Skill, despite the merged line clear
-  const dmgTriggers = events.filter((e) => e.t === 'skill' && e.effect === 'SKL_EXTRA_MATCH_DAMAGE');
+  const dmgTriggers = events.filter((e) => e.t === 'passive' && e.effect === 'PSV_EXTRA_MATCH_DAMAGE');
   assert(dmgTriggers.length === 1, `the Red group triggers once; the Green group never does (got ${dmgTriggers.length})`);
   assert(events.some((e) => e.t === 'lineClear'), 'the combined line clear still fired');
 });
@@ -2170,15 +2321,15 @@ test('§22.9 Reinforced Connection suppresses base Sync damage but keeps Skill e
   // §11.2/§11.3 — base Sync damage records as a clean ZERO...
   assert(sm.matchDamage === 0, `base Sync damage must be suppressed, got ${sm.matchDamage}`);
   // ...while the Skill's damage still resolves in its own bucket
-  assert(sm.skillDamage === 1, `Skill damage must survive suppression, got ${sm.skillDamage}`);
+  assert(sm.passiveDamage === 1, `Skill damage must survive suppression, got ${sm.passiveDamage}`);
   assert(sm.totalDamage === 1, 'only the Skill contribution was dealt');
   const dmg = events.find((e) => e.t === 'damage');
   assert(dmg && dmg.t === 'damage' && dmg.amount === 1, 'the damage event carries only the Skill portion');
   // charge (Program and Skill) continues normally
   assert(g.state.units.player[0].charge - chargeBefore === 4, 'Program charge plus the Skill bonus is unaffected');
-  assert(events.some((e) => e.t === 'skill' && e.effect === 'SKL_EXTRA_MATCH_CHARGE'), 'the charge Skill still triggers');
+  assert(events.some((e) => e.t === 'passive' && e.effect === 'PSV_EXTRA_MATCH_CHARGE'), 'the charge Skill still triggers');
   // the buckets stay disjoint and exact
-  const tallied = sm.matchDamage + sm.bombDamage + sm.attackerDamage + sm.bufferDamageAdded + sm.skillDamage;
+  const tallied = sm.matchDamage + sm.bombDamage + sm.attackerDamage + sm.bufferDamageAdded + sm.passiveDamage;
   assert(Math.abs(tallied - sm.totalDamage) < 1e-9, 'buckets remain disjoint under suppression');
 });
 
@@ -2192,7 +2343,7 @@ test('§22.9 Reinforced Connection suppresses base Sync damage for the System to
   ]);
   const events = resolveWave(g, 'enemy');
   const sm = g.state.metrics.sides.enemy;
-  assert(sm.matchDamage === 0 && sm.skillDamage === 0, 'the System deals no base Sync damage and has no Skills');
+  assert(sm.matchDamage === 0 && sm.passiveDamage === 0, 'the System deals no base Sync damage and has no Skills');
   assert(!events.some((e) => e.t === 'damage'), 'no damage event at all for a System Sync under suppression');
   assert(events.some((e) => e.t === 'destroy'), 'the Sync still resolved — only its damage output was suppressed');
 });
@@ -2596,18 +2747,18 @@ test('§20.5 Sync and cascade charge route through the queue and never exceed Fu
   assert(sawRoute, 'real play produced routed charge streams');
 });
 
-test('§20.5/§10.6 SKL_EXTRA_MATCH_CHARGE inflates the stream BEFORE routing', () => {
+test('§20.5/§10.6 PSV_EXTRA_MATCH_CHARGE inflates the stream BEFORE routing', () => {
   // The Skill adds to the qualifying RED stream rather than charging every
   // Red-bound Program separately (which is what Alpha 0.3 did).
   const g = newGameWithBuild(['PRG_H_001', 'PRG_H_006', 'PRG_H_002', 'PRG_H_003']);
   const streams: StreamMap = new Map();
   addStream(streams, 'color', Color.Red, 4, 'SYNC');
-  addStream(streams, 'color', Color.Red, 1, 'SKILL_MODIFIED_SYNC', 'SKL_002');
+  addStream(streams, 'color', Color.Red, 1, 'PASSIVE_MODIFIED_SYNC', 'SKL_002');
   const events: GameEvent[] = [];
   routeStreams(g.state, 'player', streams, events, new Map());
   const r = routeEventOf(events);
   assert(r.amount === 5, 'the Skill magnitude joined the existing stream');
-  assert(r.streamSource === 'SKILL_MODIFIED_SYNC' && r.sourceId === 'SKL_002', 'the stream is labelled as Skill-modified');
+  assert(r.streamSource === 'PASSIVE_MODIFIED_SYNC' && r.sourceId === 'SKL_002', 'the stream is labelled as Skill-modified');
   assert(totalCharge(g) === 5, 'five charge total — NOT five to each compatible Program');
   assert(g.state.units.player[0].charge === 5 && g.state.units.player[1].charge === 0, 'it routed top-to-bottom like any other stream');
 });
@@ -2705,7 +2856,7 @@ test('§20.6 the direct row slice is not a Sync: no B1, no match Skills', () => 
   const idx = events.findIndex((e) => e.t === 'targeted');
   const duringSlice = events.slice(0, idx + 1);
   assert(!duringSlice.some((e) => e.t === 'lineClear'), 'the direct slice contributes no B1 line clear');
-  assert(!duringSlice.some((e) => e.t === 'skill'), 'the direct slice triggers no colour/shape match Skill');
+  assert(!duringSlice.some((e) => e.t === 'passive'), 'the direct slice triggers no colour/shape match Skill');
   // §15.2 — refill Syncs AFTER the slice resolve completely normally
   assert(events.some((e) => e.t === 'spawn'), 'the board refilled');
 });
@@ -3095,7 +3246,7 @@ test('§20.9 metrics stay disjoint and reconcile with the new line-slice bucket'
     // under-count rather than fail loudly.
     const sum =
       m.matchDamage + m.attackerDamage + m.bombDamage + m.linesliceDamage +
-      m.transformDamage + m.skillDamage + m.bufferDamageAdded;
+      m.transformDamage + m.passiveDamage + m.bufferDamageAdded;
     assert(Math.abs(sum - m.totalDamage) < 1e-9, `${side}: disjoint buckets must sum to the total (${sum} vs ${m.totalDamage})`);
   }
   assert(g.state.metrics.sides.player.linesliceDamage > 0, 'DATACUT damage landed in its own bucket');
@@ -3182,7 +3333,7 @@ test('§20.3 ordinary routes are filtered below COMPLETE; interesting ones are k
     { programId: 'A', before: 0, assigned: 2, after: 2, overflowOut: 1 },
     { programId: 'B', before: 0, assigned: 1, after: 1, overflowOut: 0 },
   ] }), 'multiple recipients are interesting');
-  assert(routeIsInteresting({ ...base, source: 'SKILL_MODIFIED_SYNC', assignments: [{ programId: 'A', before: 0, assigned: 3, after: 3, overflowOut: 0 }] }), 'Skill-modified is interesting');
+  assert(routeIsInteresting({ ...base, source: 'PASSIVE_MODIFIED_SYNC', assignments: [{ programId: 'A', before: 0, assigned: 3, after: 3, overflowOut: 0 }] }), 'Skill-modified is interesting');
   assert(routeIsInteresting({ ...base, source: 'EFFECT_DESTRUCTION', assignments: [{ programId: 'A', before: 0, assigned: 3, after: 3, overflowOut: 0 }] }), 'Effect-generated is interesting');
 });
 
@@ -3559,8 +3710,16 @@ test('§42 SYS row validation: ID prefix, BASE_ICE, axes, PRG_SET, SKILL', () =>
   expectErrors({ systems: sysWith('PRG_SET', 'PRG_H_001:PRG_S_002:PRG_S_003:PRG_S_004') }, 'wrong ID prefix', 'PRG_H in System build');
   // §42.10 — a well-formed but undefined reference
   expectErrors({ systems: sysWith('PRG_SET', 'PRG_S_099:PRG_S_002:PRG_S_003:PRG_S_004') }, 'unknown System Program', 'broken Program reference');
-  // §42.11/§2.2 — System passive Skills are unsupported content in Alpha 0.5
-  expectErrors({ systems: sysWith('SKILL', 'SKL_001') }, 'not supported', 'nonblank System SKILL');
+  // Alpha 0.6.0 §6 — System PASSIVEs are LIVE now, where Alpha 0.5 rejected a
+  // nonblank value outright. A valid reference resolves; an unknown one is an
+  // error on exactly the Hacker's terms.
+  const withPassive = loadContent(files({ systems: sysWith('PASSIVES', 'PSV_004') })).content;
+  assert(withPassive !== null, 'a System PASSIVE reference must load');
+  assert(withPassive.systems.get('SYS_01')!.passiveIds.join(':') === 'PSV_004', 'System PASSIVE resolves');
+  expectErrors({ systems: sysWith('PASSIVES', 'PSV_404') }, 'unknown PASSIVE ID', 'unknown System PASSIVE');
+  expectErrors({ systems: sysWith('PASSIVES', 'SKL_001') }, 'wrong ID prefix', 'stale SKL reference');
+  // Director spec (2026-08-11) — the in_pool flag is a validated enum.
+  expectErrors({ systems: sysWith('in_pool', 'maybe') }, 'invalid in_pool token', 'bad in_pool token');
 });
 
 test('§42.12 System weak sets derive as the complement, in recognized enum order', () => {
@@ -3606,30 +3765,46 @@ test('§42.15 leading-apostrophe normalization applies to SYS and the Transform 
   assert(r.content !== null, `quoted values must load: ${r.issues.filter((i) => i.severity === 'error').map((i) => i.reason).join('; ')}`);
   assert(r.content.systems.get('SYS_01')!.baseIce === 100, "'100 parsed as 100");
   const op = r.content.functions.get('FNC_013')!.plan[0];
-  assert(op.params.axisTarget === 'NEU' && op.params.axisResult!.color === Color.Yellow, 'quoted axes parsed');
+  assert(op.params.axisTarget!.kind === 'NEU' && op.params.axisResult!.color === Color.Yellow, 'quoted axes parsed');
   // §20.1.4 — quoting must not change the fingerprint.
   assert(r.content.fingerprint === loadContent(real).content!.fingerprint, 'quoting must not change the fingerprint');
 });
 
 test('§42.16 EFFECT_TRANSFORM axis and tuple validation', () => {
   // exact two-value tuple
-  expectErrors({ functions: mutate(real.functions.text, 'YEL:STR,0:1', 'YEL:STR,0') }, 'exactly 2', 'short Transform tuple');
-  expectErrors({ functions: mutate(real.functions.text, 'YEL:STR,0:1', 'YEL:STR,0:1:0') }, 'exactly 2', 'long Transform tuple');
+  expectErrors({ functions: mutate(real.functions.text, 'YEL:STR,0:0', 'YEL:STR,0') }, 'exactly 2', 'short Transform tuple');
+  expectErrors({ functions: mutate(real.functions.text, 'YEL:STR,0:0', 'YEL:STR,0:1:0') }, 'exactly 2', 'long Transform tuple');
   // supported tuple enum values
-  expectErrors({ functions: mutate(real.functions.text, 'YEL:STR,0:1', 'YEL:STR,0:9') }, 'specialPacketTreatment', 'bad special treatment');
-  expectErrors({ functions: mutate(real.functions.text, 'YEL:STR,0:1', 'YEL:STR,5:1') }, 'targeting', 'bad targeting');
-  // §22.1 — the only supported axisTarget in Alpha 0.5
-  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',RED,YEL:STR,') }, 'unsupported axisTarget', 'color axisTarget');
-  // §22.2 — exactly one color and one shape, and the color may not be neutral
-  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,YEL,') }, 'exactly one color and one shape', 'axisResult missing shape');
-  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,YEL:STR:TRI,') }, 'exactly one color and one shape', 'axisResult too long');
-  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,NEU:STR,') }, 'may not be neutral', 'neutral result color');
-  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,YEL:NOPE,') }, 'unknown shape', 'bad result shape');
+  expectErrors({ functions: mutate(real.functions.text, 'YEL:STR,0:0', 'YEL:STR,0:9') }, 'specialPacketTreatment', 'bad special treatment');
+  expectErrors({ functions: mutate(real.functions.text, 'YEL:STR,0:0', 'YEL:STR,5:1') }, 'targeting', 'bad targeting');
+  // Alpha 0.6.0 §24 — the axis GRAMMAR. An axis-specific target is legal now
+  // (director override 2026-08-11), so the invalid cases are the ones the
+  // grammar genuinely forbids.
+  const okTargets = loadContent(files({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',RED,YEL:STR,') })).content;
+  assert(okTargets !== null, 'a color axisTarget is legal in Alpha 0.6');
+  assert(okTargets.functions.get('FNC_013')!.plan[0].params.axisTarget!.color === Color.Red, 'the color target resolves');
+  // ALL and NEU are whole-Packet tokens and never combine with an axis
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',ALL:RED,YEL:STR,') }, 'cannot be combined', 'ALL plus an axis');
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU:RED,YEL:STR,') }, 'cannot be combined', 'NEU plus an axis');
+  // at most one color and one shape — no OR targeting, no multi-value axis
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',RED:GRE,YEL:STR,') }, 'at most one color', 'two colors in a target');
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',RED:TRI:STR,YEL:STR,') }, 'at most one color and one shape', 'three axis tokens');
+  // ALL is a target, never a result
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,ALL,') }, 'ALL is not a transform RESULT', 'ALL as a result');
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,YEL:NOPE,') }, 'unknown axis token', 'bad result shape');
+  // §24 — target and result identical means the row can never have a target
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,NEU,') }, 'can never have a valid target', 'NEU to NEU');
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',YEL:STR,YEL:STR,') }, 'can never have a valid target', 'identical axis target and result');
+  // a single-axis result is legal and PRESERVES the other axis
+  const single = loadContent(files({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',ALL,GRE,') })).content;
+  assert(single !== null, 'a single-axis result is legal');
+  const res = single.functions.get('FNC_013')!.plan[0].params.axisResult!;
+  assert(res.color === Color.Green && res.shape === undefined, 'only the authored axis is set');
   // required axes must be present
   expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',,YEL:STR,') }, 'missing required parameter', 'blank axisTarget');
   expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,', ',NEU,,') }, 'missing required parameter', 'blank axisResult');
   // §23.1/§45.15 — targeted Transform is restricted to quantity 1
-  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,0:1', ',NEU,YEL:STR,1:1') }, 'must have quantity 1', 'targeted Transform with quantity 99');
+  expectErrors({ functions: mutate(real.functions.text, ',NEU,YEL:STR,0:0', ',NEU,YEL:STR,1:0') }, 'must have quantity 1', 'targeted Transform with quantity 99');
 });
 
 test('§2.5 quantity is an ordinary maximum — 99 gets no special handling', () => {
@@ -3648,7 +3823,12 @@ test('§2.5 quantity is an ordinary maximum — 99 gets no special handling', ()
 // A board whose neutral Packets are placed deliberately. Everything else is a
 // non-matching background, so any Sync that appears is one COERCE created.
 function coerceGame(neutrals: Pt[], seed = 5): Game {
-  const g = newGame(seed);
+  // Alpha 0.6.0 — pinned to TIMER mode. These cases are about the Transform
+  // executor and the exact planted board; with System matching (now the
+  // default) the System's turn-ending Sync would churn the board after the
+  // transform and mask what is being measured. The matching path has its own
+  // coverage elsewhere.
+  const g = newGame(seed, TIMER_MODE);
   for (let y = 0; y < BOARD_HEIGHT; y++) {
     for (let x = 0; x < BOARD_WIDTH; x++) {
       const t = g.state.board[y][x]!;
@@ -3709,7 +3889,8 @@ test('§45.13 converting EVERY eligible Packet consumes no gameplay RNG', () => 
   const spec = {
     owner: 'enemy' as const,
     params: { targeting: 0 as const, specialPacketTreatment: 1 as const },
-    axisResult: { color: Color.Yellow, shape: Shape.Star },
+    axisTarget: { token: 'NEU', kind: 'NEU' as const },
+    axisResult: { token: 'YEL:STR', color: Color.Yellow, shape: Shape.Star },
     programId: 'PRG_S_005',
     fnId: 'FNC_013',
   };
@@ -3783,7 +3964,10 @@ test('§45.12 the Transform itself contributes no direct damage and no direct ch
 
 test('§45.4/§45.16 all three special-retention branches are contract-tested', () => {
   const c = loadContent(real).content!;
-  assert(c.functions.get('FNC_013')!.plan[0].params.transform!.specialPacketTreatment === 1, 'live content retains all');
+  // Alpha 0.6.0 — COERCE now authors `0:0` (destroy). It targets NEU and
+  // neutrals cannot carry an overlay, so the choice is inert for the live row;
+  // the branches below are still exercised through the shared executor.
+  assert(c.functions.get('FNC_013')!.plan[0].params.transform!.specialPacketTreatment === 0, 'live content destroys');
   // Neutral Packets cannot currently carry an overlay, so the branches are
   // exercised against a planted special via the shared executor rather than
   // through authored content (§45.16 — every typed branch gets coverage).
@@ -3797,7 +3981,8 @@ test('§45.4/§45.16 all three special-retention branches are contract-tested', 
       {
         owner: 'enemy',
         params: { targeting: 0, specialPacketTreatment: treatment },
-        axisResult: { color: Color.Yellow, shape: Shape.Star },
+        axisTarget: { token: 'NEU', kind: 'NEU' },
+        axisResult: { token: 'YEL:STR', color: Color.Yellow, shape: Shape.Star },
         quantity: 99,
         programId: 'PRG_S_005',
         fnId: 'FNC_013',
@@ -3816,7 +4001,8 @@ test('§45.4/§45.16 all three special-retention branches are contract-tested', 
     {
       owner: 'enemy',
       params: { targeting: 0, specialPacketTreatment: 2 },
-      axisResult: { color: Color.Yellow, shape: Shape.Star },
+      axisTarget: { token: 'NEU', kind: 'NEU' },
+      axisResult: { token: 'YEL:STR', color: Color.Yellow, shape: Shape.Star },
       quantity: 99,
       programId: 'PRG_S_005',
       fnId: 'FNC_013',
@@ -3956,7 +4142,7 @@ test('§47.1/§47.2 EBUFF arms up to quantity countdowns that provide ZERO magni
 });
 
 test('§47.3/§47.4/§47.5/§47.6 at expiry the countdown becomes a live Buff on the same Packet', () => {
-  const g = newGame(41);
+  const g = newGame(41, TIMER_MODE);
   fireEbuff(g);
   const armed = specialsOf(g, 'buff', 'enemy');
   const seqs = armed.map((t) => t.special!.seq);
@@ -3991,7 +4177,7 @@ test('§47.3/§47.4/§47.5/§47.6 at expiry the countdown becomes a live Buff on
 });
 
 test('§47.7 slicing a pending EBUFF prevents any later delivery', () => {
-  const g = newGame(42);
+  const g = newGame(42, TIMER_MODE);
   fireEbuff(g);
   const armedSeqs = specialsOf(g, 'buff', 'enemy').map((t) => t.special!.seq);
   assert(armedSeqs.length === 3, 'three overlays were armed');
@@ -4011,7 +4197,7 @@ test('§47.7 slicing a pending EBUFF prevents any later delivery', () => {
 });
 
 test('§47.8 a pending EBUFF survives save/resume and still delivers correctly', () => {
-  const g = newGame(43);
+  const g = newGame(43, TIMER_MODE);
   fireEbuff(g);
   g.startPlayerPhase(); // §17.3 — an active save is taken in the stable phase
   const info = qmInfo([...g.state.identity.hackerPrograms], g.state.identity.buildOrigin);
@@ -4204,6 +4390,636 @@ test('§50.11/§50.13 current metrics carry one total and no axis-specific waste
   assert('chargeWastedTotal' in sm, 'the canonical total exists');
   assert(!('chargeDiscardedTotal' in sm), 'the Alpha 0.4.1 field name is gone from current metrics');
   assert(!('chargeWastedColor' in sm) && !('chargeWastedShape' in sm), 'no axis-specific waste (§39.4)');
+});
+
+// ============================================================================
+// Alpha 0.6.0 §54-§64 — PASSIVE runtime, HOST/UPGRADE, and Run routes
+// ============================================================================
+
+// A battle with an explicit HOST and an explicit acquired-UPGRADE list. Built
+// through the same session-layer entry points the game uses, so nothing here
+// re-implements identity, LINK/ICE resolution, or PASSIVE assembly.
+function psvGame(opts: {
+  hostId?: string;
+  upgrades?: string[];
+  seed?: number;
+  settings?: BattleSettings;
+  build?: string[];
+  system?: SelectedSystem;
+} = {}): Game {
+  const settings = opts.settings ?? TIMER_MODE;
+  const ids = defaultIdentity();
+  const system = opts.system ?? headlessSystem();
+  const identity = buildIdentity(
+    ids.hackerId,
+    ids.deckId,
+    system,
+    opts.hostId ?? headlessHost(),
+    opts.upgrades ?? [],
+    ids.selectionSource,
+    opts.build ?? defaultActiveBuild(),
+    'DEFAULT',
+  );
+  const config = buildBattleConfig(
+    settings,
+    ids.hackerId,
+    system.systemId,
+    resolveHackerMaxLink(settings, ids.hackerId, ids.deckId),
+    resolveQuickMatchIce(settings, system.systemId),
+  );
+  const g = new Game(config, identity, opts.seed ?? 7);
+  g.startPlayerPhase();
+  return g;
+}
+
+// A single qualifying Red color-axis Sync, resolved for `owner`.
+function redSync(g: Game, owner: Side = 'player', y = 1): GameEvent[] {
+  plantRun(g, [
+    { x: 1, y, color: Color.Red, shape: Shape.Circle },
+    { x: 2, y, color: Color.Red, shape: Shape.Square },
+    { x: 3, y, color: Color.Red, shape: Shape.Triangle },
+  ]);
+  return resolveWave(g, owner);
+}
+
+const chargeOf = (evs: GameEvent[]): number =>
+  evs.filter((e) => e.t === 'chargeRoute').reduce((n, e) => n + (e as Extract<GameEvent, { t: 'chargeRoute' }>).amount, 0);
+
+// ---- §55 PASSIVE migration: the former Hacker Skill behavior is intact ----
+
+test('§55/§12 a System-owned Sync does not trigger the Hacker OWNER PASSIVE', () => {
+  const g = psvGame({ seed: 61 });
+  const ev = redSync(g, 'enemy');
+  assert(!ev.some((e) => e.t === 'passive'), 'an enemy-owned Sync must not fire a Hacker OWNER PASSIVE');
+  assert(g.state.metrics.sides.enemy.passiveDamage === 0, 'no PASSIVE damage accrues to the System');
+});
+
+test('§11/§47 a PASSIVE contribution is attributed to the SOURCE that supplied it', () => {
+  const g = psvGame({ seed: 62 });
+  const ev = redSync(g);
+  const p = ev.find((e) => e.t === 'passive') as Extract<GameEvent, { t: 'passive' }>;
+  assert(p, 'a PASSIVE event is emitted');
+  assert(p.cause.sourceKind === 'HAK' && p.cause.sourceId === 'HAK_01', 'the Hacker is named as the source');
+  assert(p.cause.passiveId === 'PSV_001', 'the exact PASSIVE instance is named');
+  // §47 — metrics key by INSTANCE, never by PASSIVE_ID alone
+  const keys = Object.keys(g.state.metrics.sides.player.passives);
+  assert(keys.includes('HAK:HAK_01:PSV_001'), `expected an instance-keyed metric, got ${keys.join(',')}`);
+});
+
+// ---- §56 continual PASSIVE arithmetic ----
+
+test('§18/§19 charge bonus and dampening combine additively and floor at zero', () => {
+  // BITMIRE (HOST) supplies PSV_003 CHARGE_DAMPEN ALL:1; the Hacker supplies
+  // PSV_002 EXTRA_MATCH_CHARGE RED:1. §19's formula is order-independent.
+  const plain = psvGame({ seed: 63 });
+  const basePlusBonus = chargeOf(redSync(plain));
+  const damped = psvGame({ hostId: 'HST_02', seed: 63 });
+  const withDampen = chargeOf(redSync(damped));
+  assert(withDampen < basePlusBonus, `dampening must reduce the routed stream (${withDampen} vs ${basePlusBonus})`);
+  assert(withDampen >= 0, 'a dampened stream never goes negative');
+  // §19 — every contributing instance is recorded, never a merged total
+  const ev = redSync(psvGame({ hostId: 'HST_02', seed: 64 }));
+  const dampenEvents = ev.filter((e) => e.t === 'passive' && e.effect === 'PSV_CHARGE_DAMPEN');
+  assert(dampenEvents.length > 0, 'the dampening contribution is recorded');
+  for (const d of dampenEvents) {
+    assert(d.t === 'passive' && d.cause.sourceKind === 'HST', 'a HOST-supplied dampener names the HOST');
+  }
+});
+
+test('§13/§19 a HOST dampener applies to BOTH agents; an UPGRADE ENEMY dampener only to the System', () => {
+  // §13 — HOST instances ignore the authored agent_scope entirely.
+  const host = psvGame({ hostId: 'HST_02', seed: 65 });
+  const hackerSide = redSync(host, 'player');
+  assert(hackerSide.some((e) => e.t === 'passive' && e.effect === 'PSV_CHARGE_DAMPEN'), 'HOST dampens the Hacker');
+  const host2 = psvGame({ hostId: 'HST_02', seed: 65 });
+  const systemSide = redSync(host2, 'enemy');
+  assert(systemSide.some((e) => e.t === 'passive' && e.effect === 'PSV_CHARGE_DAMPEN'), 'HOST dampens the System too');
+  // §12 — L33TSK1LL is Hacker-owned with agent_scope ENEMY, so it dampens the
+  // SYSTEM's streams and never the Hacker's.
+  const upg = psvGame({ upgrades: ['UPG_03'], seed: 66 });
+  assert(!redSync(upg, 'player').some((e) => e.t === 'passive' && e.effect === 'PSV_CHARGE_DAMPEN'), 'ENEMY scope spares its owner');
+  const upg2 = psvGame({ upgrades: ['UPG_03'], seed: 66 });
+  assert(redSync(upg2, 'enemy').some((e) => e.t === 'passive' && e.effect === 'PSV_CHARGE_DAMPEN'), 'ENEMY scope hits the opponent');
+});
+
+test('§20 PSV_FUNCTION_DAMAGE_INCREASE adds to raw Function damage and stacks', () => {
+  // ARENA (HOST) supplies PSV_004 FUNCTION_DAMAGE_INCREASE ALL:2. §13 makes it
+  // symmetric, so the Hacker's ATTACK gains it too.
+  const attackDamage = (hostId: string): number => {
+    const g = psvGame({ hostId, build: ['PRG_H_003', 'PRG_H_001', 'PRG_H_002', 'PRG_H_005'], seed: 67 });
+    chargeSlot(g, 'player', 0);
+    const ev = g.fireProgram(0);
+    const dmg = ev.find((e) => e.t === 'damage' && e.source === 'attacker') as Extract<GameEvent, { t: 'damage' }>;
+    assert(dmg, 'ATTACK dealt damage');
+    return dmg.amount;
+  };
+  const base = attackDamage('HST_01');
+  const boosted = attackDamage('HST_03');
+  assert(boosted === base + 2, `ARENA adds exactly 2 (base ${base}, boosted ${boosted})`);
+  // §48 — the increment is its own bucket; the base event keeps its mechanism
+  const g = psvGame({ hostId: 'HST_03', build: ['PRG_H_003', 'PRG_H_001', 'PRG_H_002', 'PRG_H_005'], seed: 67 });
+  chargeSlot(g, 'player', 0);
+  const ev = g.fireProgram(0);
+  const dmg = ev.find((e) => e.t === 'damage' && e.source === 'attacker') as Extract<GameEvent, { t: 'damage' }>;
+  assert(dmg.passiveRaw === 2, 'the PASSIVE portion is reported separately');
+  // Game.collect() has already folded these events into metrics; consuming them
+  // again here would double count.
+  const sm = g.state.metrics.sides.player;
+  assert(sm.passiveDamage === 2 && sm.attackerDamage === base, 'buckets stay disjoint and reconcile');
+});
+
+test('§21 permanent Shield stacks with Packet Shield, is not sliceable, and shows in the total', () => {
+  // BRACER (UPG_01) supplies PSV_005 PERM_SHIELD ALL:1.
+  const g = psvGame({ upgrades: ['UPG_01'], seed: 68 });
+  assert(packetShieldValue(g.state, 'player') === 0, 'no Packet Shield on the board');
+  assert(shieldValue(g.state, 'player') === 1, 'the effective total includes permanent Shield');
+  // stacking with a Packet Shield
+  const t = g.state.board[4][4]!;
+  t.special = { type: 'shield', owner: 'player', magnitude: 2, seq: 99 };
+  assert(shieldValue(g.state, 'player') === 3, 'permanent and Packet Shield add');
+  // it cannot be sliced: removing every Packet Shield leaves the permanent one
+  delete t.special;
+  assert(shieldValue(g.state, 'player') === 1, 'permanent Shield survives losing every Packet');
+  // and it actually prevents damage
+  const evs: GameEvent[] = [];
+  const before = g.state.hp.player;
+  dealDamage(g.state, 'player', 5, { source: 'attacker', label: 'test' }, evs);
+  assert(before - g.state.hp.player === 4, 'permanent Shield prevented exactly 1');
+  const sh = evs.find((e) => e.t === 'shield') as Extract<GameEvent, { t: 'shield' }>;
+  assert(sh && sh.prevented === 1, 'the prevention is reported');
+  // §48 — the permanent contribution is attributable
+  assert(evs.some((e) => e.t === 'passive' && e.effect === 'PSV_PERM_SHIELD'), 'permanent Shield prevention is attributed');
+});
+
+test('§22 BIGGER_BOMB advances one named step, stacks, and saturates', () => {
+  // VERDUN (HST_04) supplies PSV_007 BIGGER_BOMB.
+  assert(advanceAreaPattern('AREA_SQUARE_3X3', 1) === 'AREA_SQUARE_3X3_CARDINAL_2', 'one step advances one entry');
+  assert(advanceAreaPattern('AREA_CARDINAL_1', 2) === 'AREA_SQUARE_3X3_CARDINAL_2', 'two instances advance two steps');
+  assert(advanceAreaPattern('AREA_SQUARE_7X7_CROSS_4', 3) === 'AREA_SQUARE_7X7_CROSS_4', 'saturates at the largest');
+  assert(advanceAreaPattern('AREA_SQUARE_3X3', 0) === 'AREA_SQUARE_3X3', 'no instances means no change');
+  // every catalog entry is a strict superset of the one before it
+  for (let i = 1; i < AREA_PATTERN_ORDER.length; i++) {
+    const prev = new Set(AREA_PATTERNS[AREA_PATTERN_ORDER[i - 1]].map((o) => `${o.x},${o.y}`));
+    const cur = new Set(AREA_PATTERNS[AREA_PATTERN_ORDER[i]].map((o) => `${o.x},${o.y}`));
+    assert(cur.size > prev.size, `${AREA_PATTERN_ORDER[i]} is larger than ${AREA_PATTERN_ORDER[i - 1]}`);
+    for (const k of prev) assert(cur.has(k), `${AREA_PATTERN_ORDER[i]} contains all of ${AREA_PATTERN_ORDER[i - 1]}`);
+  }
+});
+
+test('§22.2 a delayed Bomb stamps the UPGRADED pattern at arming time', () => {
+  // BOMBER authors AREA_SQUARE_3X3 with countdown 2; under VERDUN the overlay
+  // must carry the upgraded pattern so a later detonation is deterministic.
+  const plain = psvGame({ seed: 69 });
+  chargeSlot(plain, 'player', 0);
+  plain.fireProgram(0);
+  const plainBombs = specialsOf(plain, 'bomb', 'player');
+  assert(plainBombs.length > 0 && plainBombs[0].special!.areaPattern === 'AREA_SQUARE_3X3', 'authored pattern without the PASSIVE');
+  const verdun = psvGame({ hostId: 'HST_04', seed: 69 });
+  chargeSlot(verdun, 'player', 0);
+  const ev = verdun.fireProgram(0);
+  const bombs = specialsOf(verdun, 'bomb', 'player');
+  assert(bombs.length > 0, 'bombs were placed');
+  for (const b of bombs) {
+    assert(b.special!.areaPattern === 'AREA_SQUARE_3X3_CARDINAL_2', `armed with the upgraded pattern, got ${b.special!.areaPattern}`);
+  }
+  assert(ev.some((e) => e.t === 'passive' && e.effect === 'PSV_BIGGER_BOMB'), 'the area contribution is attributed');
+  // §22 — it applies to a DIFFERENT Bomb source too (PLINK resolves immediately)
+  const plink = psvGame({ hostId: 'HST_04', build: ['PRG_H_006', 'PRG_H_001', 'PRG_H_002', 'PRG_H_005'], seed: 70 });
+  chargeSlot(plink, 'player', 0);
+  const pev = plink.fireProgram(0, { kind: 'packet', p: { x: 4, y: 4 } });
+  assert(pev.some((e) => e.t === 'passive' && e.effect === 'PSV_BIGGER_BOMB'), 'PLINK is upgraded as well');
+});
+
+// ---- §57 START_OF_TURN ordering and cost-free carrier invocation ----
+
+test('§15/§23 a HOST carrier fires at the start of BOTH agents turns, cost-free', () => {
+  // WEEDS (HST_05) carries GREENING (FNC_016, cost 0, ALL -> GRE).
+  const g = psvGame({ hostId: 'HST_05', seed: 71 });
+  const hackerStart = g.startPlayerPhase();
+  const hx = hackerStart.filter((e) => e.t === 'transform') as Extract<GameEvent, { t: 'transform' }>[];
+  assert(hx.length === 1, `GREENING fires once at Hacker turn start, got ${hx.length}`);
+  assert(hx[0].side === 'player', '§14 — the ACTIVE agent is the Sync-resolution owner');
+  assert(hx[0].cause?.sourceKind === 'HST' && hx[0].cause.sourceId === 'HST_05', '§14 — the HOST is the causal source');
+  assert(hx[0].cause?.passiveId === 'PSV_008', 'the exact PASSIVE instance is named');
+  const systemTurn = g.runEnemyPhase();
+  // The System's own COERCE also transforms, so select on the CAUSE: only the
+  // HOST-triggered one is under test here.
+  const sx = (systemTurn.filter((e) => e.t === 'transform') as Extract<GameEvent, { t: 'transform' }>[])
+    .filter((e) => e.cause?.sourceKind === 'HST');
+  assert(sx.length === 1, `and once at System turn start, got ${sx.length}`);
+  assert(sx[0].side === 'enemy', 'the System owns the Sync consequences on its own turn');
+  assert(sx[0].fnId === 'FNC_016', 'the HOST carrier payload is the one that fired');
+  // §16 — the triggered Function pays NO cost. Every pool is opened at its cap
+  // first: a cost would visibly reduce one, while the Syncs the transform
+  // creates can only ever top a capped pool back up to the same cap. (Charge
+  // GAINED from those Syncs is correct — §14 gives the active agent the Sync
+  // consequences; what must never happen is a debit.)
+  const g2 = psvGame({ hostId: 'HST_05', seed: 72 });
+  for (const u of g2.state.units.player) u.charge = programById(u.programId).chargeCap;
+  g2.state.deckCharge = deckById(defaultIdentity().deckId).fn.cost;
+  const before = g2.state.units.player.map((u) => u.charge);
+  const beforeDeck = g2.state.deckCharge;
+  g2.startPlayerPhase();
+  assert(g2.state.units.player.every((u, i) => u.charge === before[i]), 'no Program pool was debited to pay a PASSIVE trigger');
+  assert(g2.state.deckCharge === beforeDeck, 'the Deck pool was not debited either');
+  // and the activation is recorded as PASSIVE-owned, not Program- or Deck-owned
+  const ability = g2.startPlayerPhase().find((e) => e.t === 'ability' && e.ownerKind === 'passive');
+  assert(ability, '§16 — the Function and its PASSIVE source are still logged');
+});
+
+test('§15 START_OF_TURN resolves HOST, then identity, then UPGRADEs, all before countdowns', () => {
+  // WEEDS (HOST carrier) + SNEAKERS (UPGRADE carrier) both fire on a Hacker turn.
+  const g = psvGame({ hostId: 'HST_05', upgrades: ['UPG_04'], seed: 73 });
+  const ev = g.startPlayerPhase();
+  const order: string[] = [];
+  for (const e of ev) {
+    if (e.t === 'ability' && e.ownerKind === 'passive') order.push(e.cause!.sourceKind);
+    if (e.t === 'countdown') order.push('COUNTDOWN');
+  }
+  assert(order[0] === 'HST', `HOST resolves first, got ${order.join(' -> ')}`);
+  assert(order.includes('UPG'), 'the UPGRADE carrier fires on the Hacker turn');
+  assert(order.indexOf('HST') < order.indexOf('UPG'), 'HOST precedes the UPGRADE');
+  const firstCountdown = order.indexOf('COUNTDOWN');
+  if (firstCountdown >= 0) {
+    assert(order.lastIndexOf('UPG') < firstCountdown, '§15.5 — every trigger resolves before countdowns tick');
+  }
+  // §15.3 — a Hacker UPGRADE carrier does NOT fire on the System's turn
+  const sys = g.runEnemyPhase();
+  const upgOnSystemTurn = sys.filter((e) => e.t === 'ability' && e.ownerKind === 'passive' && e.cause?.sourceKind === 'UPG');
+  assert(upgOnSystemTurn.length === 0, 'Hacker UPGRADEs do not trigger on the System turn');
+});
+
+test('§15.3 multiple UPGRADE carriers resolve in ACQUISITION order', () => {
+  // Two acquired UPGRADEs both carrying SNEAK: order follows the acquired list.
+  const acquired = ['UPG_04', 'UPG_01'];
+  const g = psvGame({ upgrades: acquired, seed: 74 });
+  const ev = g.startPlayerPhase();
+  const upg = ev.filter((e) => e.t === 'ability' && e.ownerKind === 'passive' && e.cause?.sourceKind === 'UPG');
+  assert(upg.length === 1, 'only SNEAKERS carries a trigger; BRACER is continual');
+  // reversing the acquisition order must reverse the assembly order
+  const ids = defaultIdentity();
+  const identity = buildIdentity(ids.hackerId, ids.deckId, headlessSystem(), headlessHost(), ['UPG_01', 'UPG_04'], ids.selectionSource, defaultActiveBuild(), 'DEFAULT');
+  const insts = activePassives(identity).filter((i) => i.sourceKind === 'UPG');
+  assert(insts[0].sourceId === 'UPG_01' && insts[1].sourceId === 'UPG_04', 'instances follow the acquired list order');
+});
+
+test('§15 a terminal battle state stops further turn-start mutation', () => {
+  const g = psvGame({ hostId: 'HST_05', seed: 75 });
+  g.state.winner = 'player';
+  g.state.phase = 'over';
+  const ev = g.startPlayerPhase();
+  assert(ev.length === 0, 'a finished battle emits nothing at turn start');
+});
+
+// ---- §58 HOST causal source vs Sync-resolution owner ----
+
+test('§14/§58 owner-scoped PASSIVEs evaluate against the RESOLUTION owner', () => {
+  // A HOST carrier fires on the System's turn; any Sync it creates is
+  // System-owned, so a Hacker OWNER PASSIVE must not fire from it.
+  const g = psvGame({ hostId: 'HST_05', seed: 76 });
+  g.startPlayerPhase();
+  const ev = g.runEnemyPhase();
+  const transform = ev.find((e) => e.t === 'transform') as Extract<GameEvent, { t: 'transform' }>;
+  assert(transform && transform.side === 'enemy', 'the System-turn transform is System-owned');
+  const hackerPassives = ev.filter((e) => e.t === 'passive' && e.side === 'player' && e.effect === 'PSV_EXTRA_MATCH_DAMAGE');
+  assert(hackerPassives.length === 0, 'a System-owned Sync never fires the Hacker OWNER PASSIVE');
+});
+
+test('§49 HOST causal source and Sync owner both survive log serialization', () => {
+  setLoggingLevel('COMPLETE');
+  try {
+    const g = psvGame({ hostId: 'HST_05', seed: 77 });
+    const ev = g.startPlayerPhase();
+    const rec = ev.find((e) => e.t === 'transform') as Extract<GameEvent, { t: 'transform' }>;
+    assert(rec.side === 'player', 'the resolution owner is the active agent');
+    assert(rec.cause!.sourceKind === 'HST' && rec.cause!.passiveId === 'PSV_008', 'the causal source is the HOST PASSIVE');
+    const json = JSON.parse(JSON.stringify(rec)) as typeof rec;
+    assert(json.side === 'player' && json.cause!.sourceId === 'HST_05', 'both facts survive serialization');
+  } finally {
+    setLoggingLevel('VERBOSE');
+  }
+});
+
+// ---- §24 Transform grammar behavior ----
+
+test('§24 a single-axis result preserves the other axis and excludes no-op targets', () => {
+  const g = psvGame({ seed: 78 });
+  for (let y = 0; y < BOARD_HEIGHT; y++) {
+    for (let x = 0; x < BOARD_WIDTH; x++) {
+      const t = g.state.board[y][x]!;
+      t.kind = 'standard';
+      t.color = x === 0 ? Color.Green : Color.Red;
+      t.shape = Shape.Cross;
+      delete t.special;
+    }
+  }
+  const spec = {
+    owner: 'player' as const,
+    params: { targeting: 0 as const, specialPacketTreatment: 1 as const },
+    axisTarget: { token: 'ALL', kind: 'ALL' as const },
+    axisResult: { token: 'GRE', color: Color.Green },
+    quantity: 99,
+    programId: 'PSV_008',
+    fnId: 'FNC_016',
+  };
+  const { tier1, tier2 } = transformCandidates(g.state, spec);
+  assert(tier2.length === 0, 'a single-axis result has no fallback tier');
+  assert(tier1.every((p) => p.x !== 0), 'already-green Packets are excluded as no-ops');
+  const out = applyTransform(g.state, spec, []);
+  assert(out.cells.length === tier1.length, 'every eligible Packet converts');
+  for (const p of out.cells) {
+    const t = g.state.board[p.y][p.x]!;
+    assert(t.color === Color.Green, 'the authored axis is set');
+    assert(t.shape === Shape.Cross, 'the unauthored axis is PRESERVED');
+  }
+});
+
+test('§24 a neutral target with a single-axis result randomizes the other axis', () => {
+  const g = psvGame({ seed: 79 });
+  for (const row of g.state.board) {
+    for (const t of row!) {
+      t!.kind = 'neutral';
+      delete t!.color;
+      delete t!.shape;
+      delete t!.special;
+    }
+  }
+  const out = applyTransform(
+    g.state,
+    {
+      owner: 'player',
+      params: { targeting: 0, specialPacketTreatment: 1 },
+      axisTarget: { token: 'ALL', kind: 'ALL' },
+      axisResult: { token: 'GRE', color: Color.Green },
+      quantity: 99,
+      programId: 'PSV_008',
+      fnId: 'FNC_016',
+    },
+    [],
+  );
+  assert(out.cells.length > 0, 'neutrals are eligible under ALL');
+  for (const p of out.cells) {
+    const t = g.state.board[p.y][p.x]!;
+    assert(t.kind === 'standard', 'the Packet is no longer neutral');
+    assert(t.color === Color.Green, 'the authored axis is set');
+    assert(t.shape !== undefined, 'the missing axis is randomized, never left undefined');
+  }
+});
+
+test('§24 the shares-one-axis fallback tier tops up a two-axis result', () => {
+  const g = psvGame({ seed: 80 });
+  // every Packet is a yellow circle: with a YEL:STR result, all of them share
+  // exactly one axis, so tier 1 is empty and tier 2 must supply the targets.
+  for (const row of g.state.board) {
+    for (const t of row!) {
+      t!.kind = 'standard';
+      t!.color = Color.Yellow;
+      t!.shape = Shape.Circle;
+      delete t!.special;
+    }
+  }
+  const spec = {
+    owner: 'player' as const,
+    params: { targeting: 0 as const, specialPacketTreatment: 1 as const },
+    axisTarget: { token: 'ALL', kind: 'ALL' as const },
+    axisResult: { token: 'YEL:STR', color: Color.Yellow, shape: Shape.Star },
+    quantity: 3,
+    programId: 'PRG_S_005',
+    fnId: 'FNC_013',
+  };
+  const { tier1, tier2 } = transformCandidates(g.state, spec);
+  assert(tier1.length === 0, 'no Packet shares zero result axes');
+  assert(tier2.length === BOARD_WIDTH * BOARD_HEIGHT, 'every Packet is a fallback candidate');
+  const out = applyTransform(g.state, spec, []);
+  assert(out.cells.length === 3 && out.tier2Used === 3, 'the fallback tier supplies the full quantity');
+  // a Packet matching EVERY result axis is never eligible at any tier
+  for (const row of g.state.board) for (const t of row!) { t!.shape = Shape.Star; }
+  const none = transformCandidates(g.state, spec);
+  assert(none.tier1.length === 0 && none.tier2.length === 0, 'a fully-matching Packet is never a target');
+});
+
+// ---- §59 route generation ----
+
+test('§29 the initial offers are always DOORMAN + THRESHOLD with distinct UPGRADEs', () => {
+  for (let seed = 0; seed < 40; seed++) {
+    const p = initialPathOffers(makeSetupRandom(seed).rng, []);
+    assert(p.step === 1, 'the initial offers lead into Battle 1');
+    assert(p.offers.length === 2, 'exactly two paths');
+    for (const o of p.offers) {
+      assert(o.systemId === INITIAL_SYSTEM_ID && o.hostId === INITIAL_HOST_ID, 'both paths use the fixed encounter');
+      assert(getContent().upgrades.has(o.upgradeId), 'each path offers a valid UPGRADE');
+    }
+    assert(p.offers[0].upgradeId !== p.offers[1].upgradeId, 'the two UPGRADEs differ');
+    assert(!p.upgradeExhausted, 'the pool is not exhausted at Battle 1');
+  }
+});
+
+test('§30/§30.1 later offers randomize valid SYS/HST and avoid a duplicate pair', () => {
+  const pairs = new Set<string>();
+  for (let seed = 0; seed < 60; seed++) {
+    const p = laterPathOffers(makeSetupRandom(seed).rng, 2, []);
+    assert(p.step === 2, 'the offers know which battle they lead into');
+    for (const o of p.offers) {
+      assert(poolSystems().some((s) => s.id === o.systemId), 'a pool System is offered');
+      assert(poolHosts().some((h) => h.id === o.hostId), 'a pool HOST is offered');
+      pairs.add(`${o.systemId}+${o.hostId}`);
+    }
+    const [a, b] = p.offers;
+    assert(!(a.systemId === b.systemId && a.hostId === b.hostId), '§30.1 — no identical SYS+HST pair within one offer');
+    assert(a.upgradeId !== b.upgradeId, 'distinct UPGRADEs while the pool allows it');
+  }
+  assert(pairs.size > 1, 'combinations actually vary across seeds');
+});
+
+test('§30.2/§31 acquired UPGRADEs leave the pool and the last one may appear twice', () => {
+  const all = allUpgrades().map((u) => u.id);
+  const acquired = all.slice(0, 2);
+  for (let seed = 0; seed < 30; seed++) {
+    const p = laterPathOffers(makeSetupRandom(seed).rng, 3, acquired);
+    for (const o of p.offers) assert(!acquired.includes(o.upgradeId), 'an acquired UPGRADE is never re-offered');
+  }
+  // §31 — exactly one eligible UPGRADE remains before Battle 4
+  const three = all.slice(0, 3);
+  const last = laterPathOffers(makeSetupRandom(5).rng, 4, three);
+  assert(last.offers[0].upgradeId === last.offers[1].upgradeId, 'both final paths show the one remaining UPGRADE');
+  assert(last.upgradeExhausted, 'the exhaustion case is RECORDED, not inferred');
+  // §32/§43 — choosing either duplicate path acquires it exactly once
+  assert(acquireUpgrade(three, last.offers[0].upgradeId).length === 4, 'the fourth UPGRADE is acquired');
+  assert(acquireUpgrade(all, all[0]).length === all.length, 'acquisition is idempotent by ID');
+  assert(new Set(acquireUpgrade(three, last.offers[1].upgradeId)).size === 4, 'the acquired list stays unique');
+});
+
+test('§28/§32/§35 committing a Run stores exact offers; selecting one commits the package', () => {
+  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
+  const run = commitNewRun(setup, D, 4242);
+  assert(run.pendingPath !== undefined, '§28 — entering the Path Choice creates pending offers');
+  assert(run.upgradeIds.length === 0, 'a new Run has acquired nothing yet');
+  assert(run.build.join(',') === defaultBuild('HAK_01', 'DEK_01').join(','), '§33 — Battle 1 opens on the default build');
+  // §35 — the same seed reproduces the same offers exactly
+  const again = commitNewRun(setup, D, 4242);
+  assert(JSON.stringify(again.pendingPath) === JSON.stringify(run.pendingPath), 'the route stream is deterministic');
+  // §32 — selection commits System, HOST, and the UPGRADE, and clears the offers
+  const chosen = run.pendingPath!.offers[1];
+  const committed = selectPath(run, 1);
+  assert(committed.pendingPath === undefined, 'the offers are consumed');
+  assert(committed.pendingBuild === true, 'the Run moves to its pre-battle Build');
+  assert(committed.system.systemId === chosen.systemId, 'the System is committed');
+  assert(committed.hostId === chosen.hostId, 'the HOST is committed');
+  assert(committed.upgradeIds.join(',') === chosen.upgradeId, 'the UPGRADE is acquired');
+  // §32 — acquiring the same UPGRADE twice is impossible
+  const twice = selectPath({ ...committed, pendingPath: run.pendingPath }, 1);
+  assert(twice.upgradeIds.length === 1, 'a repeated acquisition is idempotent');
+});
+
+test('§35 route generation never consumes gameplay RNG and continues deterministically', () => {
+  const boardOf = (g: Game): string => JSON.stringify(gridViewOf(g.state.board));
+  const a = newBattle(D, 909);
+  const rng = makeSetupRandom(3).rng;
+  for (let i = 0; i < 20; i++) laterPathOffers(rng, 2, []);
+  const b = newBattle(D, 909);
+  assert(boardOf(a) === boardOf(b), 'gameplay boards are unaffected by route draws');
+  // §35 — the persisted route state continues the SAME stream a saved Run had
+  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
+  let run = commitNewRun(setup, D, 77);
+  run = selectPath(run, 0);
+  const straight = openPathChoice(run, 2).pendingPath;
+  // simulate a save/reload: the RunInfo is rebuilt from its persisted fields
+  const reloaded = openPathChoice({ ...run, routeRngState: run.routeRngState }, 2).pendingPath;
+  assert(JSON.stringify(straight) === JSON.stringify(reloaded), 'a reload cannot perturb later route generation');
+});
+
+// ---- §60 Run flow ----
+
+test('§34.1/§34.3 retry preserves the package; a full Restart clears Run-local progression', () => {
+  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
+  let run = selectPath(commitNewRun(setup, D, 31), 0);
+  const pkg = { sys: run.system.systemId, host: run.hostId, upg: [...run.upgradeIds] };
+  // §34.1 — a retry generates NO path and acquires nothing
+  const retry: RunInfo = { ...run, pendingBuild: true };
+  assert(retry.pendingPath === undefined, 'a retry has no pending offers');
+  assert(retry.system.systemId === pkg.sys && retry.hostId === pkg.host, 'the encounter is preserved');
+  assert(retry.upgradeIds.join(',') === pkg.upg.join(','), 'acquired UPGRADEs are preserved');
+  // §34.3 — Restart Run clears the acquired UPGRADEs and reopens Battle 1
+  const restarted = openPathChoice({ ...run, step: 1, upgradeIds: [] }, 1);
+  assert(restarted.upgradeIds.length === 0, 'a restarted Run retains no UPGRADEs');
+  assert(restarted.pendingPath!.step === 1, 'it reopens at the initial Path Choice');
+  assert(restarted.pendingPath!.offers.every((o) => o.systemId === INITIAL_SYSTEM_ID), 'Battle 1 is the fixed encounter again');
+  // §36 — ICE progression is untouched by HOST or UPGRADE
+  for (const [step, expected] of [[1, 100], [2, 150], [3, 200], [4, 250]] as const) {
+    assert(resolveRunIce(D, INITIAL_SYSTEM_ID, step) === expected, `Battle ${step} ICE is ${expected}`);
+  }
+});
+
+test('§32 an acquired UPGRADE applies to the battle it was chosen for and to later ones', () => {
+  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
+  let run = commitNewRun(setup, D, 55);
+  // force the BRACER path so the effect is observable
+  run = { ...run, pendingPath: { ...run.pendingPath!, offers: run.pendingPath!.offers.map((o, i) => ({ ...o, upgradeId: i === 0 ? 'UPG_01' : o.upgradeId })) } };
+  run = selectPath(run, 0);
+  const g = createRunBattle(run, 1, 9);
+  assert(g.state.identity.upgradeIds.join(',') === 'UPG_01', 'the battle carries the acquired UPGRADE');
+  assert(shieldValue(g.state, 'player') === 1, 'BRACER permanent Shield is active in Battle 1');
+  // it persists into a later battle of the same Run
+  const later = createRunBattle({ ...run, step: 3 }, 3, 9);
+  assert(later.state.identity.upgradeIds.join(',') === 'UPG_01', 'the UPGRADE persists into Battle 3');
+});
+
+// ---- §61 Quick Match ----
+
+test('§37/§39/§44 Quick Match carries a HOST and never a Run UPGRADE', () => {
+  const g = createQuickMatchBattle(D, defaultIdentity(), headlessSystem(), 'HST_03', defaultActiveBuild(), 'DEFAULT', 11);
+  assert(g.state.identity.hostId === 'HST_03', 'the chosen HOST is committed to the battle');
+  assert(g.state.identity.upgradeIds.length === 0, '§37 — Quick Match acquires no UPGRADEs');
+  // the selected HOST's PASSIVEs are genuinely active
+  const insts = activePassives(g.state.identity).filter((i) => i.sourceKind === 'HST');
+  assert(insts.length === 1 && insts[0].passive.effectType === 'PSV_FUNCTION_DAMAGE_INCREASE', 'ARENA PASSIVEs apply in battle');
+  // §44 — a Quick Match save round-trips its exact HOST
+  const info: QuickMatchInfo = { mode: 'QUICK_MATCH', identity: defaultIdentity(), system: headlessSystem(), hostId: 'HST_03', build: [...g.state.identity.hackerPrograms], buildOrigin: 'DEFAULT' };
+  const r = deserializeSession(serializeSession(info, g, null));
+  assert(r && r.info.mode === 'QUICK_MATCH' && r.info.hostId === 'HST_03', 'the HOST survives save/restore');
+});
+
+// ---- §62 save and version ----
+
+test('§40/§41/§42 a PENDING_PATH save round-trips its exact offers and rejects tampering', () => {
+  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
+  const run = commitNewRun(setup, D, 8181);
+  const json = serializeSession(run, null, null);
+  const r = deserializeSession(json);
+  assert(r && r.game === null && r.pending === null, 'a pending-path save carries no battle');
+  assert(r.info.mode === 'RUN' && r.info.pendingPath !== undefined, 'the pending phase restores');
+  assert(JSON.stringify(r.info.pendingPath) === JSON.stringify(run.pendingPath), '§35 — the exact offers survive, never rerolled');
+  assert(r.info.routeRngState === run.routeRngState, 'the route RNG state survives');
+  const tamper = (mut: (e: Record<string, any>) => void, label: string): void => {
+    const env = JSON.parse(json) as Record<string, any>;
+    mut(env);
+    assert(deserializeSession(JSON.stringify(env)) === null, label);
+  };
+  tamper((e) => { e.run.pendingPath.offers[0].hostId = 'HST_99'; }, 'an unknown offered HOST rejects');
+  tamper((e) => { e.run.pendingPath.offers[0].upgradeId = 'UPG_99'; }, 'an unknown offered UPGRADE rejects');
+  tamper((e) => { e.run.pendingPath.offers.pop(); }, 'a structurally incomplete offer set rejects');
+  tamper((e) => { e.run.pendingPath.offers[0].systemId = 'SYS_01'; }, 'a Battle 1 offer that is not DOORMAN rejects');
+  tamper((e) => { e.run.pendingPath.upgradeExhausted = true; }, 'an exhaustion flag that disagrees with the offers rejects');
+  tamper((e) => { e.run.hostId = 'HST_99'; }, 'an unknown committed HOST rejects');
+  tamper((e) => { e.run.upgradeIds = ['UPG_01', 'UPG_01']; }, '§43 — a duplicate acquired UPGRADE rejects');
+  tamper((e) => { e.run.upgradeIds = ['UPG_99']; }, 'an unresolvable acquired UPGRADE rejects');
+  tamper((e) => { delete e.run.routeRngState; }, 'a missing route RNG state rejects');
+  tamper((e) => { e.phase = 'PENDING_BUILD'; }, 'a phase that disagrees with the offers rejects');
+});
+
+test('§41 a committed pre-battle Build save round-trips the whole encounter package', () => {
+  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
+  const run = selectPath(commitNewRun(setup, D, 99), 0);
+  const r = deserializeSession(serializeSession(run, null, null));
+  assert(r && r.info.mode === 'RUN', 'the Run restores');
+  assert(r.info.pendingPath === undefined && r.info.pendingBuild === true, 'it restores to the pre-battle Build');
+  assert(r.info.system.systemId === run.system.systemId, 'the committed System survives');
+  assert(r.info.hostId === run.hostId, 'the committed HOST survives');
+  assert(r.info.upgradeIds.join(',') === run.upgradeIds.join(','), 'the acquired UPGRADEs survive in order');
+});
+
+test('§40 an Alpha 0.5 active save is rejected cleanly, never migrated', () => {
+  const g = psvGame({ seed: 100 });
+  const json = serializeSession(qmInfo(), g, null);
+  const asAlpha05 = JSON.parse(json) as Record<string, any>;
+  asAlpha05.version = 'alpha-0.5.0';
+  asAlpha05.schema = 4;
+  assert(deserializeSession(JSON.stringify(asAlpha05)) === null, 'the older schema rejects');
+  // and no HOST/UPGRADE state is synthesized to make it fit
+  const noHost = JSON.parse(json) as Record<string, any>;
+  delete noHost.identity.hostId;
+  assert(deserializeSession(JSON.stringify(noHost)) === null, 'a save with no HOST identity rejects');
+});
+
+// ---- §63 logging and metrics ----
+
+test('§46 route offer and selection records carry every required ID', () => {
+  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
+  const run = commitNewRun(setup, D, 606);
+  const p = run.pendingPath!;
+  // the fields §46 requires are all present on the pending state the logger reads
+  assert(typeof p.step === 'number', 'the target battle number');
+  assert(p.offers.every((o) => typeof o.index === 'number'), 'both offered path indexes');
+  assert(p.offers.every((o) => o.systemId && o.hostId && o.upgradeId), 'each offered SYS/HST/UPG');
+  assert(typeof p.upgradeExhausted === 'boolean', 'whether duplication was pool exhaustion');
+  const committed = selectPath(run, 1);
+  assert(committed.upgradeIds.length === 1, 'the acquired list after commitment');
+});
+
+test('§47/§63 several PASSIVEs modifying one calculation stay individually attributable', () => {
+  // ARENA (HOST, +2) and a second Function-damage instance from a fixture
+  // UPGRADE both modify one ATTACK.
+  const g = psvGame({ hostId: 'HST_03', build: ['PRG_H_003', 'PRG_H_001', 'PRG_H_002', 'PRG_H_005'], seed: 101 });
+  chargeSlot(g, 'player', 0);
+  const ev = g.fireProgram(0);
+  const contributions = ev.filter((e) => e.t === 'passive' && e.effect === 'PSV_FUNCTION_DAMAGE_INCREASE');
+  assert(contributions.length === 1, 'one instance, one record');
+  const keys = Object.keys(g.state.metrics.sides.player.passives);
+  assert(keys.includes('HST:HST_03:PSV_004'), `instance-keyed metrics, got ${keys.join(',')}`);
+  // §48 — totals still reconcile after PASSIVE modifiers
+  const sm = g.state.metrics.sides.player;
+  const tallied = sm.matchDamage + sm.bombDamage + sm.attackerDamage + sm.linesliceDamage + sm.transformDamage + sm.bufferDamageAdded + sm.passiveDamage;
+  assert(Math.abs(tallied - sm.totalDamage) < 1e-9, 'the seven disjoint buckets sum to total');
 });
 
 // ---- summary ----

@@ -22,6 +22,7 @@ import {
   GameState,
   Mode,
   NaturalOutcome,
+  PassiveCause,
   Pt,
   Readiness,
   RunStep,
@@ -116,7 +117,12 @@ export interface IdentityStamp {
   // (§35 — do not copy the System definition into every turn).
   systemId: string;
   systemSelectionSource: SystemSelectionSource;
-  skillIds: string[];
+  // Alpha 0.6.0 §7/§46 — the HOST and the acquired UPGRADEs are battle-static
+  // in exactly the same sense the System is, so they join the battle-level
+  // identity stamp and are never repeated into turn records (§35).
+  hostId: string;
+  upgradeIds: string[];
+  passiveIds: string[];
   deckFunctionId: string;
   hackerPrograms: string[]; // Alpha 0.4.0 — the ordered ACTIVE build
   inventory: string[]; // §18.2 — the ordered six-Program inventory
@@ -131,7 +137,9 @@ export function identityStamp(id: BattleIdentity): IdentityStamp {
     deckId: id.deckId,
     systemId: id.systemId,
     systemSelectionSource: id.systemSelectionSource,
-    skillIds: [...id.skillIds],
+    hostId: id.hostId,
+    upgradeIds: [...id.upgradeIds],
+    passiveIds: [...id.passiveIds],
     deckFunctionId: id.deckFunctionId,
     hackerPrograms: [...id.hackerPrograms],
     inventory: [...id.inventory],
@@ -170,7 +178,7 @@ export interface ChargeRouteRecord {
 // the volume and prove nothing.
 export function routeIsInteresting(r: ChargeRouteRecord): boolean {
   if (r.discarded > 0) return true;
-  if (r.source === 'SKILL_MODIFIED_SYNC' || r.source === 'EFFECT_DESTRUCTION') return true;
+  if (r.source === 'PASSIVE_MODIFIED_SYNC' || r.source === 'EFFECT_DESTRUCTION') return true;
   return r.assignments.filter((a) => a.assigned > 0).length > 1;
 }
 
@@ -237,25 +245,47 @@ export interface TurnLogEntry {
 // turn stream at all, so targeted-Function, Drain, and interesting charge-route
 // telemetry had to be promoted OUT of the turn record to survive there. One
 // stream, written at every level; the level tag records how it was produced.
-export type BattleEventKind = 'ROUTE' | 'TARGETED' | 'DRAIN' | 'TRANSFORM' | 'COUNTDOWN';
+export type BattleEventKind = 'ROUTE' | 'TARGETED' | 'DRAIN' | 'TRANSFORM' | 'COUNTDOWN' | 'PASSIVE';
 
 // Alpha 0.5.0 §37.1 — an EFFECT_TRANSFORM activation. Enough to verify what
 // happened without a board snapshot. The damage and charge its Syncs produced
 // stay in the normal damage/route streams and are NOT duplicated here; SYS_ID
 // joins from the battle-level record rather than being repeated (§35).
 export interface TransformRecord {
-  side: Side;
+  side: Side; // the RESOLUTION owner (§14) — not necessarily the causal source
   programId: string;
   fnId: string;
+  // Alpha 0.6.0 §14/§49 — present when a PASSIVE caused this activation. It is
+  // what lets a log say BOTH "HOST WEEDS/GREENING caused the transformation"
+  // and "the Hacker owned the resulting Sync consequences".
+  cause?: PassiveCause;
   axisTarget: string;
-  resultColor: number;
-  resultShape: number;
+  axisResult: string;
+  // §24 — a single-axis result leaves the other axis to the Packet, so neither
+  // resolved axis is guaranteed to be present.
+  resultColor?: number;
+  resultShape?: number;
   requested: number;
   converted: number;
   candidates: number; // whether valid targets existed, and how many
+  tier2Used: number; // §24 — conversions drawn from the fallback tier
   specialsRetained: number;
   specialsDestroyed: number;
   cells?: Pt[]; // COMPLETE-only reconstruction detail
+}
+
+// Alpha 0.6.0 §47 — one PASSIVE contribution to one calculation. Emitted for
+// every contributing instance, never as a merged total: §47 forbids collapsing
+// several PASSIVEs modifying one calculation into an unexplained aggregate.
+// The base event keeps its own attribution (§48); this is the increment.
+export interface PassiveRecord {
+  side: Side; // the AFFECTED agent
+  cause: PassiveCause;
+  effect: string;
+  damage?: number;
+  charge?: number;
+  shield?: number;
+  steps?: number;
 }
 
 // §37.3 — a delayed payload actually landing, so "armed" and "delivered" are
@@ -284,6 +314,7 @@ export interface BattleEventEntry {
   drain?: DrainRecord;
   transform?: TransformRecord;
   countdown?: CountdownRecord;
+  passive?: PassiveRecord;
 }
 
 // Alpha 0.4.1 §4.1 — the battle-level record is the AUTHORITY for everything
@@ -333,6 +364,12 @@ export interface SelectionLogEntry {
     // explicitly chosen. Emitted once when the selection is committed, never
     // repeated per turn (System identity is battle-static, §35).
     | 'SYSTEM_SELECTED'
+    // Alpha 0.6.0 §46 — the environment and route records. HOST_SELECTED
+    // mirrors SYSTEM_SELECTED; PATH_OFFERED and PATH_SELECTED are what make
+    // every offered and selected route reconstructible.
+    | 'HOST_SELECTED'
+    | 'PATH_OFFERED'
+    | 'PATH_SELECTED'
     | 'RUN_CREATED'
     | 'QUICK_MATCH_CREATED'
     | 'BUILD_OPENED'
@@ -355,6 +392,23 @@ export interface SelectionLogEntry {
   systemStrongColors?: number[];
   systemStrongShapes?: number[];
   systemPrograms?: string[];
+  // Alpha 0.6.0 §46 — resolved HOST identity, on the System's terms.
+  hostId?: string;
+  hostSelectionSource?: 'QUICK_RANDOM' | 'QUICK_CONSTRUCTED' | 'RUN_PATH';
+  hostPassives?: string[];
+  // §46 — route offer and commitment detail. `offers` carries BOTH offered
+  // packages with their screen indexes, so a log reader can reconstruct the
+  // choice the player was actually given, not only the one they took.
+  targetStep?: RunStep;
+  offers?: { index: number; systemId: string; hostId: string; upgradeId: string }[];
+  upgradeExhausted?: boolean;
+  selectedPath?: number;
+  upgradeId?: string;
+  upgradeAcquired?: boolean;
+  acquiredUpgrades?: string[];
+  // §35 — the Run's isolated ROUTE seed, so a Run's route sequence is
+  // reproducible from the log without touching gameplay RNG.
+  routeSeed?: number;
   // §18.2/§18.3 — portfolio, inventory and build context.
   hackerPortfolio?: string[];
   deckPortfolio?: string[];
@@ -522,19 +576,25 @@ export class TurnLogger {
               side: ev.side,
               programId: ev.programId,
               fnId: ev.fnId,
+              ...(ev.cause ? { cause: ev.cause } : {}),
               axisTarget: ev.axisTarget,
+              axisResult: ev.axisResult,
               resultColor: ev.resultColor,
               resultShape: ev.resultShape,
               requested: ev.requested,
               converted: ev.converted,
               candidates: ev.candidates,
+              tier2Used: ev.tier2Used,
               specialsRetained: ev.specialsRetained,
               specialsDestroyed: ev.specialsDestroyed,
               ...(atLeast('COMPLETE') ? { cells: ev.cells } : {}),
             },
           });
           act(
-            `${ev.side} EFFECT_TRANSFORM ${ev.resolved ? `converted ${ev.converted}/${ev.candidates} ${ev.axisTarget}` : 'withheld — no valid Packet'}`,
+            `${ev.side} EFFECT_TRANSFORM ${ev.resolved ? `converted ${ev.converted}/${ev.candidates} ${ev.axisTarget}->${ev.axisResult}` : 'withheld — no valid Packet'}` +
+              // §49 — the causal source, printed alongside the resolution owner
+              // so the readable mirror carries both facts too.
+              (ev.cause ? ` [via ${ev.cause.sourceKind} ${ev.cause.sourceId}/${ev.cause.passiveId}]` : ''),
           );
           break;
         // §37.3 — a countdown delivering its payload.
@@ -554,10 +614,29 @@ export class TurnLogger {
         case 'shake':
           act(`${ev.side} EFFECT_SHAKE ${ev.resolved ? 'resolved' : 'fizzled (legal)'}`);
           break;
-        case 'skill':
+        // Alpha 0.6.0 §47 — PASSIVE contributions are promoted to the battle-
+        // event stream so source attribution survives at BASIC, where there is
+        // no turn record to carry it. Each contributing instance is its own
+        // record: several PASSIVEs modifying one calculation must stay
+        // individually attributable.
+        case 'passive':
+          this.pushEvent(e.turn, 'PASSIVE', {
+            passive: {
+              side: ev.side,
+              cause: ev.cause,
+              effect: ev.effect,
+              ...(ev.damage !== undefined ? { damage: ev.damage } : {}),
+              ...(ev.charge !== undefined ? { charge: ev.charge } : {}),
+              ...(ev.shield !== undefined ? { shield: ev.shield } : {}),
+              ...(ev.steps !== undefined ? { steps: ev.steps } : {}),
+            },
+          });
           act(
-            `${ev.side} skill ${ev.skillId} ${ev.effect}` +
-              `${ev.damage !== undefined ? ` +${ev.damage} dmg` : ''}${ev.charge !== undefined ? ` +${ev.charge} charge` : ''}`,
+            `${ev.side} passive ${ev.cause.sourceKind} ${ev.cause.sourceId}/${ev.cause.passiveId} ${ev.effect}` +
+              `${ev.damage !== undefined ? ` ${ev.damage >= 0 ? '+' : ''}${ev.damage} dmg` : ''}` +
+              `${ev.charge !== undefined ? ` ${ev.charge >= 0 ? '+' : ''}${ev.charge} charge` : ''}` +
+              `${ev.shield !== undefined ? ` +${ev.shield} shield` : ''}` +
+              `${ev.steps !== undefined ? ` +${ev.steps} area step` : ''}`,
           );
           break;
         case 'placed':

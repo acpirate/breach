@@ -1,0 +1,10 @@
+PASSIVE_ID,passive_effect,params,activation,function_payload,agent_scope,display,notes
+PSV_001,PSV_EXTRA_MATCH_DAMAGE,RED:1,CONTINUAL,,OWNER,Deal %1 extra damage on a %0 sync,
+PSV_002,PSV_EXTRA_MATCH_CHARGE,RED:1,CONTINUAL,,OWNER,Gain %1 extra charge on a %0 sync,
+PSV_003,PSV_CHARGE_DAMPEN,ALL:1,CONTINUAL,,ENEMY,%0 syncs generate %1 fewer charge,
+PSV_004,PSV_FUNCTION_DAMAGE_INCREASE,ALL:2,CONTINUAL,,OWNER,Increase damage dealt by %0 FUNCTIONS by %1,
+PSV_005,PSV_PERM_SHIELD,ALL:1,CONTINUAL,,OWNER,Decrease damage dealt from %0 sources by %1,
+PSV_006,PSV_EXTRA_MATCH_CHARGE,YEL:1,CONTINUAL,,OWNER,Gain %1 extra charge on a %0 sync,
+PSV_007,PSV_BIGGER_BOMB,,CONTINUAL,,OWNER,Increased explosion radius for all bombs,
+PSV_008,PSV_CARRIER,,START_OF_TURN,FNC_016,OWNER,,
+PSV_009,PSV_CARRIER,,START_OF_TURN,FNC_017,OWNER,,

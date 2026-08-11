@@ -14,15 +14,22 @@ import {
   DATA_SCHEMA_VERSION,
   DEFAULT_DECK_ID,
   DEFAULT_HACKER_ID,
+  INITIAL_HOST_ID,
+  INITIAL_SYSTEM_ID,
   InventoryEntry,
+  PATH_CHOICE_COUNT,
   allSystems,
+  allUpgrades,
   deckById,
   defaultBuild,
   getContent,
   hackerById,
+  hostById,
   inventoryFor,
   inventoryProgramIds,
   isValidBuild,
+  poolHosts,
+  poolSystems,
   systemById,
 } from './data/content';
 import { RNG, makeRNG } from './rng';
@@ -104,6 +111,8 @@ export function buildIdentity(
   hackerId: string,
   deckId: string,
   system: SelectedSystem,
+  hostId: string,
+  upgradeIds: readonly string[],
   selectionSource: SelectionSource,
   build: readonly string[],
   buildOrigin: BuildOrigin,
@@ -113,12 +122,18 @@ export function buildIdentity(
   // Alpha 0.5.0 §5.4/§9 — the System roster is the SELECTED System's ordered
   // PRG_SET, not "every loaded PRG_S_*" as it was through Alpha 0.4.
   const sys = systemById(system.systemId);
+  // Alpha 0.6.0 §7/§12 — the HOST and the acquired UPGRADEs complete the
+  // battle's PASSIVE sources. hostById throws on an unknown ID, so a bad
+  // reference surfaces here rather than as a battle with a missing environment.
+  const host = hostById(hostId);
   return {
     hackerId,
     deckId,
     systemId: sys.id,
     systemSelectionSource: system.source,
-    skillIds: [...hacker.skillIds],
+    hostId: host.id,
+    upgradeIds: [...upgradeIds],
+    passiveIds: [...hacker.passiveIds],
     deckFunctionId: deck.fn.id,
     hackerPrograms: [...build],
     inventory: inventoryProgramIds(hackerId, deckId),
@@ -140,16 +155,122 @@ export interface SelectedSystem {
 
 // §11.1/§13 — one valid loaded System, sampled with replacement. Repeats
 // across Run battles are allowed; there is no shuffle bag and no anti-repeat
-// rule in Alpha 0.5.
+// rule beyond §30.1's within-one-offer pair rule.
 //
-// §14 — the caller supplies a SETUP RNG (makeSetupRandom), never the battle's
-// gameplay stream: selecting an opponent must not perturb the board, refills,
-// or AI sequence for a given gameplay seed.
+// §14/§35 — the caller supplies a SETUP/ROUTE RNG (makeSetupRandom), never the
+// battle's gameplay stream: selecting an opponent must not perturb the board,
+// refills, or AI sequence for a given gameplay seed.
+//
+// Alpha 0.6.0 — random selection samples the `in_pool` subset; deliberate
+// selection screens still list everything (director spec 2026-08-11).
 export function randomSystem(rng: RNG, source: SystemSelectionSource): SelectedSystem {
-  const catalog = allSystems();
-  // The loader guarantees a nonempty catalog (§41), so this cannot pick from
-  // nothing; a content bug would surface as a thrown error, not a silent default.
+  const catalog = poolSystems();
+  // The loader guarantees a nonempty pool, so this cannot pick from nothing; a
+  // content bug would surface at startup, not as a silent default here.
   return { systemId: rng.pick(catalog).id, source };
+}
+
+export function randomHost(rng: RNG): string {
+  return rng.pick(poolHosts()).id;
+}
+
+// ============================================================================
+// Alpha 0.6.0 §27-§35 — RUN ROUTE STATE
+//
+// A Run is now a sequence of PATH CHOICES: before every battle the player picks
+// one of two offered `SYS + HST + UPG` packages, and the choice is committed
+// BEFORE the Build screen opens, so the build can be edited against a known
+// encounter (§27). Offers are real saved state, never UI-transient (§42).
+// ============================================================================
+
+// One offered path: a complete encounter package plus the reward for taking it.
+export interface PathOffer {
+  index: number; // 0-based position on the screen, for logging and audit (§46)
+  systemId: string;
+  hostId: string;
+  upgradeId: string;
+}
+
+// The two pending offers for a specific upcoming battle. Persisted verbatim and
+// restored verbatim: reloading a Path Choice NEVER rerolls (§35).
+export interface PendingPath {
+  step: RunStep; // the battle these offers lead into
+  offers: PathOffer[];
+  // §31 — true when the eligible pool held only one UPGRADE and both cards
+  // therefore show it. Recorded rather than inferred so the log can say WHY the
+  // duplicate happened (§46).
+  upgradeExhausted: boolean;
+}
+
+// §29 — the Battle 1 offers. Both paths are the FIXED DOORMAN + THRESHOLD
+// encounter; the only intended difference is the UPGRADE.
+export function initialPathOffers(rng: RNG, acquired: readonly string[]): PendingPath {
+  const upgrades = pickOfferUpgrades(rng, acquired);
+  return {
+    step: 1,
+    offers: upgrades.ids.map((upgradeId, index) => ({
+      index,
+      systemId: INITIAL_SYSTEM_ID,
+      hostId: INITIAL_HOST_ID,
+      upgradeId,
+    })),
+    upgradeExhausted: upgrades.exhausted,
+  };
+}
+
+// §30 — offers for Battles 2-4: one valid System and one valid HOST per path,
+// independently randomized from the in_pool subsets, plus one eligible UPGRADE.
+export function laterPathOffers(rng: RNG, step: RunStep, acquired: readonly string[]): PendingPath {
+  const upgrades = pickOfferUpgrades(rng, acquired);
+  const pairs: { systemId: string; hostId: string }[] = [];
+  for (let i = 0; i < PATH_CHOICE_COUNT; i++) {
+    // §30.1 — avoid two identical SYS+HST pairs within ONE offer whenever
+    // another valid combination exists. Sharing a System OR a HOST is fine;
+    // repeating a PRIOR battle's encounter is fine. Deliberately a retry loop
+    // over the ordinary sampler rather than a shuffle-bag policy (§30.1 —
+    // "do not add shuffle-bag/no-repeat policy beyond this requirement").
+    const combos = poolSystems().length * poolHosts().length;
+    let systemId = randomSystem(rng, 'RUN_RANDOM').systemId;
+    let hostId = randomHost(rng);
+    if (combos > 1) {
+      let guard = 0;
+      while (pairs.some((p) => p.systemId === systemId && p.hostId === hostId) && guard < 32) {
+        systemId = randomSystem(rng, 'RUN_RANDOM').systemId;
+        hostId = randomHost(rng);
+        guard++;
+      }
+    }
+    pairs.push({ systemId, hostId });
+  }
+  return {
+    step,
+    offers: pairs.map((pair, index) => ({ index, ...pair, upgradeId: upgrades.ids[index] })),
+    upgradeExhausted: upgrades.exhausted,
+  };
+}
+
+// §30.2/§31 — the eligible UPGRADE pool is every valid row not already acquired
+// in this Run. Offer DISTINCT IDs whenever at least two remain; when exactly one
+// remains, both paths legitimately show it and that is not a validation error.
+function pickOfferUpgrades(rng: RNG, acquired: readonly string[]): { ids: string[]; exhausted: boolean } {
+  const eligible = allUpgrades().filter((u) => !acquired.includes(u.id));
+  if (eligible.length === 0) {
+    // Unreachable with four UPGRADEs and four decisions, but a content change
+    // must not produce an offer with no reward at all.
+    throw new Error('no eligible UPGRADE remains for a path offer');
+  }
+  if (eligible.length === 1) {
+    return { ids: Array(PATH_CHOICE_COUNT).fill(eligible[0].id), exhausted: true };
+  }
+  const pool = rng.shuffle([...eligible]);
+  return { ids: pool.slice(0, PATH_CHOICE_COUNT).map((u) => u.id), exhausted: false };
+}
+
+// §32 — committing a path. Acquisition is idempotent by ID: the one-remaining
+// duplicate-offer case (§31) acquires exactly once however it is chosen, and
+// the acquired list stays unique and ordered (§43).
+export function acquireUpgrade(acquired: readonly string[], upgradeId: string): string[] {
+  return acquired.includes(upgradeId) ? [...acquired] : [...acquired, upgradeId];
 }
 
 // ============================================================================
@@ -285,6 +406,10 @@ export interface QuickMatchInfo {
   // before the battle (explicitly in Constructed, rolled in Random) and
   // restored verbatim by Continue rather than rerolled (§14).
   system: SelectedSystem;
+  // Alpha 0.6.0 §37/§39/§44 — the resolved HOST for this Quick Match, chosen
+  // deliberately in Constructed and rolled in Random, restored verbatim by
+  // Continue. Quick Match has NO UPGRADE state at all (§37/§44).
+  hostId: string;
   // §9.5 — the exact resolved build and where it came from, so Continue
   // restores this battle rather than rerolling a Random build or rereading the
   // remembered Constructed preset.
@@ -314,6 +439,21 @@ export interface RunInfo {
   // this value; only successful progression to a new step rolls a new one
   // (§11.4/§11.5).
   system: SelectedSystem;
+  // Alpha 0.6.0 §32 — the committed HOST for the current encounter, chosen with
+  // the System as one package at the Path Choice and never re-resolved.
+  hostId: string;
+  // §32/§41 — every UPGRADE acquired so far this Run, in acquisition order.
+  // That order is their START_OF_TURN resolution order (§15.3), so it is real
+  // gameplay state rather than a display convenience. Unique by ID (§43).
+  upgradeIds: string[];
+  // §35/§41 — the isolated ROUTE RNG state. Persisted so a save/reload cannot
+  // perturb later route generation compared with an uninterrupted Run: offer
+  // generation always continues the same stream from where it left off, and it
+  // never touches the battle's gameplay RNG.
+  routeRngState: number;
+  // §42 — the exact pending offers while the Run sits on a Path Choice. Real
+  // saved state: `PENDING_PATH` restores these verbatim rather than rerolling.
+  pendingPath?: PendingPath;
   // §17.2 — true while the Run is sitting on a pre-battle Build screen rather
   // than inside a battle. A committed Run in this phase is fully saveable.
   pendingBuild?: true;
@@ -437,26 +577,22 @@ export function deserializeConstructedPreset(json: string | null): ConstructedPr
 
 // ---- §12 pending New Run setup state ----
 
-// Alpha 0.4.0 §8 — the third step is now the FUNCTIONAL Build screen; the
-// Alpha 0.3 fixed Build Review no longer exists.
-export type SetupStep = 'HACKER' | 'DECK' | 'BUILD';
+// Alpha 0.6.0 §27/§28 — setup now ends at Deck Selection. The next screen is
+// the initial PATH CHOICE, and entering it COMMITS the Run (§28), so pending
+// setup no longer carries a Build or a pre-rolled opponent: the encounter comes
+// from the path the player picks.
+export type SetupStep = 'HACKER' | 'DECK';
 
 // Ephemeral UI/application state, NOT an active save (§12.2). Entering setup
-// does not modify the existing save; only Start Run commits.
+// does not modify the existing save; only advancing into the Path Choice does.
 export interface PendingSetup {
   step: SetupStep;
   hackerId: string | null;
   deckId: string | null;
-  // Alpha 0.5.0 §11.3 — the pending Battle 1 opponent. It belongs to pending
-  // setup (not to the save) until Start Run commits, and it is rolled EXACTLY
-  // ONCE, when setup first reaches the pre-battle Build state. Backing out to
-  // Deck/Hacker Selection and returning must not reroll it; abandoning setup
-  // to Title discards it with the rest of pending setup.
-  system: SelectedSystem | null;
 }
 
 export function beginSetup(): PendingSetup {
-  return { step: 'HACKER', hackerId: null, deckId: null, system: null };
+  return { step: 'HACKER', hackerId: null, deckId: null };
 }
 
 // Choosing updates pending setup ONLY (§13.2/§14.2).
@@ -464,27 +600,92 @@ export function chooseHacker(s: PendingSetup, hackerId: string): PendingSetup {
   return { ...s, hackerId, step: 'DECK' };
 }
 
-// §11.3 — advancing into Build is the moment the pre-battle state exists, so
-// the Battle 1 System resolves here. `?? existing` is what makes back-and-forth
-// navigation stable: a second pass through Deck Selection keeps the opponent
-// the player already saw.
-export function chooseDeck(s: PendingSetup, deckId: string, rng: RNG): PendingSetup {
-  return { ...s, deckId, step: 'BUILD', system: s.system ?? randomSystem(rng, 'RUN_RANDOM') };
+export function chooseDeck(s: PendingSetup, deckId: string): PendingSetup {
+  return { ...s, deckId };
 }
 
 // Back navigation RETAINS current pending choices (§12.2/§6.3). Backing out of
 // the first screen returns null, meaning "return to Title and discard pending
 // setup only" — the resident save is untouched.
 export function setupBack(s: PendingSetup): PendingSetup | null {
-  if (s.step === 'BUILD') return { ...s, step: 'DECK' };
   if (s.step === 'DECK') return { ...s, step: 'HACKER' };
   return null;
 }
 
-// The setup is committable once both choices exist, the opponent has been
-// resolved, and Build is showing.
+// The setup is committable once both identity choices exist.
 export function setupComplete(s: PendingSetup): boolean {
-  return s.step === 'BUILD' && s.hackerId !== null && s.deckId !== null && s.system !== null;
+  return s.hackerId !== null && s.deckId !== null;
+}
+
+// §28 — THE ALPHA 0.6 DESTRUCTIVE COMMITMENT BOUNDARY. Advancing from Deck
+// Selection into the initial Path Choice creates the Run, replaces the previous
+// active save, generates the two initial offers, and persists them immediately.
+// It deliberately does NOT roll an encounter: Battle 1's System and HOST are
+// the fixed DOORMAN + THRESHOLD on both offered paths (§29), and which UPGRADE
+// the Run starts with is the player's first decision.
+//
+// The caller supplies the route seed so the whole Run's route randomness comes
+// from one persisted, gameplay-isolated stream (§35).
+export function commitNewRun(
+  s: PendingSetup,
+  settings: BattleSettings,
+  routeSeed: number,
+): RunInfo {
+  const hackerId = s.hackerId!;
+  const deckId = s.deckId!;
+  const routeRng = makeRNG(routeSeed);
+  const pendingPath = initialPathOffers(routeRng, []);
+  return {
+    mode: 'RUN',
+    step: 1,
+    settings: snapshotRunSettings(settings),
+    identity: { hackerId, deckId, selectionSource: 'EXPLICIT_SELECTION' },
+    hackerMaxLink: resolveHackerMaxLink(settings, hackerId, deckId),
+    inventory: inventoryProgramIds(hackerId, deckId),
+    build: defaultBuild(hackerId, deckId),
+    buildOrigin: 'DEFAULT',
+    // Until a path is chosen there is no committed encounter. The fixed Battle
+    // 1 identity is what both offers name, so these placeholders are replaced
+    // by selectPath() before any battle or Build screen can exist.
+    system: { systemId: INITIAL_SYSTEM_ID, source: 'RUN_RANDOM' },
+    hostId: INITIAL_HOST_ID,
+    upgradeIds: [],
+    routeRngState: routeRng.getState(),
+    pendingPath,
+  };
+}
+
+// §30 — generate the offers for the NEXT battle after a win or a Force Win.
+// Advances the persisted route RNG in place so an interrupted-and-resumed Run
+// produces the same sequence an uninterrupted one would (§35).
+export function openPathChoice(info: RunInfo, step: RunStep): RunInfo {
+  const routeRng = makeRNG(info.routeRngState);
+  const pendingPath = step === 1
+    ? initialPathOffers(routeRng, info.upgradeIds)
+    : laterPathOffers(routeRng, step, info.upgradeIds);
+  const next: RunInfo = { ...info, step, pendingPath, routeRngState: routeRng.getState() };
+  delete next.pendingBuild;
+  return next;
+}
+
+// §32 — selecting a path is immediate and final for that battle: acquire the
+// UPGRADE (once), commit the System and HOST, drop the pending offers, and move
+// to the pre-battle Build state. Back navigation cannot undo it (§32).
+export function selectPath(info: RunInfo, offerIndex: number): RunInfo {
+  const pending = info.pendingPath;
+  if (!pending) return info;
+  const offer = pending.offers[offerIndex];
+  if (!offer) return info;
+  const next: RunInfo = {
+    ...info,
+    step: pending.step,
+    system: { systemId: offer.systemId, source: 'RUN_RANDOM' },
+    hostId: offer.hostId,
+    upgradeIds: acquireUpgrade(info.upgradeIds, offer.upgradeId),
+    pendingBuild: true,
+  };
+  delete next.pendingPath;
+  return next;
 }
 
 // ---- Battle creation (§4.2/§4.3/§10.5) ----
@@ -527,6 +728,7 @@ export function createQuickMatchBattle(
   settings: BattleSettings,
   ids: SelectedIdentity,
   system: SelectedSystem,
+  hostId: string,
   build: readonly string[],
   buildOrigin: BuildOrigin,
   seed?: number,
@@ -539,7 +741,9 @@ export function createQuickMatchBattle(
     hackerMaxLink,
     resolveQuickMatchIce(settings, system.systemId),
   );
-  return new Game(config, buildIdentity(ids.hackerId, ids.deckId, system, ids.selectionSource, build, buildOrigin), seed);
+  // §37/§44 — Quick Match acquires no UPGRADEs, so the list is empty by
+  // construction rather than by a filter somewhere downstream.
+  return new Game(config, buildIdentity(ids.hackerId, ids.deckId, system, hostId, [], ids.selectionSource, build, buildOrigin), seed);
 }
 
 // Quick Match "Reset" restarts under the concluded battle's OWN config and
@@ -557,6 +761,8 @@ export function createRunBattle(info: RunInfo, step: RunStep, seed?: number): Ga
       info.identity.hackerId,
       info.identity.deckId,
       info.system,
+      info.hostId,
+      info.upgradeIds,
       info.identity.selectionSource,
       info.build,
       info.buildOrigin,
@@ -599,7 +805,10 @@ export function contextLabel(info: SessionInfo): string {
 // fake Run values to satisfy a broad nullable interface). Alpha 0.2 saves are
 // rejected by the version/schema check: there is no migration path (§17.1).
 
-type SavePhase = 'ACTIVE_BATTLE' | 'PENDING_RESULT' | 'PENDING_BUILD';
+// Alpha 0.6.0 §42 — PENDING_PATH is a real saved phase: a committed Run with no
+// active battle, no committed encounter yet, and two exact pending offers. It
+// is deliberately NOT encoded as UI-transient state (§42).
+type SavePhase = 'ACTIVE_BATTLE' | 'PENDING_RESULT' | 'PENDING_BUILD' | 'PENDING_PATH';
 
 interface SavedRun {
   step: RunStep;
@@ -613,6 +822,13 @@ interface SavedRun {
   // definition: identity resolves through the matching content fingerprint
   // (§32 — no redundant serialization of immutable content).
   system: SelectedSystem;
+  // Alpha 0.6.0 §41 — the committed HOST, the acquired UPGRADEs in acquisition
+  // order, the isolated route RNG state, and the exact pending offers. All
+  // stable IDs and primitives; no content definitions are duplicated here.
+  hostId: string;
+  upgradeIds: string[];
+  routeRngState: number;
+  pendingPath?: PendingPath;
 }
 
 interface SavedSession {
@@ -644,22 +860,34 @@ const savedRunOf = (info: RunInfo): SavedRun => ({
   build: [...info.build],
   buildOrigin: info.buildOrigin,
   system: { ...info.system },
+  hostId: info.hostId,
+  upgradeIds: [...info.upgradeIds],
+  routeRngState: info.routeRngState,
+  ...(info.pendingPath
+    ? { pendingPath: { ...info.pendingPath, offers: info.pendingPath.offers.map((o) => ({ ...o })) } }
+    : {}),
 });
 
 export function serializeSession(info: SessionInfo, game: Game | null, pending: PendingResultInfo | null): string {
   const content = getContent();
-  // §17.4 — a committed Run parked on Build has no battle state; its identity
-  // is still explicit, derived from the same authority a battle would use.
+  // §17.4 — a committed Run parked on Build or on a Path Choice has no battle
+  // state; its identity is still explicit, derived from the same authority a
+  // battle would use. On a Path Choice the encounter fields are the not-yet-
+  // superseded previous package, which the phase check below makes unusable as
+  // a committed encounter on restore.
   const identity =
     game?.state.identity ??
     buildIdentity(
       info.identity.hackerId,
       info.identity.deckId,
       info.system,
+      info.mode === 'RUN' ? info.hostId : info.hostId,
+      info.mode === 'RUN' ? info.upgradeIds : [],
       info.identity.selectionSource,
       info.build,
       info.buildOrigin,
     );
+  const onPath = info.mode === 'RUN' && !!info.pendingPath;
   const env: SavedSession = {
     version: SAVE_VERSION,
     schema: DATA_SCHEMA_VERSION,
@@ -667,7 +895,7 @@ export function serializeSession(info: SessionInfo, game: Game | null, pending: 
     mode: info.mode,
     identity: { ...identity },
     ...(info.mode === 'RUN' ? { run: savedRunOf(info) } : {}),
-    phase: !game ? 'PENDING_BUILD' : pending ? 'PENDING_RESULT' : 'ACTIVE_BATTLE',
+    phase: onPath ? 'PENDING_PATH' : !game ? 'PENDING_BUILD' : pending ? 'PENDING_RESULT' : 'ACTIVE_BATTLE',
     ...(pending
       ? { result: { natural: pending.natural, ...(pending.forcedWin ? { forcedWin: true as const } : {}), metricsLogged: pending.metricsLogged } }
       : {}),
@@ -696,9 +924,15 @@ export function deserializeSession(json: string | null): RestoredSession | null 
     const sameOrder = (a: readonly string[], b: readonly string[]): boolean =>
       a.length === b.length && a.every((v, i) => v === b[i]);
 
-    if (env.phase !== 'ACTIVE_BATTLE' && env.phase !== 'PENDING_RESULT' && env.phase !== 'PENDING_BUILD') return null;
-    // §17.4 — the pre-battle Build phase is Run-only and carries no battle.
-    const inBuild = env.phase === 'PENDING_BUILD';
+    if (
+      env.phase !== 'ACTIVE_BATTLE' && env.phase !== 'PENDING_RESULT' &&
+      env.phase !== 'PENDING_BUILD' && env.phase !== 'PENDING_PATH'
+    ) {
+      return null;
+    }
+    // §17.4/§42 — both battle-less phases are Run-only and carry no battle.
+    const onPath = env.phase === 'PENDING_PATH';
+    const inBuild = env.phase === 'PENDING_BUILD' || onPath;
     if (inBuild && (env.mode !== 'RUN' || env.state !== undefined || env.result !== undefined)) return null;
 
     let game: Game | null = null;
@@ -715,7 +949,10 @@ export function deserializeSession(json: string | null): RestoredSession | null 
         // Alpha 0.5.0 §32 — the battle's opponent must round-trip exactly.
         stateId.systemId !== envId.systemId ||
         stateId.systemSelectionSource !== envId.systemSelectionSource ||
-        !sameOrder(envId.skillIds, stateId.skillIds) ||
+        // Alpha 0.6.0 §7/§12 — so must the battlefield and the reward state.
+        stateId.hostId !== envId.hostId ||
+        !sameOrder(envId.upgradeIds, stateId.upgradeIds) ||
+        !sameOrder(envId.passiveIds, stateId.passiveIds) ||
         !sameOrder(envId.hackerPrograms, stateId.hackerPrograms) ||
         !sameOrder(envId.inventory, stateId.inventory) ||
         !sameOrder(envId.systemPrograms, stateId.systemPrograms)
@@ -744,6 +981,23 @@ export function deserializeSession(json: string | null): RestoredSession | null 
       // encounter the player saved.
       if (!isSelectedSystem(run.system)) return null;
       if (!inBuild && run.system.systemId !== envId.systemId) return null;
+      // Alpha 0.6.0 §52/§41 — the committed HOST must still resolve, on exactly
+      // the terms the System does: a missing or unknown HST_ID is an
+      // incompatible save, never an invitation to substitute THRESHOLD (§40).
+      if (typeof run.hostId !== 'string' || !getContent().hosts.has(run.hostId)) return null;
+      if (!inBuild && run.hostId !== envId.hostId) return null;
+      // §43 — a persisted acquired list containing the same UPGRADE_ID twice is
+      // invalid. Reject rather than silently deduplicating.
+      if (!Array.isArray(run.upgradeIds) || run.upgradeIds.some((id) => typeof id !== 'string')) return null;
+      if (new Set(run.upgradeIds).size !== run.upgradeIds.length) return null;
+      if (run.upgradeIds.some((id) => !getContent().upgrades.has(id))) return null;
+      if (!inBuild && !sameOrder(run.upgradeIds, envId.upgradeIds)) return null;
+      // §35 — the route RNG state, so continuation is deterministic.
+      if (!Number.isInteger(run.routeRngState)) return null;
+      // §42/§52 — pending offers must be structurally complete and reference
+      // valid content. They are restored EXACTLY as saved; nothing rerolls.
+      if (onPath !== (run.pendingPath !== undefined)) return null;
+      if (run.pendingPath && !isValidPendingPath(run.pendingPath, run.step as RunStep, run.upgradeIds)) return null;
       info = {
         mode: 'RUN',
         step: run.step as RunStep,
@@ -754,19 +1008,29 @@ export function deserializeSession(json: string | null): RestoredSession | null 
         build: [...run.build],
         buildOrigin: run.buildOrigin,
         system: { ...run.system },
-        ...(inBuild ? { pendingBuild: true as const } : {}),
+        hostId: run.hostId,
+        upgradeIds: [...run.upgradeIds],
+        routeRngState: run.routeRngState,
+        ...(run.pendingPath
+          ? { pendingPath: { ...run.pendingPath, offers: run.pendingPath.offers.map((o) => ({ ...o })) } }
+          : {}),
+        ...(inBuild && !onPath ? { pendingBuild: true as const } : {}),
       };
     } else {
       if (env.run !== undefined) return null; // Quick Match never carries Run values
       // §9.5/§17.5 — restore the EXACT saved build and its source. Continue
       // never rerolls a Random build and never rereads the Constructed preset.
       if (!isValidBuild(envId.hackerPrograms, envId.inventory)) return null;
+      // §44 — Quick Match has no Run UPGRADE state at all. A save claiming one
+      // is malformed rather than a Quick Match with rewards.
+      if (envId.upgradeIds.length !== 0) return null;
       info = {
         mode: 'QUICK_MATCH',
         identity: { hackerId: envId.hackerId, deckId: envId.deckId, selectionSource: envId.selectionSource },
-        // §14 — the opponent comes from the saved battle identity, so Continue
-        // never rerolls a Random Quick Match's System.
+        // §14/§44 — the opponent AND the battlefield come from the saved battle
+        // identity, so Continue never rerolls a Random Quick Match's encounter.
         system: { systemId: envId.systemId, source: envId.systemSelectionSource },
+        hostId: envId.hostId,
         build: [...envId.hackerPrograms],
         buildOrigin: envId.buildOrigin,
       };
@@ -803,6 +1067,38 @@ export function deserializeSession(json: string | null): RestoredSession | null 
 const BUILD_ORIGINS: BuildOrigin[] = ['DEFAULT', 'RANDOM', 'REMEMBERED_CONSTRUCTED', 'CARRIED_RUN', 'PLAYER_EDITED'];
 function isBuildOrigin(v: unknown): v is BuildOrigin {
   return typeof v === 'string' && (BUILD_ORIGINS as string[]).includes(v);
+}
+
+// Alpha 0.6.0 §52 — pending route offers must be STRUCTURALLY COMPLETE and
+// reference valid content: the right number of offers, each naming a System, a
+// HOST, and an UPGRADE that all still resolve, none of them already acquired,
+// and the exhaustion flag agreeing with what the offers actually show. Nothing
+// here infers or repairs; a mismatch rejects the save (§52).
+function isValidPendingPath(v: unknown, step: RunStep, acquired: readonly string[]): boolean {
+  const p = v as PendingPath | undefined;
+  if (!p || typeof p !== 'object') return false;
+  if (p.step !== step) return false;
+  if (typeof p.upgradeExhausted !== 'boolean') return false;
+  if (!Array.isArray(p.offers) || p.offers.length !== PATH_CHOICE_COUNT) return false;
+  const c = getContent();
+  for (let i = 0; i < p.offers.length; i++) {
+    const o = p.offers[i];
+    if (!o || typeof o !== 'object') return false;
+    if (o.index !== i) return false;
+    if (typeof o.systemId !== 'string' || !c.systems.has(o.systemId)) return false;
+    if (typeof o.hostId !== 'string' || !c.hosts.has(o.hostId)) return false;
+    if (typeof o.upgradeId !== 'string' || !c.upgrades.has(o.upgradeId)) return false;
+    // §30.2 — an already-acquired UPGRADE is not eligible, so an offer naming
+    // one is a corrupt save rather than a duplicate to be tolerated.
+    if (acquired.includes(o.upgradeId)) return false;
+  }
+  // §31 — the flag must match reality: duplicated UPGRADE IDs across the offers
+  // are legal ONLY as the recorded pool-exhaustion case.
+  const distinct = new Set(p.offers.map((o) => o.upgradeId)).size;
+  if (p.upgradeExhausted !== (distinct < p.offers.length)) return false;
+  // §29 — Battle 1 always offers the fixed encounter identity on both paths.
+  if (step === 1 && p.offers.some((o) => o.systemId !== INITIAL_SYSTEM_ID || o.hostId !== INITIAL_HOST_ID)) return false;
+  return true;
 }
 
 // §33 — a persisted opponent choice: a SYS_ID that still resolves against the

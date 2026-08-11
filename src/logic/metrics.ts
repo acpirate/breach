@@ -14,7 +14,7 @@
 // Damage buckets remain DISJOINT and never double count.
 
 import { getContent } from './data/content';
-import { GameEvent, Side, opponentOf } from './types';
+import { GameEvent, PassiveCause, PassiveSourceKind, Side, opponentOf } from './types';
 
 export interface UnitMetrics {
   fires: number; // parent Function activations (paid events)
@@ -43,19 +43,27 @@ export interface DeckMetrics {
   shakeFizzles: number; // §8.7 legal fizzles (Datastream left unchanged)
 }
 
-// §21.3 — per-Skill trigger and contribution counters, keyed by stable SKL_ ID.
-export interface SkillMetrics {
+// Alpha 0.6.0 §47 — per-PASSIVE-INSTANCE trigger and contribution counters.
+// Keyed by `<SOURCE_KIND>:<SOURCE_ID>:<PASSIVE_ID>`, NOT by PASSIVE_ID: the
+// same PSV row supplied by two different sources is two instances and both
+// apply (§11), so merging them here would make stacking unauditable.
+export interface PassiveMetrics {
+  sourceKind: PassiveSourceKind;
+  sourceId: string;
+  passiveId: string;
   triggers: number;
-  damage: number; // SKL_EXTRA_MATCH_DAMAGE raw contribution (pre-floor)
-  charge: number; // SKL_EXTRA_MATCH_CHARGE charge actually granted
+  damage: number; // raw damage contribution (pre-floor)
+  charge: number; // charge granted (positive) or dampened away (negative)
+  shield: number; // §21 permanent-Shield value contributed to preventions
+  steps: number; // §22 named area-pattern steps contributed
 }
 
 export interface SideMetrics {
   totalDamage: number;
-  // MK7.3/7.4 + §11.3 + §15.3 — SIX DISJOINT causal buckets: match + bomb +
-  // attacker + lineslice + bufferDamageAdded + skillDamage === totalDamage,
-  // exactly. `lineslice` is its own bucket rather than a generic Function
-  // catch-all so DATACUT stays separable (§15.3).
+  // MK7.3/7.4 + §11.3 + §15.3 — SEVEN DISJOINT causal buckets: match + bomb +
+  // attacker + lineslice + transform + bufferDamageAdded + passiveDamage ===
+  // totalDamage, exactly. `lineslice` is its own bucket rather than a generic
+  // Function catch-all so DATACUT stays separable (§15.3).
   matchDamage: number; // BASE Sync damage only (zero under Reinforced Connection)
   attackerDamage: number;
   bombDamage: number;
@@ -65,7 +73,9 @@ export interface SideMetrics {
   // Disjoint from matchDamage: a transform-created Sync lands here INSTEAD of
   // there, never in both, so the buckets still sum to totalDamage.
   transformDamage: number;
-  skillDamage: number; // §6.4 Hacker-Skill damage, never folded into matchDamage
+  // §17/§20/§48 — PASSIVE-contributed damage from every source, never folded
+  // into the bucket of the mechanism it modified.
+  passiveDamage: number;
   // MK7.3 cross-cutting (overlaps the buckets, does NOT sum with them)
   cascadeDamage: number;
   // MK7.5 — behavioral split of Sync-cause damage by paying axis
@@ -100,7 +110,7 @@ export interface SideMetrics {
   lineClears: number;
   units: Record<string, UnitMetrics>; // keyed by stable Program ID
   deck: DeckMetrics;
-  skills: Record<string, SkillMetrics>; // keyed by stable Skill ID
+  passives: Record<string, PassiveMetrics>; // keyed by source kind + source ID + PASSIVE ID
 }
 
 export interface BattleMetrics {
@@ -144,7 +154,16 @@ const emptyDeck = (): DeckMetrics => ({
   shakeFizzles: 0,
 });
 
-const emptySkill = (): SkillMetrics => ({ triggers: 0, damage: 0, charge: 0 });
+const emptyPassive = (cause: PassiveCause): PassiveMetrics => ({
+  sourceKind: cause.sourceKind,
+  sourceId: cause.sourceId,
+  passiveId: cause.passiveId,
+  triggers: 0,
+  damage: 0,
+  charge: 0,
+  shield: 0,
+  steps: 0,
+});
 
 // Alpha 0.4.0 §5.8 — seeded from the battle's ACTIVE roster, not from every
 // loaded Program: an inactive inventory Program has no metrics slot.
@@ -158,7 +177,7 @@ function emptySide(programIds: readonly string[]): SideMetrics {
     bombDamage: 0,
     linesliceDamage: 0,
     transformDamage: 0,
-    skillDamage: 0,
+    passiveDamage: 0,
     cascadeDamage: 0,
     matchDamageColor: 0,
     matchDamageShape: 0,
@@ -175,7 +194,7 @@ function emptySide(programIds: readonly string[]): SideMetrics {
     lineClears: 0,
     units,
     deck: emptyDeck(),
-    skills: {},
+    passives: {},
   };
 }
 
@@ -217,8 +236,11 @@ function unitOf(sm: SideMetrics, programId: string): UnitMetrics {
   return (sm.units[programId] ??= emptyUnit());
 }
 
-function skillOf(sm: SideMetrics, skillId: string): SkillMetrics {
-  return (sm.skills[skillId] ??= emptySkill());
+export const passiveMetricKey = (cause: PassiveCause): string =>
+  `${cause.sourceKind}:${cause.sourceId}:${cause.passiveId}`;
+
+function passiveOf(sm: SideMetrics, cause: PassiveCause): PassiveMetrics {
+  return (sm.passives[passiveMetricKey(cause)] ??= emptyPassive(cause));
 }
 
 export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
@@ -228,35 +250,42 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
         const side = opponentOf(ev.target); // damage is dealt BY the target's opponent
         const sm = m.sides[side];
         const bonus = ev.buffBonus ?? 0;
-        const skill = ev.skillRaw ?? 0;
+        const passive = ev.passiveRaw ?? 0;
         const base = ev.amount - bonus; // MK7.4: buffer subtracted out of the causal bucket
         sm.totalDamage += ev.amount;
         if (ev.amount > sm.largestHit) sm.largestHit = ev.amount;
         if (ev.source === 'match') {
-          // §6.4/§11.3: the Skill portion is its OWN bucket and is removed from
+          // §17/§48: the PASSIVE portion is its OWN bucket and is removed from
           // base Sync damage, so the two never double count. Under Reinforced
-          // Connection the whole causal amount is Skill damage and base Sync
+          // Connection the whole causal amount is PASSIVE damage and base Sync
           // damage records as a clean zero.
-          sm.matchDamage += base - skill;
-          sm.skillDamage += skill;
+          sm.matchDamage += base - passive;
+          sm.passiveDamage += passive;
           sm.critExtra += ev.critExtra ?? 0;
           sm.matchDamageColor += ev.colorRaw ?? 0;
           sm.matchDamageShape += ev.shapeRaw ?? 0;
         } else if (ev.source === 'attacker') {
-          sm.attackerDamage += base;
-          if (ev.programId) unitOf(sm, ev.programId).effect += base;
+          // §20/§48 — a Function-damage PASSIVE increment is subtracted out of
+          // the Function's own bucket the same way, so the base event stays
+          // attributed to its original mechanism and the totals still reconcile.
+          sm.attackerDamage += base - passive;
+          sm.passiveDamage += passive;
+          if (ev.programId) unitOf(sm, ev.programId).effect += base - passive;
         } else if (ev.source === 'lineslice') {
-          sm.linesliceDamage += base; // §13.4: direct slice + its cascades
-          if (ev.programId) unitOf(sm, ev.programId).effect += base;
+          sm.linesliceDamage += base - passive; // §13.4: direct slice + its cascades
+          sm.passiveDamage += passive;
+          if (ev.programId) unitOf(sm, ev.programId).effect += base - passive;
         } else if (ev.source === 'transform') {
-          // Alpha 0.5.0 — the Syncs COERCE created, credited to COERCE. The
-          // per-Program `effect` credit is what makes the Effect's contribution
-          // legible next to ATTACK/BOMB damage in the same units.
-          sm.transformDamage += base;
-          if (ev.programId) unitOf(sm, ev.programId).effect += base;
+          // Alpha 0.5.0 — the Syncs a Transform created, credited to the
+          // Effect. The per-Program `effect` credit is what makes the Effect's
+          // contribution legible next to ATTACK/BOMB damage in the same units.
+          sm.transformDamage += base - passive;
+          sm.passiveDamage += passive;
+          if (ev.programId) unitOf(sm, ev.programId).effect += base - passive;
         } else {
-          sm.bombDamage += base; // MK7.3: includes bomb-caused settling + cascades
-          if (ev.programId) unitOf(sm, ev.programId).effect += base;
+          sm.bombDamage += base - passive; // MK7.3: includes bomb-caused settling + cascades
+          sm.passiveDamage += passive;
+          if (ev.programId) unitOf(sm, ev.programId).effect += base - passive;
         }
         sm.cascadeDamage += ev.cascadeRaw ?? 0; // cross-cutting, any cause
         if (bonus > 0) {
@@ -285,12 +314,19 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
         }
         break;
       }
-      case 'skill': {
+      // Alpha 0.6.0 §47 — keyed by SOURCE+PASSIVE, not by PASSIVE_ID alone.
+      // The same PSV row supplied by a Hacker and by a HOST is two instances
+      // (§11), and collapsing them here would make the stacking rule
+      // unauditable. `shield` and `steps` are prevention/area contributions
+      // rather than damage, so they get their own counters.
+      case 'passive': {
         const sm = m.sides[ev.side];
-        const k = skillOf(sm, ev.skillId);
+        const k = passiveOf(sm, ev.cause);
         k.triggers++;
         k.damage += ev.damage ?? 0;
         k.charge += ev.charge ?? 0;
+        k.shield += ev.shield ?? 0;
+        k.steps += ev.steps ?? 0;
         break;
       }
       case 'deckCharge': {
