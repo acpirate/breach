@@ -22,6 +22,7 @@ import {
   GameState,
   Mode,
   NaturalOutcome,
+  OpponentKind,
   PassiveCause,
   Pt,
   Readiness,
@@ -111,12 +112,17 @@ interface SideDamage {
 export interface IdentityStamp {
   hackerId: string;
   deckId: string;
-  // Alpha 0.5.0 §36 — the opponent this battle was fought against, and how it
-  // was chosen. Battle-static: it lives here on the battle-level record and
-  // joins to turn/event records by `battleId` rather than being repeated
-  // (§35 — do not copy the System definition into every turn).
-  systemId: string;
-  systemSelectionSource: SystemSelectionSource;
+  // Alpha 0.5.0 §36, revised by Alpha 0.7.0 §40 — the opponent this battle was
+  // fought against, WHICH IDENTITY LAYER it came from, and how it was chosen.
+  // Battle-static: it lives here on the battle-level record and joins to
+  // turn/event records by `battleId` rather than being repeated (§35 — do not
+  // copy the definition into every turn).
+  //
+  // §40 is explicit that a Boss battle must NOT emit a misleading SYS identity,
+  // which is exactly why the kind travels with the ID here.
+  opponentKind: OpponentKind;
+  opponentId: string;
+  opponentSelectionSource: SystemSelectionSource;
   // Alpha 0.6.0 §7/§46 — the HOST and the acquired UPGRADEs are battle-static
   // in exactly the same sense the System is, so they join the battle-level
   // identity stamp and are never repeated into turn records (§35).
@@ -135,8 +141,9 @@ export function identityStamp(id: BattleIdentity): IdentityStamp {
   return {
     hackerId: id.hackerId,
     deckId: id.deckId,
-    systemId: id.systemId,
-    systemSelectionSource: id.systemSelectionSource,
+    opponentKind: id.opponentKind,
+    opponentId: id.opponentId,
+    opponentSelectionSource: id.opponentSelectionSource,
     hostId: id.hostId,
     upgradeIds: [...id.upgradeIds],
     passiveIds: [...id.passiveIds],
@@ -245,7 +252,25 @@ export interface TurnLogEntry {
 // turn stream at all, so targeted-Function, Drain, and interesting charge-route
 // telemetry had to be promoted OUT of the turn record to survive there. One
 // stream, written at every level; the level tag records how it was produced.
-export type BattleEventKind = 'ROUTE' | 'TARGETED' | 'DRAIN' | 'TRANSFORM' | 'COUNTDOWN' | 'PASSIVE';
+// Alpha 0.7.0 §41 — BOSS joins the EXISTING battle-event vocabulary rather
+// than opening a parallel boss log stream (§38).
+export type BattleEventKind = 'ROUTE' | 'TARGETED' | 'DRAIN' | 'TRANSFORM' | 'COUNTDOWN' | 'PASSIVE' | 'BOSS';
+
+// §41 — one ODANSHAY mechanic transition. Target COORDINATES are detail and are
+// retained only at COMPLETE, on exactly the terms EFFECT_TRANSFORM's `cells`
+// are; damage from CODESHATTER and from DATABEND's Syncs stays in the normal
+// damage stream and is NOT duplicated here.
+export interface BossMechanicRecord {
+  bossId: string;
+  kind: 'OVERRIDE_PLACED' | 'INSUFFICIENT_TARGETS' | 'THRESHOLD' | 'PLACEMENT_ABANDONED';
+  countBefore: number;
+  countAfter: number;
+  placed?: number;
+  overwrote?: number;
+  available?: number;
+  attempt?: number;
+  cells?: Pt[];
+}
 
 // Alpha 0.5.0 §37.1 — an EFFECT_TRANSFORM activation. Enough to verify what
 // happened without a board snapshot. The damage and charge its Syncs produced
@@ -315,6 +340,7 @@ export interface BattleEventEntry {
   transform?: TransformRecord;
   countdown?: CountdownRecord;
   passive?: PassiveRecord;
+  boss?: BossMechanicRecord;
 }
 
 // Alpha 0.4.1 §4.1 — the battle-level record is the AUTHORITY for everything
@@ -375,7 +401,13 @@ export interface SelectionLogEntry {
     | 'BUILD_OPENED'
     | 'BUILD_REPLACE'
     | 'BUILD_REORDER'
-    | 'BATTLE_BUILD_APPLIED';
+    | 'BATTLE_BUILD_APPLIED'
+    // Alpha 0.7.0 §12/§39 — Boss Selection joins the EXISTING event-sourced
+    // selection pipeline; §12 is explicit that no separate boss log store is
+    // created. OFFERED records the valid Boss IDs the screen presented,
+    // SELECTED the committed one.
+    | 'BOSS_OFFERED'
+    | 'BOSS_SELECTED';
   mode?: Mode;
   runStep?: RunStep;
   battleId?: string; // present once a battle exists
@@ -383,15 +415,21 @@ export interface SelectionLogEntry {
   identity: Partial<IdentityStamp>;
   hackerMaxLink?: number;
   systemMaxIce?: number;
-  // Alpha 0.5.0 §36 — resolved opponent identity on selection/creation
-  // records. Strong sets are included because they are the analytically
-  // interesting half of a System's profile; weak sets are their complement and
-  // are derivable, so they are deliberately not duplicated here.
-  systemId?: string;
-  systemSelectionSource?: SystemSelectionSource;
-  systemStrongColors?: number[];
-  systemStrongShapes?: number[];
-  systemPrograms?: string[];
+  // Alpha 0.5.0 §36, revised by Alpha 0.7.0 §39/§40 — resolved opponent
+  // identity on selection/creation records. Strong sets are included because
+  // they are the analytically interesting half of an opponent's profile; weak
+  // sets are their complement and are derivable, so they are deliberately not
+  // duplicated here. `opponentKind` keeps a Boss from ever reading as a System.
+  opponentKind?: OpponentKind;
+  opponentId?: string;
+  opponentSelectionSource?: SystemSelectionSource;
+  opponentStrongColors?: number[];
+  opponentStrongShapes?: number[];
+  opponentPrograms?: string[];
+  // Alpha 0.7.0 §39 — Boss Selection detail. `bossIds` is every valid Boss the
+  // screen offered; `bossId` is the committed one.
+  bossIds?: string[];
+  bossId?: string;
   // Alpha 0.6.0 §46 — resolved HOST identity, on the System's terms.
   hostId?: string;
   hostSelectionSource?: 'QUICK_RANDOM' | 'QUICK_CONSTRUCTED' | 'RUN_PATH';
@@ -400,7 +438,10 @@ export interface SelectionLogEntry {
   // packages with their screen indexes, so a log reader can reconstruct the
   // choice the player was actually given, not only the one they took.
   targetStep?: RunStep;
-  offers?: { index: number; systemId: string; hostId: string; upgradeId: string }[];
+  // Alpha 0.7.0 §39 — each offer records its opponent KIND alongside the ID, so
+  // a log reader can see that both Battle-4 cards led to the same Boss rather
+  // than inferring it from an ID prefix.
+  offers?: { index: number; opponentKind: OpponentKind; opponentId: string; hostId: string; upgradeId: string }[];
   upgradeExhausted?: boolean;
   selectedPath?: number;
   upgradeId?: string;
@@ -613,6 +654,34 @@ export class TurnLogger {
           break;
         case 'shake':
           act(`${ev.side} EFFECT_SHAKE ${ev.resolved ? 'resolved' : 'fizzled (legal)'}`);
+          break;
+        // Alpha 0.7.0 §41 — ODANSHAY mechanic transitions. Only meaningful
+        // transitions reach here: a threshold CHECK that found nothing emits no
+        // event at all, which is what keeps the §41 compactness goal.
+        case 'bossMechanic':
+          this.pushEvent(e.turn, 'BOSS', {
+            boss: {
+              bossId: ev.bossId,
+              kind: ev.kind,
+              countBefore: ev.countBefore,
+              countAfter: ev.countAfter,
+              ...(ev.placed !== undefined ? { placed: ev.placed } : {}),
+              ...(ev.overwrote !== undefined ? { overwrote: ev.overwrote } : {}),
+              ...(ev.available !== undefined ? { available: ev.available } : {}),
+              ...(ev.attempt !== undefined ? { attempt: ev.attempt } : {}),
+              ...(atLeast('COMPLETE') && ev.cells ? { cells: ev.cells } : {}),
+            },
+          });
+          act(
+            ev.kind === 'OVERRIDE_PLACED'
+              ? `${ev.bossId} placed ${ev.placed} Override(s) (${ev.countBefore}->${ev.countAfter})` +
+                (ev.overwrote ? `, overwriting ${ev.overwrote} Hacker special(s)` : '')
+              : ev.kind === 'INSUFFICIENT_TARGETS'
+                ? `${ev.bossId} has only ${ev.available} valid Override target(s) — activating DATABEND (attempt ${ev.attempt})`
+                : ev.kind === 'PLACEMENT_ABANDONED'
+                  ? `${ev.bossId} could not place Overrides after ${ev.attempt} attempt(s) — turn continues`
+                  : `${ev.bossId} Override threshold reached at ${ev.countBefore}`,
+          );
           break;
         // Alpha 0.6.0 §47 — PASSIVE contributions are promoted to the battle-
         // event stream so source attribution survives at BASIC, where there is

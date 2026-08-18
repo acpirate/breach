@@ -14,19 +14,24 @@
 // UPGRADE as first-class content, taking the runtime to nine required datasets
 // (§0.2). They join this same model and the same loader; there is no parallel
 // content authority for the new kinds.
+//
+// Alpha 0.7.0 adds BOSS as the tenth, on the same terms: one loader, one
+// resolved model, one registry. A Boss is a DISTINCT enemy identity layer, not
+// a System with a flag — see ResolvedBoss.
 
 import { AreaPatternId } from './areas';
 import { EffectId, EffectParamName, TargetKind } from './effects';
 import { AgentScope, PassiveActivation, PassiveEffectId } from './passives';
 import type { Color, Shape, Side } from '../types';
 
-export const GAME_VERSION = 'alpha-0.6.0';
-// Alpha 0.6.0 §40 — schema 5: PASSIVE authority after the Skill migration, HOST
-// identity, acquired UPGRADEs, pending route offers, and the committed path
-// package. Alpha 0.5 active saves (schema 4) cannot faithfully represent any of
-// them and are rejected through the established incompatible-save path, never
-// migrated and never back-filled with synthesized THRESHOLD/no-UPGRADE state.
-export const DATA_SCHEMA_VERSION = 5;
+export const GAME_VERSION = 'alpha-0.7.0';
+// Alpha 0.7.0 §33 — schema 6: the committed Boss, the two resumable setup
+// phases, and the honest `SYS | BOS` opponent union on both the pending route
+// and the battle identity. Alpha 0.6 active saves (schema 5) cannot faithfully
+// represent any of them — they have no Boss at all — and are rejected through
+// the established incompatible-save path (§36), never migrated and never
+// back-filled with a synthesized Boss or setup phase.
+export const DATA_SCHEMA_VERSION = 6;
 
 // §5.1/§4.4/§4.5 — every Hacker and every Deck contributes exactly this many
 // ordered Programs; the two portfolios combine into the Run inventory.
@@ -71,6 +76,44 @@ export const MIN_UPGRADE_ROWS = 4;
 // §29/§30 — how many paths a Path Choice screen offers.
 export const PATH_CHOICE_COUNT = 2;
 
+// ---- Alpha 0.7.0 §21-§27 — the ODANSHAY mechanic's payload Functions ----
+//
+// ODANSHAY's Override mechanic is CODE keyed to BOS_01 (§21), not a data-driven
+// scripting field: §2 explicitly forbids a MECHANIC_ID column or a generalized
+// Boss trigger table. These three Functions are therefore invoked from the
+// mechanic handler rather than from any Program, Deck, or PASSIVE reference.
+//
+// Naming them here does two jobs at once. The mechanic implementation resolves
+// its payloads through one authority instead of scattering string literals
+// through combat code, and the loader can count them as genuinely REFERENCED
+// content — otherwise every startup would emit three permanent "unreferenced
+// Function row" warnings for rows the engine demonstrably uses.
+export const BOSS_MECHANIC_BOSS_ID = 'BOS_01'; // ODANSHAY
+export const FN_DATABEND = 'FNC_018'; // §24 — insufficient-capacity fallback
+export const FN_REBOOT = 'FNC_019'; // §27 — post-threshold Datastream wipe
+export const FN_CODESHATTER = 'FNC_020'; // §27 — the threshold's damage payload
+
+export const BOSS_MECHANIC_FUNCTION_IDS: ReadonlyArray<string> = [
+  FN_DATABEND,
+  FN_REBOOT,
+  FN_CODESHATTER,
+];
+
+// §24 — the ODANSHAY end-of-turn placement contract, and §25's threshold.
+// Authored values used exactly as supplied (§60): three Overrides placed as the
+// final action of every non-terminal Boss turn, and the threshold firing at 15
+// or more on-board Overrides (>=, never exactly 15, §25).
+export const OVERRIDE_PLACEMENT_COUNT = 3;
+export const OVERRIDE_THRESHOLD = 15;
+
+// Director ruling (2026-08-17) — handoff §24 specified an UNBOUNDED
+// DATABEND/retry loop whose only exit was Hacker defeat. That is a hang if the
+// board can never reach three valid targets. The loop is hard-capped here;
+// on exhaustion the Boss places nothing and the turn continues normally. With
+// current content it realistically never iterates at all: the cap exists to
+// preempt hypothetical future unremovable Hacker- or HOST-placed specials.
+export const OVERRIDE_DATABEND_RETRY_LIMIT = 5;
+
 // ---- EFFECT_SHAKE typed parameters (§8.2-8.6) ----
 
 // Enum value names, kept as named constants so combat code never compares bare
@@ -79,6 +122,11 @@ export const SHAKE_REARRANGE = 0; // permute existing tile objects
 export const SHAKE_REPLACE = 1; // regenerate affected tiles as ordinary Packets
 export const SHAKE_RETAIN_SPECIALS = 0;
 export const SHAKE_REMOVE_SPECIALS = 1;
+// Alpha 0.7.0 §7.1 — remove only the overlays the ACTIVATING side does not own.
+// DATABEND (`1:2:1:2`) uses it so ODANSHAY's fallback clears Hacker-placed
+// overlays that are blocking Override capacity without destroying the Boss's own
+// accumulated Overrides — which would make the §25 threshold unreachable.
+export const SHAKE_REMOVE_ENEMY_SPECIALS = 2;
 export const SHAKE_PREVENT_MATCHES = 0;
 export const SHAKE_ALLOW_MATCHES = 1;
 export const SHAKE_CASCADE_NONE = 0; // initial post-Shake wave only
@@ -87,7 +135,7 @@ export const SHAKE_CASCADE_UNTIL_STABLE = 2; // ignore the finite limit
 
 export interface ShakeParams {
   boardComposition: 0 | 1;
-  specialGems: 0 | 1;
+  specialGems: 0 | 1 | 2;
   matches: 0 | 1;
   cascades: 0 | 1 | 2;
 }
@@ -344,6 +392,40 @@ export interface ResolvedSystem {
   graphics: string; // §5.2 placeholder only — no asset loading
 }
 
+// Alpha 0.7.0 §5 — an authored BOSS: the enemy-side combat identity for the
+// final Run battle. A DISTINCT identity layer rather than a System with a flag
+// (§1.1/§17): it is never reported as a SYS_ID in combat, saves, logs, metrics,
+// or UI, and it never receives the Run's additive ICE escalation (§19).
+//
+// It deliberately has NO `passives` field. The workbook supplies no PASSIVES
+// column, and §2/§5.1 forbid inventing one merely because a future Boss might
+// want it. ODANSHAY's Override mechanic is code keyed to BOS_01 (§21), not data.
+export interface ResolvedBoss {
+  id: string;
+  name: string;
+  // §19 — the FINAL Boss-battle ICE under Normal LINK, not a base the Run
+  // escalation table adds to. Director override 2026-08-17: authored as 250 so
+  // the Boss matches the Battle-4 durability the Alpha 0.6 ladder produced.
+  baseIce: number;
+  // §20 — authored strong sets; weak sets are calculated complements over the
+  // recognized enum vocabularies in enum order, exactly as Hacker and System
+  // weak sets are. No 3/3 partition is required.
+  strongColors: ReadonlyArray<Color>;
+  weakColors: ReadonlyArray<Color>;
+  strongShapes: ReadonlyArray<Shape>;
+  weakShapes: ReadonlyArray<Shape>;
+  // §5.2/§18 — the ordered PRG_SET. Order is charge-routing priority and display
+  // order; it is NOT Function-activation priority (§18), exactly as a System's.
+  programIds: ReadonlyArray<string>;
+  // §5.3 — parsed and fingerprinted, but NOT a selection filter: Alpha 0.7 has
+  // no random Boss pool, and Boss Selection lists every valid row.
+  inPool: boolean;
+  // §5.4 — presentation only. Never mechanic authority, never fingerprinted.
+  passiveDescription: string;
+  bio: string;
+  graphics: string;
+}
+
 export interface ResolvedDeck {
   id: string;
   name: string;
@@ -371,12 +453,14 @@ export interface ResolvedContent {
   systems: ReadonlyMap<string, ResolvedSystem>; // Alpha 0.5.0 §5
   hosts: ReadonlyMap<string, ResolvedHost>; // Alpha 0.6.0 §7
   upgrades: ReadonlyMap<string, ResolvedUpgrade>; // Alpha 0.6.0 §8
+  bosses: ReadonlyMap<string, ResolvedBoss>; // Alpha 0.7.0 §5
   // Authored row order, for deterministic selection-screen presentation.
   hackerOrder: ReadonlyArray<string>;
   deckOrder: ReadonlyArray<string>;
   systemOrder: ReadonlyArray<string>; // §15 — System Selection listing order
   hostOrder: ReadonlyArray<string>; // §38 — HOST Selection listing order
   upgradeOrder: ReadonlyArray<string>; // §30.2 — eligible-pool iteration order
+  bossOrder: ReadonlyArray<string>; // Alpha 0.7.0 §11 — Boss Selection listing order
 }
 
 // ---- active-content registry (set once at startup, read-only afterwards) ----
@@ -444,6 +528,24 @@ export function upgradeById(id: string): ResolvedUpgrade {
   const u = getContent().upgrades.get(id);
   if (!u) throw new Error(`unknown upgrade id: ${id}`);
   return u;
+}
+
+// Alpha 0.7.0 §5.5/§36 — the same unknown-ID contract every other identity
+// lookup uses. §36 is explicit that a missing or unknown Boss must NOT be
+// silently substituted with ODANSHAY: a broken reference is a broken save or
+// broken content, not a playable state.
+export function bossById(id: string): ResolvedBoss {
+  const b = getContent().bosses.get(id);
+  if (!b) throw new Error(`unknown boss id: ${id}`);
+  return b;
+}
+
+// §11 — every valid Boss in authored order, for the Boss Selection screen.
+// `in_pool` is deliberately NOT consulted: Alpha 0.7 has no random Boss
+// routing, so the flag never filters this list (§5.3).
+export function allBosses(): ResolvedBoss[] {
+  const c = getContent();
+  return c.bossOrder.map((id) => c.bosses.get(id)!);
 }
 
 export function passiveById(id: string): ResolvedPassive {
@@ -597,6 +699,10 @@ export interface ContentStamp {
   // System identity is battle-static and is never copied into turn records
   // (§35).
   systems: { id: string; baseIce: number; programs: string[] }[];
+  // Alpha 0.7.0 §40 — the authored Boss catalog, on exactly the System's terms,
+  // so an exported Boss-battle record identifies the opponent content it was
+  // played against without ever presenting the Boss as a System.
+  bosses: { id: string; baseIce: number; programs: string[] }[];
 }
 
 export function contentStamp(): ContentStamp {
@@ -620,6 +726,10 @@ export function contentStamp(): ContentStamp {
     systems: c.systemOrder.map((id) => {
       const s = c.systems.get(id)!;
       return { id: s.id, baseIce: s.baseIce, programs: [...s.programIds] };
+    }),
+    bosses: c.bossOrder.map((id) => {
+      const b = c.bosses.get(id)!;
+      return { id: b.id, baseIce: b.baseIce, programs: [...b.programIds] };
     }),
   };
 }

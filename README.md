@@ -1,35 +1,31 @@
-# Breach — Alpha 0.6.0
+# Breach — Alpha 0.7.0
 
-Breach is a mobile-first match-3 combat game with a cyberpunk hacking theme. Alpha 0.6.0 adds the environment and reward layers around the established combat model: every battle is now fought on a HOST, every Run is a sequence of path choices, and one shared PASSIVE framework replaces the Hacker-only Skill mechanic.
+Breach is a mobile-first match-3 combat game with a cyberpunk hacking theme. Alpha 0.7.0 completes the Alpha gameplay skeleton by adding the BOSS layer: a Run now opens by choosing the Boss it will end against, and Battle 4 is fought against that Boss rather than another randomized System.
 
 The project remains a whitebox development build rather than a complete game. It supports browser play, deterministic headless simulation, four-battle Runs, Quick Matches, persistent in-progress state, event-sourced metrics, and validated external content.
 
 ## Current status
 
-**Build:** `alpha-0.6.0`
-**Active save schema:** `5`
+**Build:** `alpha-0.7.0`
+**Active save schema:** `6`
 
-Alpha 0.6.0 adds:
+Alpha 0.7.0 adds:
 
-- a unified `PSV` PASSIVE framework replacing the retired `SKL` Skill dataset
-- PASSIVEs referenced by Hackers, Systems, HOSTs, and UPGRADEs alike, stacking by source
-- HOST (`HST`) as a first-class environment source with its own causal attribution
-- UPGRADE (`UPG`) as persistent Run-local reward state, always Hacker-owned
-- a Path Choice before every Run battle, committing a `SYS + HST + UPG` package
-- a fixed DOORMAN + THRESHOLD Battle 1 whose paths differ only by UPGRADE
-- randomized System/HOST route offers for Battles 2-4, with an `in_pool` authoring flag
-- `START_OF_TURN` carrier PASSIVEs that invoke a Function at no cost
-- continual PASSIVEs for match damage, match charge, charge dampening, Function damage, permanent Shield, and Bomb area
-- four new named area patterns and the `PSV_BIGGER_BOMB` progression
-- a generalized `EFFECT_TRANSFORM` axis grammar with neutral results and a two-tier target rule
-- HOST Selection in Constructed Quick Match and automatic HOST selection in Random Quick Match
-- System matching ON by default
-- a `PENDING_PATH` save phase with exact, never-rerolled offers
+- BOSS (`BOS`) as a tenth required runtime dataset and a distinct enemy identity layer — never a System with a flag
+- `BOS_01` ODANSHAY, the first authored Boss
+- Boss Selection as the FIRST New Run choice, and the point at which the Run is created
+- resumable setup: Continue returns to Hacker Selection or Deck Selection with the committed Boss intact
+- an honest `SYS | BOS` opponent union across route offers, battle identity, saves, logs, metrics, and UI
+- Battle 4 against the Run's selected Boss on both offered paths, with distinct randomized HOSTs
+- ODANSHAY's Override mechanic: three Boss-owned Overrides placed at the end of every non-terminal Boss turn
+- `FNC_018` DATABEND, `FNC_019` REBOOT, and `FNC_020` CODESHATTER as zero-cost mechanic payloads
+- an `EFFECT_SHAKE` `specialGems` mode that removes only the overlays the activating side does not own
+- save schema 6, rejecting Alpha 0.6 saves cleanly rather than synthesizing Boss or setup state
 
 The current implementation requirements are documented in:
 
 ```text
-staging/breach-alpha-0.6.0-coding-agent-handoff.md
+staging/breach-alpha-0.7.0-coding-agent-handoff.md
 ```
 
 Earlier Alpha, PoC, and MK requirements remain useful as development history but are not the current implementation specification.
@@ -62,20 +58,22 @@ npm run typecheck  # TypeScript validation
 npm run build      # production bundle
 ```
 
-Alpha 0.6.0 handoff results:
+Alpha 0.7.0 handoff results:
 
 | Command | Result |
 |---|---|
 | `npm run typecheck` | pass |
-| `npm test` | 237 passed, 0 failed |
+| `npm test` | 272 passed, 0 failed |
 | `npm run smoke` | `SMOKE OK` |
-| `npm run batch` | pass across 6 cells |
-| `npm run hpladder` | pass — 76/74/85% in timer mode; 39/37/29% with System matching |
-| `npm run build` | pass — 170.02 kB, 53.18 kB gzip |
+| `npm run batch` | pass across 6 cells, unchanged from Alpha 0.6 |
+| `npm run hpladder` | pass — 76/74/85% in timer mode; 39/37/29% with System matching, unchanged from Alpha 0.6 |
+| `npm run build` | pass — 183.17 kB, 56.46 kB gzip |
 
-Alpha 0.6 is a framework and content-structure build, not a balance pass. The player-facing default now runs with System matching ON, which is a deliberate difficulty change: the System takes a real turn instead of receiving a flat timer charge. Tuning is deferred to the post-beta content and balance pass. The ladder still reports both modes so the pre-0.6 numbers stay comparable.
+Alpha 0.7 is a feature-completion build, not a balance pass. The batch and ladder figures are byte-identical to Alpha 0.6, which is the intended result: nothing in the Boss layer changes normal System combat. The ladder still reports both matching modes so the pre-0.6 numbers stay comparable.
 
-Headless simulations pin one System (`SYS_01`) and one HOST (`HST_01` THRESHOLD, which has no PASSIVEs) so their output stays comparable between runs; random selection is gameplay behavior and does not belong in a measurement instrument.
+ODANSHAY's authored ICE of 250 makes Battle 4 as durable as the Alpha 0.6 ladder's step-4 System, but the Boss also spends part of every turn placing Overrides instead of attacking. Whether that nets out as a satisfying finale is a balance question deferred to the tuning pass.
+
+Headless simulations pin one System (`SYS_01`) and one HOST (`HST_01` THRESHOLD, which has no PASSIVEs) so their output stays comparable between runs; random selection is gameplay behavior and does not belong in a measurement instrument. Boss battles are reached through a separate harness fixture rather than by widening Quick Match.
 
 The current content loads with zero errors and five expected warnings:
 
@@ -83,7 +81,7 @@ The current content loads with zero errors and five expected warnings:
 - duplicate display name `DISABLER` across Hacker and System Programs
 - unreferenced showcase Functions `FNC_007`, `FNC_008`, and `FNC_009`
 
-These are warnings rather than startup blockers. The Alpha 0.5 warning about `PRG_S_004` DISABLER being unfielded is gone: DOORMAN fields it, so the System now Drains in live play.
+These are warnings rather than startup blockers, and the set is unchanged from Alpha 0.6. `FNC_018`, `FNC_019`, and `FNC_020` do **not** warn as unreferenced: the ODANSHAY mechanic handler declares them as the payloads it invokes, so the loader counts them as genuinely referenced content rather than dead rows.
 
 ## Systems
 
@@ -108,7 +106,7 @@ DOORMAN is the fixed Battle 1 opponent and is excluded from the random pool by i
 
 `PRG_SET` order is charge-routing priority, display order, and save identity. It is **not** Function-activation priority.
 
-There is no System portfolio, System inventory, System Build screen, or System Program reordering in Alpha 0.6. System PASSIVEs are supported — the `PASSIVES` column resolves through the shared `PSV` dataset exactly as the Hacker's does — but no authored System currently references one. The retired `SKILL` header is not accepted as an alias; a stale export fails the header check.
+There is no System portfolio, System inventory, System Build screen, or System Program reordering. System PASSIVEs are supported — the `PASSIVES` column resolves through the shared `PSV` dataset exactly as the Hacker's does — but no authored System currently references one. The retired `SKILL` header is not accepted as an alias; a stale export fails the header check.
 
 Each System and HOST also carries an `in_pool` flag. Blank or `y` includes the row in random route generation and Random Quick Match; `n` excludes it. Deliberate selection screens ignore the flag and always list everything.
 
@@ -121,7 +119,50 @@ Quick Match:  BASE_ICE
 Run battle N: BASE_ICE + run-step modifier   (+0, +50, +100, +150)
 ```
 
-A `BASE_ICE = 100` System therefore still produces the established 100 / 150 / 200 / 250 Run ladder, while a future System with different durability escalates correctly without redesigning Run progression. With Normal LINK off, the manual System ICE setting replaces both the base and the step modifier; the values are never combined.
+A `BASE_ICE = 100` System therefore still produces the established 100 / 150 / 200 Run ladder for Battles 1-3, while a future System with different durability escalates correctly without redesigning Run progression. With Normal LINK off, the manual enemy ICE setting replaces both the base and the step modifier; the values are never combined.
+
+A **Boss** does not take the step modifier at all — see below.
+
+## Bosses
+
+A Boss is a distinct enemy identity layer, not a System with a flag. `BOS` is its own runtime dataset with its own header, and a Boss is never stored, logged, or displayed as a `SYS_ID`.
+
+The `BOS` schema is:
+
+```text
+BOS_ID  name  in_pool  BASE_ICE  STRONG_COLORS  STRONG_SHAPES  PRG_SET
+BOSS_PASSIVE_DESCRIPTION  BIO  GRAPHICS
+```
+
+There is deliberately no `PASSIVES` column and no `MECHANIC_ID`. A Boss contributes no identity PASSIVEs, and ODANSHAY's mechanic is code keyed to `BOS_01` rather than a data-driven scripting field.
+
+The authored Boss is:
+
+| Boss | ICE | Strong colors | Strong shapes | Build (top to bottom) |
+|---|---|---|---|---|
+| `BOS_01` ODANSHAY | 250 | Green, Blue, Magenta | Square, Circle, Diamond | DISABLER, SHIELDER, SPAMBOT, ATTACKER |
+
+Weak sets derive as the enum-order complement, exactly as a Hacker's and a System's do. The ordered `PRG_SET` is charge-routing priority and display order, not Function-activation priority.
+
+`in_pool` is parsed and fingerprinted but is **not** a selection filter: Alpha 0.7 has no random Boss routing, and Boss Selection lists every valid authored row.
+
+### Boss ICE
+
+Under Normal LINK a Boss uses its authored `BASE_ICE` as the final battle ICE, with **no** run-step modifier on top. ODANSHAY's authored 250 is therefore the Battle-4 ICE directly, matching the durability the Alpha 0.6 ladder produced at that step. With Normal LINK off, the manual enemy ICE setting overrides it exactly as it does for a System; there is no separate manual Boss ICE setting.
+
+### ODANSHAY's Override mechanic
+
+An **Override** is a Boss-owned board overlay. It does not change the Packet's color or shape, deals no damage, grants no charge, and triggers no Sync; it occupies the overlay slot, counts toward the Boss's on-board total, and is destroyed by any ordinary mechanic that destroys an enemy special.
+
+- **End of every non-terminal Boss turn:** place exactly three Overrides, chosen from the gameplay RNG. A valid target is an occupied axis-bearing Packet that does not already carry a Boss-owned overlay; a Hacker-owned overlay is a valid target and is destroyed and replaced.
+- **Too few valid targets:** place none — never a partial one or two — then activate `FNC_018` DATABEND at no charge cost, resolve it completely, and retry. The retry is capped at five attempts, after which the Boss places nothing and the turn continues normally.
+- **Start of every Boss turn:** if fifteen or more Overrides are on the board, activate `FNC_020` CODESHATTER (70 Function damage), check for defeat, and — if the Hacker survives — activate `FNC_019` REBOOT, which wipes the Datastream as though a new battle had started. The turn then continues from countdown ticking. Fifteen is a repeatable threshold, not a phase change.
+
+Turn order on a Boss turn is: HOST `START_OF_TURN` PASSIVEs, then the Override threshold, then countdown ticking, then the normal enemy Function phase and turn-ending behavior, then the three-Override placement as the final action.
+
+### Zero-cost Functions
+
+`cost = 0` is valid only for a Function that is **not** directly assigned to a Program or a Deck, and that is therefore invoked only through a PASSIVE, boss, or mechanic payload path where no charge is paid. A Program's charge pool capacity is its Function's cost, so a zero-cost assigned Function would hold no pool and fire free every turn; startup rejects that outright. `FNC_016`, `FNC_017`, `FNC_018`, `FNC_019`, and `FNC_020` are the valid examples.
 
 ## HOSTs and UPGRADEs
 
@@ -152,9 +193,10 @@ There are four UPGRADEs and four acquisition decisions, so before Battle 4 exact
 
 ```text
 Title
+→ Boss Selection       (commits the Run and replaces the save)
 → Hacker Selection
 → Deck Selection
-→ Path Choice          (commits the Run and replaces the save)
+→ Path Choice
 → Build
 → Battle 1
 → Result
@@ -162,15 +204,22 @@ Title
 → Build
 → Battle 2
 → ...
+→ Battle 4             (the selected Boss)
 ```
 
-Every battle is preceded by a Path Choice offering two `SYS + HST + UPG` packages. Selecting one is immediate and final for that battle: it acquires the UPGRADE, commits the System and HOST, and opens the Build screen — so the player always edits the build against a fully known encounter.
+Choosing the Boss is the **destructive commitment boundary**: it creates the Run, replaces the previous save, and persists the Boss immediately. From that moment the Boss is fixed — ordinary Back navigation cannot change it, and picking a different one means deliberately starting the Run again.
 
-Battle 1 is fixed: both paths are DOORMAN on THRESHOLD, and the only difference is the UPGRADE. Battles 2-4 randomize System and HOST independently from the `in_pool` subsets, avoiding two identical `SYS + HST` pairs within one offer when another combination exists. Repeating a previous battle's System or HOST is allowed.
+Setup itself is resumable from there. Closing the tab after committing the Boss and reopening it offers `Continue Run — Hacker Selection`; doing the same after committing the Hacker offers `Continue Run — Deck Selection`. Only committed selections are saved: a highlighted-but-unconfirmed row is never Run state.
 
-Entering the **initial** Path Choice is the destructive commitment boundary: it creates the Run, replaces the previous save, generates the two offers, and persists them immediately. Reloading on a Path Choice restores exactly the same two cards — offers are never rerolled.
+Every battle is preceded by a Path Choice offering two `opponent + HST + UPG` packages. Selecting one is immediate and final for that battle: it acquires the UPGRADE, commits the opponent and HOST, and opens the Build screen — so the player always edits the build against a fully known encounter.
 
-Retrying a lost battle preserves the committed System, HOST, and every acquired UPGRADE, and generates no new path. A full Restart Run clears Run-local progression: the acquired UPGRADEs go with the abandoned Run.
+Battle 1 is fixed: both paths are DOORMAN on THRESHOLD, and the only difference is the UPGRADE. The Boss choice does not alter it. Battles 2-3 randomize System and HOST independently from the `in_pool` subsets, avoiding two identical `SYS + HST` pairs within one offer when another combination exists. Repeating a previous battle's System or HOST is allowed.
+
+**Battle 4 always uses the Boss selected at New Run start.** Both final paths name that same Boss and vary the HOST, which is drawn from the same escalation pool and is distinct across the two cards whenever at least two eligible HOSTs exist. With four authored UPGRADEs and four acquisition decisions, exactly one UPGRADE remains at the final screen, so both cards legitimately offer it and taking either acquires it once.
+
+Reloading on a Path Choice restores exactly the same two cards — offers are never rerolled.
+
+Retrying a lost battle preserves the committed opponent, HOST, and every acquired UPGRADE, and generates no new path. A full Restart Run clears Run-local progression: the acquired UPGRADEs go with the abandoned Run.
 
 ### Quick Match
 
@@ -188,7 +237,7 @@ Quick Match
 
 System Selection lists every valid loaded System with its Quick Match ICE, strong and weak axes, and ordered Programs. HOST Selection lists every valid loaded HOST with its resolved PASSIVE text — or, for a carrier with no authored display, its payload Function name. Both ignore `in_pool`: that flag governs random generation only, so a tester can always field a specific encounter deliberately.
 
-There is no UPGRADE selection in Quick Match and no Run UPGRADE state in a Quick Match save.
+There is no UPGRADE selection in Quick Match and no Run UPGRADE state in a Quick Match save. Quick Match is also **System-only**: there is no Boss Quick Match, and a Quick Match save claiming a Boss opponent is rejected as malformed. Automated coverage reaches Boss battles through the headless harness instead.
 
 Constructed Quick Match still remembers the last valid Hacker build and order, independent of Run progression. There is no remembered System or HOST preference.
 
@@ -361,7 +410,7 @@ This is a deliberate change from Alpha 0.4.1, where placement Functions fired in
 
 ### `EFFECT_TRANSFORM` and its axis grammar
 
-A Transform changes the underlying color/shape identity of Packets matching an authored target spec. Alpha 0.6 generalizes both axis columns (director override, 2026-08-11):
+A Transform changes the underlying color/shape identity of Packets matching an authored target spec. Alpha 0.6 generalized both axis columns (director override, 2026-08-11):
 
 ```text
 axisTarget:  NEU | ALL | <COLOR> | <SHAPE> | <COLOR>:<SHAPE>
@@ -450,7 +499,7 @@ DOORMAN fields DISABLER, so this path is exercised by live play from Battle 1 of
 
 Runtime source files are stored under `data/`.
 
-The nine required datasets define:
+The ten required datasets define:
 
 ```text
 Hackers
@@ -459,6 +508,7 @@ Decks
 Hacker Programs
 System Programs
 Systems
+Bosses
 HOSTs
 UPGRADEs
 Functions
@@ -479,7 +529,7 @@ FNC_...      Function
 EFFECT_...   coded Effect
 ```
 
-Hackers define LINK, strong color and shape sets, ordered PASSIVEs, and an ordered three-Program portfolio. Decks add LINK, an ordered three-Program portfolio, and one Deck Function. Systems define base ICE, strong color and shape sets, an ordered four-Program build, ordered PASSIVEs, and a pool flag. HOSTs define ordered PASSIVEs and a pool flag. UPGRADEs define ordered PASSIVEs. PASSIVEs define a coded effect, typed parameters, an activation, an agent scope, and an optional Function payload. Programs define identity, charge bindings, and one active Function. Functions define activation cost, payload, common fields, transform axes, and typed Effect-specific parameter tuples. Effects remain coded TypeScript actions rather than spreadsheet scripting.
+Hackers define LINK, strong color and shape sets, ordered PASSIVEs, and an ordered three-Program portfolio. Decks add LINK, an ordered three-Program portfolio, and one Deck Function. Systems define base ICE, strong color and shape sets, an ordered four-Program build, ordered PASSIVEs, and a pool flag. Bosses define base ICE, strong color and shape sets, an ordered four-Program build, and a pool flag — and deliberately no PASSIVEs column. HOSTs define ordered PASSIVEs and a pool flag. UPGRADEs define ordered PASSIVEs. PASSIVEs define a coded effect, typed parameters, an activation, an agent scope, and an optional Function payload. Programs define identity, charge bindings, and one active Function. Functions define activation cost, payload, common fields, transform axes, and typed Effect-specific parameter tuples. Effects remain coded TypeScript actions rather than spreadsheet scripting.
 
 A Function cost of `0` is legal so a PASSIVE carrier payload can state its true cost, but a zero-cost Function may **not** be assigned to a Program or Deck: a charge pool's capacity is its Function's cost, so such a Program would hold no pool and fire free every turn. That assignment is a blocking startup error.
 
@@ -504,12 +554,14 @@ Validation includes:
 - enum and area-pattern values
 - typed Effect parameter tuples and the transform axis grammar
 - positive integer `BASE_ICE`
-- exactly four distinct System Programs in each `PRG_SET`
+- exactly four distinct System Programs in each System and Boss `PRG_SET`
+- Boss ID uniqueness, prefix, strong-axis tokens, and Program references
 - PASSIVE activation, agent scope, typed params, and required/forbidden Function payloads
 - `START_OF_TURN` payloads that are executable without player targeting
 - PASSIVE references from every source kind
 - at least four valid UPGRADE rows
 - a nonempty random pool for both Systems and HOSTs
+- at least one valid Boss row
 - zero-cost Functions not assigned to a Program or Deck
 - broken references
 - invalid Function composition
@@ -531,7 +583,7 @@ Data loads once at application startup and is not reloaded during an active sess
 
 ## Persistence
 
-Alpha 0.6 uses save schema `5`.
+Alpha 0.7 uses save schema `6`.
 
 Supported active-save phases are:
 
@@ -539,14 +591,17 @@ Supported active-save phases are:
 - `PENDING_RESULT`
 - `PENDING_BUILD` for Run state between battles
 - `PENDING_PATH` for a committed Run sitting on a Path Choice
+- `SETUP_HACKER` and `SETUP_DECK` for a Run whose Boss is committed but whose identity is not
 
-Saves include the selected Hacker, Deck, System, and HOST, how the System was chosen, the acquired UPGRADEs in acquisition order, the six-Program inventory, the ordered four-Program active build, the System's ordered build, battle identity, board and special state (including armed countdowns and their stamped area patterns), LINK/ICE, Program and Deck charge, configuration, metrics, content fingerprint, the isolated route RNG state, and deterministic gameplay RNG state where applicable.
+The two setup phases carry the committed Boss, the settings snapshot, the route RNG seed, and — at `SETUP_DECK` — the committed Hacker. They carry no battle identity and no battle, because neither exists yet.
+
+Saves include the selected Boss, Hacker, Deck, opponent, and HOST, the opponent's identity kind (`SYS` or `BOS`), how it was chosen, the acquired UPGRADEs in acquisition order, the six-Program inventory, the ordered four-Program active build, the System's ordered build, battle identity, board and special state (including armed countdowns and their stamped area patterns), LINK/ICE, Program and Deck charge, configuration, metrics, content fingerprint, the isolated route RNG state, and deterministic gameplay RNG state where applicable.
 
 A `PENDING_PATH` save carries no battle and holds the two exact offers, which restore verbatim — a reload never rerolls them.
 
-System, HOST, and UPGRADE identity are stored as stable IDs. Immutable definitions are not copied into the save; they resolve through the matching content fingerprint.
+Boss, System, HOST, and UPGRADE identity are stored as stable IDs. A Boss encounter stores `opponentKind: BOS` alongside its `BOS_ID`; there is no fake `SYS_ID` for Battle 4 anywhere in the save. Immutable definitions are not copied into the save; they resolve through the matching content fingerprint.
 
-Alpha 0.5 saves are rejected cleanly. There is no migration and no partial restore: an old save cannot represent PASSIVE authority, HOST identity, acquired UPGRADEs, pending offers, or a committed path package, and restoring one would mean inventing them. Saves with stale inventory, an unknown `SYS_ID`/`HST_ID`/`UPG_ID`, a duplicate acquired UPGRADE, structurally incomplete offers, an exhaustion flag that disagrees with the offers, a System build that no longer matches, or a mismatched gameplay-content fingerprint are rejected rather than silently defaulted.
+Alpha 0.6 saves are rejected cleanly. There is no migration and no partial restore: an old save has no Boss and no setup phase at all, and restoring one would mean inventing them. Also rejected rather than silently defaulted: stale inventory; an unknown `BOS_ID`/`SYS_ID`/`HST_ID`/`UPG_ID`; an opponent ID that does not resolve in the layer it claims; a setup phase inconsistent with its committed selection IDs; a Battle-4 route naming a normal System or a Boss the Run never committed to; a duplicate acquired UPGRADE; structurally incomplete offers; an exhaustion flag that disagrees with the offers; an enemy build that no longer matches; a Quick Match save claiming a Boss; or a mismatched gameplay-content fingerprint.
 
 The remembered Constructed Quick Match preset is stored separately under its own versioned preference key and survives the schema bump. It holds a Hacker build only.
 
@@ -560,9 +615,12 @@ Current instrumentation includes:
 - source-specific damage attribution across disjoint buckets: Sync, Bomb, Attack, line-slice, Transform, Buffer, and PASSIVE
 - Function activation, Effect operation, and fizzle counts
 - Hacker, Deck, inventory, active build, and Program order
-- System identity, selection source, strong axes, and ordered build
+- opponent identity — `SYS` or `BOS` kind, ID, selection source, strong axes, and ordered build — so a Boss battle never reports a System
 - HOST identity and selection source; acquired UPGRADEs in acquisition order
-- route offers and commitments: target battle, both offered `SYS`/`HST`/`UPG` packages, the pool-exhaustion flag, the selected path, and the acquired list afterwards
+- route offers and commitments: target battle, both offered packages with their opponent kind, the pool-exhaustion flag, the selected path, and the acquired list afterwards
+- Boss Selection: the valid Boss IDs offered and the committed one
+- Boss mechanic transitions: Override placement batches with before/after counts, target coordinates at `COMPLETE`, and Hacker specials overwritten; the insufficient-target condition and its DATABEND invocations; and the threshold firing
+- Boss battle aggregates: total Overrides placed, peak simultaneous count, Hacker specials overwritten, and DATABEND / CODESHATTER / REBOOT activation counts
 - PASSIVE contributions keyed by INSTANCE — source kind, source ID, and PASSIVE ID — so several PASSIVEs modifying one calculation stay individually attributable
 - HOST causal source alongside the agent that owned the resulting Sync
 - Transform activations with converted count, eligible count, fallback-tier usage, and both axis tokens
@@ -572,7 +630,7 @@ Current instrumentation includes:
 - Disabler target ID and readiness data
 - cascade behavior, think time, save schema, and content fingerprint
 
-System, HOST, and UPGRADE identity are battle-static: they live once on the battle-level record and join to turn and event records by `battleId` rather than being repeated per turn.
+Boss, System, HOST, and UPGRADE identity are battle-static: they live once on the battle-level record and join to turn and event records by `battleId` rather than being repeated per turn.
 
 The base event always keeps its own mechanism attribution and a PASSIVE's increment is recorded separately, so metric totals still reconcile exactly after PASSIVE modifiers.
 
@@ -593,8 +651,8 @@ The compact exporter classifies every record it reads as rendered, summarized, i
 
 ```text
 data/
-  Authoritative Hacker, PASSIVE, Deck, System, HOST, UPGRADE, Program, and
-  Function CSV resources — the nine required runtime datasets
+  Authoritative Hacker, PASSIVE, Deck, System, BOSS, HOST, UPGRADE, Program,
+  and Function CSV resources — the ten required runtime datasets
 
 staging/
   Handoff specifications and the authoring workbook they were exported from
@@ -628,29 +686,34 @@ Effect validation is centralized in the Effect registry. Runtime Effect dispatch
 
 ## Manual verification still recommended
 
-The automated suite and desktop-browser checks pass, but the following should still be checked manually:
+The automated suite and browser checks pass, including the setup, route, and Boss-battle UI at a real 390 x 844 CSS-pixel viewport. The following should still be checked manually:
 
-- a real phone or tablet, and any narrow viewport, especially the path cards, HOST Selection, the Build context panels, and the Settings accordion
-- a complete four-battle Run through every Path Choice, Build, and result transition
-- the final Path Choice showing the one remaining UPGRADE on both cards
+- a real phone or tablet — the narrow-viewport checks were done in a 390 x 844 frame, not on hardware
+- winning the Boss battle and confirming Run Complete, and losing it and confirming ordinary Run-loss handling
+- a Hacker-owned special being visibly overwritten by an Override in the browser (covered by automated tests only)
+- a complete four-battle Run at default settings, end to end, without the harness shortcuts
 - Save and Quit from a between-battle Build, followed by resume
 - retry-after-defeat retaining the same encounter package and UPGRADE list
 - VERDUN/`PSV_BIGGER_BOMB` visibly enlarging a detonation
 - SNEAKERS/SNEAK firing at Hacker turn start
-- a START_OF_TURN carrier resolving before a countdown ticks, in a setup that shows it
 - EBUFF countdown overlays becoming live Buffs in the browser
 - SPAM detonations and their charge generation in the browser
 - a same-phase second System activation driven by Function-created charge
 
 The development-only Find Sync control may overlap status text on a narrow viewport. This is pre-existing and does not affect production controls.
 
+Loading the app with `?dev=boss` starts a Boss battle directly. It is a development harness only: it appears in no menu, is unreachable from normal play, and writes a save that Continue deliberately will not restore, because Quick Match is System-only.
+
 ## Current scope
 
-Alpha 0.6 establishes the environment, reward, and passive layers around the Alpha 0.5 encounter model.
+Alpha 0.7 completes the Alpha gameplay skeleton: identity, environment, reward, passive, route, and boss layers are all in place.
 
 Not included yet:
 
-- boss mechanics, boss-specific route rules, or boss battlefields
+- additional Bosses, Boss phases, boss-specific HOST routing, or fixed boss HOSTs
+- a generalized boss-mechanic scripting engine — ODANSHAY's Override mechanic is code keyed to `BOS_01`
+- Boss PASSIVEs: the Alpha 0.7 `BOS` schema has no `PASSIVES` column
+- Boss Quick Match, boss reward tables, or a post-run completion/high-score matrix
 - permanent account progression, or rewards outside the Run-local UPGRADE layer
 - reward rarity or economy
 - a procedural map beyond the two-option path screen
@@ -661,9 +724,9 @@ Not included yet:
 - multiple active Functions per Program, or Program passives
 - multi-Packet targeting
 - a generalized delayed-Function graph
-- broad balance changes — Alpha 0.6 is a framework build and tuning is deferred to the post-beta content and balance pass
+- broad balance changes — Alpha 0.7 is a framework build and tuning is deferred to the post-beta content and balance pass
 - runtime-editable content in a production bundle: `data/*.csv` are read from disk by the headless tools and re-read on reload in `npm run dev`, but `npm run build` still inlines them
 - axis-specific charge-waste metrics
 - final art, animation, audio, accessibility, or production polish
 
-The next build can add boss rules, more PASSIVE content, or encounter curation without replacing the Alpha 0.6 PASSIVE framework, HOST/UPGRADE layers, or route state.
+Content expansion, balance, broader boss parameterization, content tooling, and engine migration remain later work, and none of them requires replacing the Alpha 0.7 identity, route, or mechanic layers.

@@ -59,8 +59,14 @@ export function activePassives(identity: BattleIdentity): PassiveInstance[] {
   };
   const hacker = hackerById(identity.hackerId);
   push(hacker.passives, 'HAK', hacker.id, 'player');
-  const system = systemById(identity.systemId);
-  push(system.passives, 'SYS', system.id, 'enemy');
+  // Alpha 0.7.0 §5.1/§26 — only a SYSTEM opponent contributes identity
+  // PASSIVEs. The Alpha 0.7 Boss schema has NO PASSIVES column (§2 forbids
+  // inventing one), so a Boss battle simply contributes nothing at this step;
+  // §26.2 is explicit that no Boss PASSIVE layer is to be added to populate it.
+  if (identity.opponentKind === 'SYS') {
+    const system = systemById(identity.opponentId);
+    push(system.passives, 'SYS', system.id, 'enemy');
+  }
   const host = hostById(identity.hostId);
   push(host.passives, 'HST', host.id, null);
   // §12 — UPGRADEs are ALWAYS Hacker-owned, whatever their agent_scope says

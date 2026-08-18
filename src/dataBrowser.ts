@@ -14,6 +14,7 @@ import dekText from '../data/breach datastructures - DEK.csv?raw';
 import sysText from '../data/breach datastructures - SYS.csv?raw';
 import hstText from '../data/breach datastructures - HST.csv?raw';
 import upgText from '../data/breach datastructures - UPG.csv?raw';
+import bosText from '../data/breach datastructures - BOS.csv?raw';
 import { DataFiles } from './logic/data/load';
 
 // The manifest: each dataset's ROLE is declared here and independently
@@ -29,5 +30,6 @@ export function browserDataFiles(): DataFiles {
     systems: { name: 'breach datastructures - SYS.csv', text: sysText },
     hosts: { name: 'breach datastructures - HST.csv', text: hstText },
     upgrades: { name: 'breach datastructures - UPG.csv', text: upgText },
+    bosses: { name: 'breach datastructures - BOS.csv', text: bosText },
   };
 }

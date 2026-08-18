@@ -16,7 +16,7 @@ initContentOrExit();
 // Alpha 0.5.0 §44 — the ladder pins its opponent, so tier-to-tier and
 // run-to-run comparisons measure tempo rather than a changing System.
 {
-  const s = systemById(headlessSystem().systemId);
+  const s = systemById(headlessSystem().id);
   console.log(`system: ${s.id} ${s.name} | build: ${s.programIds.join(', ')}`);
 }
 

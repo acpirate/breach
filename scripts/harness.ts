@@ -5,8 +5,10 @@
 
 import { DEFAULT_BATTLE_SETTINGS } from '../src/logic/constants';
 import {
+  BOSS_MECHANIC_BOSS_ID,
   HEADLESS_HOST_ID,
   HEADLESS_SYSTEM_ID,
+  bossById,
   deckById,
   defaultBuild,
   hackerById,
@@ -15,7 +17,7 @@ import {
   systemById,
 } from '../src/logic/data/content';
 import { Game } from '../src/logic/game';
-import { SelectedSystem, createQuickMatchBattle, defaultIdentity } from '../src/logic/session';
+import { SelectedOpponent, createQuickMatchBattle, defaultIdentity } from '../src/logic/session';
 import { BattleSettings, BuildOrigin } from '../src/logic/types';
 
 export const D: BattleSettings = DEFAULT_BATTLE_SETTINGS;
@@ -31,8 +33,16 @@ export const TIMER_MODE: BattleSettings = { ...DEFAULT_BATTLE_SETTINGS, enemyMat
 // instrument needs a fixed opponent or its output stops being comparable
 // between runs. Designer note (2026-08-07): replace with a purpose-built
 // TESTER System in a future build.
-export function headlessSystem(systemId: string = HEADLESS_SYSTEM_ID): SelectedSystem {
-  return { systemId: systemById(systemId).id, source: 'HEADLESS_PINNED' };
+export function headlessSystem(systemId: string = HEADLESS_SYSTEM_ID): SelectedOpponent {
+  return { kind: 'SYS', id: systemById(systemId).id, source: 'HEADLESS_PINNED' };
+}
+
+// Alpha 0.7.0 §45 — the test-fixture route to a Boss battle. §45 forbids
+// expanding player-facing Quick Match with Boss selection, and explicitly
+// directs automated coverage to use a harness entry point like this instead.
+// `HEADLESS_PINNED` keeps the selection source honest: it is never in play.
+export function headlessBoss(bossId: string = BOSS_MECHANIC_BOSS_ID): SelectedOpponent {
+  return { kind: 'BOS', id: bossById(bossId).id, source: 'HEADLESS_PINNED' };
 }
 
 // Alpha 0.6.0 — the same reasoning for the environment layer: the pinned HOST
@@ -65,7 +75,7 @@ export function newBattle(
   seed?: number,
   build: readonly string[] = defaultActiveBuild(),
   origin: BuildOrigin = 'DEFAULT',
-  system: SelectedSystem = headlessSystem(),
+  system: SelectedOpponent = headlessSystem(),
   hostId: string = headlessHost(),
 ): Game {
   return createQuickMatchBattle(settings, defaultIdentity(), system, hostId, build, origin, seed);

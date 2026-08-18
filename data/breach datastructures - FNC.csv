@@ -16,3 +16,6 @@ FNC_014,EBUFF,9,EFFECT_BUFF,when countdown goes off those same packets become th
 FNC_015,SPAM,7,EFFECT_BOMB,"many small bombs, charges",3,1,AREA_CARDINAL_1,,,,,,0:0:0
 FNC_016,GREENING,0,EFFECT_TRANSFORM,turn other packets into green,3,,,,,,ALL,GRE,0:1
 FNC_017,SNEAK,0,EFFECT_TRANSFORM,turn other packets into magenta,2,,,,,,ALL,MAG,0:1
+FNC_018,DATABEND,0,EFFECT_SHAKE,supports ODANSHAY's passive,,,,,,,,,1:2:1:2
+FNC_019,REBOOT,0,EFFECT_SHAKE,supports ODANSHAY's passive,,,,,,,,,1:1:0:0
+FNC_020,CODESHATTER,0,EFFECT_ATTACK,supports ODANSHAY's passive,,,,,70,,,,

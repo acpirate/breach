@@ -13,7 +13,7 @@
 // charge attribution, and Shake attempts/successes/legal fizzles are counted.
 // Damage buckets remain DISJOINT and never double count.
 
-import { getContent } from './data/content';
+import { FN_CODESHATTER, FN_DATABEND, FN_REBOOT, getContent } from './data/content';
 import { GameEvent, PassiveCause, PassiveSourceKind, Side, opponentOf } from './types';
 
 export interface UnitMetrics {
@@ -138,7 +138,28 @@ export interface BattleMetrics {
   enemyShieldRemoved: number;
   enemyShieldInstances: number; // Hacker->System damage instances that hit active shield
   enemyShieldPrevented: number; // total damage absorbed by shields
+  // Alpha 0.7.0 §42 — Boss-battle aggregates. Battle-level counters, exactly
+  // like `detonations` and `systemWithholds` above, so the encounter can be
+  // evaluated later without adding per-turn storage (§42). DAMAGE is NOT
+  // duplicated here: the existing attribution buckets remain authoritative for
+  // amounts, and §42 forbids a second Boss-only damage tree.
+  boss: BossMetrics | null; // null in every non-Boss battle
   sides: Record<Side, SideMetrics>;
+}
+
+// §42 — present only when the opponent is a Boss.
+export interface BossMetrics {
+  bossId: string;
+  overridesPlaced: number; // total placed across the battle
+  overridePeak: number; // peak simultaneous on-board count
+  hackerSpecialsOverwritten: number;
+  databendActivations: number;
+  codeshatterActivations: number;
+  rebootActivations: number;
+  // The director-mandated retry cap actually being hit. Expected to stay 0 with
+  // current content; a nonzero value means the board reached a state where three
+  // Overrides could not be placed even after the permitted DATABEND retries.
+  placementsAbandoned: number;
 }
 
 const emptyUnit = (): UnitMetrics => ({ fires: 0, ops: 0, fizzles: 0, effect: 0, bombsPlaced: 0 });
@@ -201,12 +222,27 @@ function emptySide(programIds: readonly string[]): SideMetrics {
 export function createBattleMetrics(
   playerPrograms: readonly string[],
   enemyPrograms: readonly string[],
+  // §42 — supplied only for a Boss battle; every other battle carries null and
+  // no Boss counters at all.
+  bossId?: string,
 ): BattleMetrics {
   return {
     turns: 0,
     autoReshuffles: 0,
     detonations: 0,
     systemWithholds: 0,
+    boss: bossId
+      ? {
+          bossId,
+          overridesPlaced: 0,
+          overridePeak: 0,
+          hackerSpecialsOverwritten: 0,
+          databendActivations: 0,
+          codeshatterActivations: 0,
+          rebootActivations: 0,
+          placementsAbandoned: 0,
+        }
+      : null,
     winner: null,
     thinkTimesMs: [],
     hintsShown: 0,
@@ -297,12 +333,25 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
       }
       case 'ability': {
         const sm = m.sides[ev.side];
-        if (ev.ownerKind === 'deck') sm.deck.fires++;
+        // Alpha 0.7.0 §42 — a `boss` activation is the ODANSHAY mechanic, not a
+        // Program. Counting it through unitOf() would invent a phantom
+        // per-Program row keyed by the Boss ID and corrupt the Program metrics,
+        // so it goes to the Boss aggregates by payload Function instead.
+        if (ev.ownerKind === 'boss') {
+          const b = m.boss;
+          if (b) {
+            if (ev.fn === FN_DATABEND) b.databendActivations++;
+            else if (ev.fn === FN_CODESHATTER) b.codeshatterActivations++;
+            else if (ev.fn === FN_REBOOT) b.rebootActivations++;
+          }
+        } else if (ev.ownerKind === 'deck') sm.deck.fires++;
         else unitOf(sm, ev.programId).fires++;
         break;
       }
       case 'op': {
         const sm = m.sides[ev.side];
+        // §42 — likewise: a Boss mechanic payload owns no Program slot.
+        if (ev.ownerKind === 'boss') break;
         if (ev.ownerKind === 'deck') {
           sm.deck.ops++;
           if (!ev.resolved) sm.deck.fizzles++;
@@ -367,6 +416,21 @@ export function consumeEvents(m: BattleMetrics, events: GameEvent[]): void {
       case 'withhold':
         m.systemWithholds++;
         break;
+      // Alpha 0.7.0 §42 — Boss mechanic aggregates. `overridePeak` is tracked
+      // from the count the placement batch reported rather than by rescanning
+      // the board, so the metric and the event stream cannot disagree.
+      case 'bossMechanic': {
+        const b = m.boss;
+        if (!b) break;
+        if (ev.kind === 'OVERRIDE_PLACED') {
+          b.overridesPlaced += ev.placed ?? 0;
+          b.hackerSpecialsOverwritten += ev.overwrote ?? 0;
+        } else if (ev.kind === 'PLACEMENT_ABANDONED') {
+          b.placementsAbandoned++;
+        }
+        if (ev.countAfter > b.overridePeak) b.overridePeak = ev.countAfter;
+        break;
+      }
       case 'placed':
         if (ev.kind === 'bomb') {
           if (ev.ownerKind !== 'deck') unitOf(m.sides[ev.side], ev.programId).bombsPlaced += ev.count;

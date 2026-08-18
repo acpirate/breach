@@ -22,6 +22,7 @@ const FILES = {
   systems: 'breach datastructures - SYS.csv',
   hosts: 'breach datastructures - HST.csv',
   upgrades: 'breach datastructures - UPG.csv',
+  bosses: 'breach datastructures - BOS.csv',
 } as const;
 
 export function nodeDataFiles(): DataFiles {
@@ -39,6 +40,7 @@ export function nodeDataFiles(): DataFiles {
     systems: read(FILES.systems),
     hosts: read(FILES.hosts),
     upgrades: read(FILES.upgrades),
+    bosses: read(FILES.bosses),
   };
 }
 

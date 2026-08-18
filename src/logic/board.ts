@@ -5,12 +5,13 @@
 import { BOARD_HEIGHT, BOARD_WIDTH, COLOR_COUNT, NEUTRAL_TILE_DROP_RATE, SHAPE_COUNT } from './constants';
 import {
   SHAKE_PREVENT_MATCHES,
+  SHAKE_REMOVE_ENEMY_SPECIALS,
   SHAKE_REMOVE_SPECIALS,
   SHAKE_REPLACE,
   ShakeParams,
 } from './data/content';
 import { detectMatches } from './match';
-import { Board, Cell, Pt, Tile } from './types';
+import { Board, Cell, Pt, Side, Tile } from './types';
 import type { RNG } from './rng';
 
 // Structural subset of GameState that tile generation needs.
@@ -112,19 +113,35 @@ export function hasAnyValidMove(board: Board): boolean {
 export function shakeBoard(
   state: { board: Board; rng: RNG; nextId: number },
   params: ShakeParams,
+  // Alpha 0.7.0 §7.1 — the ACTIVATING side, needed only by specialGems mode 2
+  // ("remove the overlays this side does not own"). Modes 0 and 1 are
+  // ownership-blind, so every pre-0.7 caller is unaffected by passing it.
+  owner: Side,
 ): boolean {
   const cells: Pt[] = [];
   for (let y = 0; y < BOARD_HEIGHT; y++) for (let x = 0; x < BOARD_WIDTH; x++) cells.push({ x, y });
 
-  // §8.3 REPLACE is destructive: the prior underlying Packet AND any special
-  // state on the tile are removed regardless of the specialGems parameter, so
-  // fresh ordinary Packets are generated. REARRANGE permutes the existing tile
-  // OBJECTS, preserving board membership and overall composition — positions
-  // change, which is the whole point ("preserve the underlying tile" never
-  // meant preserving its coordinate).
+  // §8.3 REARRANGE permutes the existing tile OBJECTS, preserving board
+  // membership and overall composition — positions change, which is the whole
+  // point ("preserve the underlying tile" never meant preserving its
+  // coordinate). REPLACE regenerates cells as fresh ordinary Packets.
+  //
+  // Alpha 0.7.0 §7.1 — REPLACE is no longer unconditionally destructive. A tile
+  // whose overlay this Shake RETAINS keeps both its overlay and its underlying
+  // axes, at its own coordinate; every other cell regenerates. That is what
+  // makes DATABEND's authored `1:2:1:2` mean "randomize the non-special Packets
+  // and clear the enemy's overlays" instead of silently wiping the activating
+  // side's own board investment. REBOOT (`1:1:0:0`) retains nothing and so
+  // still regenerates all 64 cells, exactly as it did through Alpha 0.6.
   const replace = params.boardComposition === SHAKE_REPLACE;
-  const stripSpecials = params.specialGems === SHAKE_REMOVE_SPECIALS;
   const preventMatches = params.matches === SHAKE_PREVENT_MATCHES;
+  // Whether THIS overlay survives the Shake, by ownership mode.
+  const retains = (t: Tile): boolean => {
+    if (!t.special) return false;
+    if (params.specialGems === SHAKE_REMOVE_SPECIALS) return false;
+    if (params.specialGems === SHAKE_REMOVE_ENEMY_SPECIALS) return t.special.owner === owner;
+    return true; // SHAKE_RETAIN_SPECIALS
+  };
 
   const existing: Tile[] = [];
   for (const row of state.board) for (const t of row) if (t) existing.push(t);
@@ -139,8 +156,11 @@ export function shakeBoard(
     if (replace) {
       const gen = { rng: state.rng, nextId: draftNextId };
       for (const p of cells) {
-        // ordinary Packets only — replacement never carries special state
-        draft[p.y][p.x] = randomTile(gen);
+        const cur = state.board[p.y][p.x]!;
+        // A retained overlay's whole Packet is left alone — §7.1's "randomize
+        // the non-special Packets" is the operative phrase, and an Override
+        // must not have its color/shape changed underneath it (§22).
+        draft[p.y][p.x] = retains(cur) ? cur : randomTile(gen);
       }
       draftNextId = gen.nextId;
     } else {
@@ -150,14 +170,14 @@ export function shakeBoard(
       for (const p of cells) draft[p.y][p.x] = order[i++];
     }
 
-    // §8.4 under REARRANGE: RETAIN moves each special object with its
-    // underlying Packet (automatic — same Tile objects, relocated), while
-    // REMOVE strips the overlay/state and keeps the ordinary Packet. Under
-    // REPLACE there is no prior state left to retain or strip.
-    if (stripSpecials && !replace) {
+    // §8.4 under REARRANGE: a retained special moves with its underlying Packet
+    // (automatic — same Tile objects, relocated), while a removed one is
+    // stripped and the ordinary Packet kept. Under REPLACE the non-retained
+    // cells were regenerated above and carry no prior state to strip.
+    if (!replace) {
       for (const p of cells) {
         const t = draft[p.y][p.x];
-        if (t?.special) delete t.special;
+        if (t?.special && !retains(t)) delete t.special;
       }
     }
 

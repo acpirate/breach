@@ -16,6 +16,13 @@ import { AREA_PATTERNS, AreaPatternId, advanceAreaPattern } from './data/areas';
 import type { TargetKind } from './data/effects';
 import {
   ActivationEligibility,
+  BOSS_MECHANIC_BOSS_ID,
+  FN_CODESHATTER,
+  FN_DATABEND,
+  FN_REBOOT,
+  OVERRIDE_DATABEND_RETRY_LIMIT,
+  OVERRIDE_PLACEMENT_COUNT,
+  OVERRIDE_THRESHOLD,
   PlanOp,
   ResolvedFunction,
   ResolvedProgram,
@@ -187,7 +194,12 @@ export class Game {
       phase: 'playerPre',
       winner: null,
       turn: 1,
-      metrics: createBattleMetrics(identity.hackerPrograms, identity.systemPrograms),
+      // Alpha 0.7.0 §42 — Boss aggregates exist only in a Boss battle.
+      metrics: createBattleMetrics(
+        identity.hackerPrograms,
+        identity.systemPrograms,
+        identity.opponentKind === 'BOS' ? identity.opponentId : undefined,
+      ),
       battleId,
       // copied: the battle's config is immutable for its lifetime (MK5.4) —
       // later menu edits must not leak into a running battle
@@ -768,7 +780,19 @@ export class Game {
           s,
           opponentOf(owner),
           (op.params.damage ?? 0) + bonus,
-          { source: 'attacker', label: `${who} attack`, programId: actor.id, buffBonus: bonus },
+          {
+            source: 'attacker',
+            label: `${who} attack`,
+            // Alpha 0.7.0 §42 — a `boss` actor owns no Program slot, so crediting
+            // its ID here would invent a phantom per-Program metrics row keyed by
+            // BOS_01. The damage still lands in the ordinary Function-damage
+            // bucket; §41/§53.86 attribution comes from `fnId` below.
+            ...(actor.kind === 'boss' ? {} : { programId: actor.id }),
+            // §41 — naming the Function makes CODESHATTER attributable through
+            // the EXISTING Function-damage events rather than a Boss-only stream.
+            fnId: op.fnId,
+            buffBonus: bonus,
+          },
           events,
         );
         events.push(opEvent(true));
@@ -778,7 +802,9 @@ export class Game {
         // §8 — the formal Shake contract. Parameters were resolved and typed at
         // startup; nothing is parsed here.
         const params = op.params.shake!;
-        const ok = shakeBoard(s, params);
+        // §7.1 — the activating side decides whose overlays specialGems mode 2
+        // clears; modes 0 and 1 ignore it.
+        const ok = shakeBoard(s, params, owner);
         events.push({ t: 'shake', side: owner, resolved: ok });
         events.push(opEvent(ok));
         if (!ok) {
@@ -1089,6 +1115,188 @@ export class Game {
     }
   }
 
+  // ==========================================================================
+  // Alpha 0.7.0 §21-§28 — THE ODANSHAY OVERRIDE MECHANIC
+  //
+  // Deliberately a SMALL handler keyed to BOS_01 (§21), not a generalized boss
+  // scripting engine, a mechanic DSL, a trigger table, or a new PASSIVE type.
+  // It reuses the existing board-overlay, Function, Effect, turn-order,
+  // source-attribution, save, and event systems throughout (§21).
+  // ==========================================================================
+
+  // Is THIS battle the ODANSHAY encounter? Everything below is inert otherwise,
+  // so a normal System battle pays only this check per turn.
+  private get odanshay(): boolean {
+    const id = this.state.identity;
+    return id.opponentKind === 'BOS' && id.opponentId === BOSS_MECHANIC_BOSS_ID;
+  }
+
+  // §22/§25 — how many Boss-owned Overrides are currently on the Datastream.
+  // Derived from the board every time rather than cached in a counter: the board
+  // is the authority, so a save/reload cannot desynchronize the count and §35's
+  // "no Overrides disappear or duplicate on reload" holds by construction.
+  private overrideCount(): number {
+    let n = 0;
+    for (const row of this.state.board) {
+      for (const t of row) if (t?.special?.type === 'override') n++;
+    }
+    return n;
+  }
+
+  // §23 — the valid Override target set. A target is an occupied normal
+  // axis-bearing Packet that does not already carry a BOSS-owned special. A
+  // Hacker-owned special does NOT make a Packet invalid (§23): the Override
+  // replaces it. Boss-owned specials — existing Overrides, Boss Bombs, Boss
+  // Shields — are excluded and are never silently overwritten by placement.
+  private overrideTargets(): Pt[] {
+    const s = this.state;
+    const out: Pt[] = [];
+    for (let y = 0; y < s.board.length; y++) {
+      for (let x = 0; x < s.board[y].length; x++) {
+        const t = s.board[y][x];
+        if (!t || t.kind !== 'standard') continue; // §23 — neutrals have no axes
+        if (t.special && t.special.owner === 'enemy') continue;
+        out.push({ x, y });
+      }
+    }
+    return out;
+  }
+
+  // §24 — place exactly the chosen Overrides as ONE mechanic resolution. Axes
+  // are unchanged, so no Sync is created and none is resolved (§22/§24).
+  private placeOverrides(cells: Pt[], events: GameEvent[]): number {
+    const s = this.state;
+    let overwrote = 0;
+    for (const p of cells) {
+      const t = s.board[p.y][p.x];
+      if (!t) continue;
+      // §23 — installing over a Hacker-owned special destroys/replaces it
+      // through the ordinary special-overlay replacement semantics, while the
+      // underlying Packet's axes are RETAINED.
+      if (t.special) overwrote++;
+      t.special = { type: 'override', owner: 'enemy', seq: s.nextSeq++ };
+      events.push({ t: 'setTile', p, view: tileViewOf(t) });
+    }
+    return overwrote;
+  }
+
+  // §21/§28 — invoke a mechanic payload Function at NO charge cost, attributed
+  // to the Boss. The actor kind is `boss` and the actor ID is the Boss itself,
+  // so every event the payload emits carries Boss causal identity rather than a
+  // fake Program, a fake PASSIVE, or a fake System (§28).
+  private castBossMechanic(fnId: string, events: GameEvent[]): void {
+    const fn = getContent().functions.get(fnId);
+    if (!fn) return; // the loader guarantees resolution; defensive only
+    this.castActor(
+      'enemy',
+      { kind: 'boss', id: this.state.identity.opponentId, name: fn.name, fn },
+      events,
+    );
+  }
+
+  // §24 — THE FINAL ACTION OF EVERY NON-TERMINAL ODANSHAY TURN: attempt to
+  // place exactly three new Overrides.
+  //
+  //  1. compute the valid target set;
+  //  2. with at least three valid distinct targets, choose three using the
+  //     GAMEPLAY RNG, choose all three BEFORE mutating the board, and place them
+  //     as one batch;
+  //  3. with fewer than three, place NONE (never a partial one or two), invoke
+  //     DATABEND at zero cost, resolve it completely including its Syncs,
+  //     cascades, damage and charge, check for a terminal state, and retry.
+  //
+  // The retry is hard-capped (director ruling 2026-08-17, overriding §24's
+  // unbounded loop) so an unreachable board cannot hang the turn.
+  private placeEndOfTurnOverrides(events: GameEvent[]): void {
+    const s = this.state;
+    const bossId = s.identity.opponentId;
+    for (let attempt = 0; attempt <= OVERRIDE_DATABEND_RETRY_LIMIT; attempt++) {
+      if (s.winner) return;
+      const targets = this.overrideTargets();
+      const before = this.overrideCount();
+      if (targets.length >= OVERRIDE_PLACEMENT_COUNT) {
+        // §24.2/§50.48/§50.50 — three DISTINCT targets, chosen from the
+        // GAMEPLAY stream (never route/setup RNG, §24), all selected before any
+        // mutation so no placement can influence a later choice.
+        const pool = [...targets];
+        s.rng.shuffle(pool);
+        const cells = pool.slice(0, OVERRIDE_PLACEMENT_COUNT);
+        const overwrote = this.placeOverrides(cells, events);
+        events.push({
+          t: 'bossMechanic',
+          bossId,
+          kind: 'OVERRIDE_PLACED',
+          countBefore: before,
+          countAfter: this.overrideCount(),
+          placed: cells.length,
+          cells,
+          overwrote,
+        });
+        return;
+      }
+      // §24.3 — insufficient capacity. Place NOTHING, then DATABEND.
+      events.push({
+        t: 'bossMechanic',
+        bossId,
+        kind: 'INSUFFICIENT_TARGETS',
+        countBefore: before,
+        countAfter: before,
+        available: targets.length,
+        attempt: attempt + 1,
+      });
+      if (attempt === OVERRIDE_DATABEND_RETRY_LIMIT) {
+        // Director ruling — the cap is reached: place none and let the turn
+        // continue normally. Recorded so the condition is visible if it ever
+        // fires; with current content it realistically never does.
+        events.push({
+          t: 'bossMechanic',
+          bossId,
+          kind: 'PLACEMENT_ABANDONED',
+          countBefore: before,
+          countAfter: before,
+          available: targets.length,
+          attempt: attempt + 1,
+        });
+        return;
+      }
+      // §24.3 — DATABEND resolves COMPLETELY (its authored tuple allows Syncs
+      // and unlimited cascades, so damage and charge follow through the normal
+      // pipeline), and a terminal state stops the mechanic immediately.
+      this.castBossMechanic(FN_DATABEND, events);
+      if (s.winner) return;
+    }
+  }
+
+  // §25/§27 — the start-of-turn threshold. Trigger at 15 OR MORE on-board
+  // Overrides (§25 — never "exactly 15"), then CODESHATTER, a survival check,
+  // and REBOOT. A check that finds nothing emits no event at all, preserving the
+  // Alpha 0.4.1/0.6 log-compactness goal (§41).
+  private resolveOverrideThreshold(events: GameEvent[]): void {
+    const s = this.state;
+    const count = this.overrideCount();
+    if (count < OVERRIDE_THRESHOLD) return;
+    events.push({
+      t: 'bossMechanic',
+      bossId: s.identity.opponentId,
+      kind: 'THRESHOLD',
+      countBefore: count,
+      countAfter: count,
+    });
+    // §27.1/§27.2 — CODESHATTER is ordinary Function damage: it takes the normal
+    // Function-damage modifiers, is reduced by Packet and permanent Shield under
+    // the current ordering, and is NOT suppressed by Reinforced Connection,
+    // which suppresses base Sync damage only.
+    this.castBossMechanic(FN_CODESHATTER, events);
+    // §27.3/§27.4 — terminal check. If the Hacker is defeated the battle ends
+    // immediately: REBOOT does not fire and no further Boss-turn action runs.
+    if (s.winner) return;
+    // §27.5/§27.6 — REBOOT wipes the Datastream as if a new battle started. Its
+    // authored `1:1:0:0` regenerates every Packet, removes every overlay (the
+    // accumulated Overrides with them, §27), and suppresses post-shake Syncs and
+    // cascades. §27.7 — the turn then continues from the countdown stage.
+    this.castBossMechanic(FN_REBOOT, events);
+  }
+
   // 1.6.2 — System phase. Two modes (MK5.1). Alpha 0.5.0 §18 keeps this OUTER
   // order exactly as it was; only readiness handling INSIDE the Function phase
   // changed (§19).
@@ -1113,8 +1321,26 @@ export class Game {
     // START_OF_TURN PASSIVEs resolve fully, THEN countdowns tick. A HOST
     // carrier fires at the start of BOTH agents' turns (§13); the resolution
     // owner here is the System.
+    //
+    // Alpha 0.7.0 §26 — the ODANSHAY turn-start order, extending Alpha 0.6's:
+    //   1. HOST START_OF_TURN PASSIVEs                (below)
+    //   2. a Boss identity PASSIVE layer WOULD sit here — Alpha 0.7 BOS data has
+    //      no PASSIVES field and §26.2 forbids adding one to populate this step
+    //   3. the Override threshold                     (below)
+    //   4. CODESHATTER -> survival check -> REBOOT     (inside the threshold)
+    //   5. countdown ticking                          (below)
+    //   6. the normal enemy Function phase            (below)
+    //   7. the rest of the established enemy turn     (below)
+    //   8. the three-Override placement, as the final non-terminal action
     this.runStartOfTurnPassives('enemy', events);
     if (s.winner) return this.collect(events);
+
+    // §26.3/§26.4 — strictly AFTER HOST start-of-turn effects and strictly
+    // BEFORE countdown ticking.
+    if (this.odanshay) {
+      this.resolveOverrideThreshold(events);
+      if (s.winner) return this.collect(events);
+    }
 
     this.tickCountdowns('enemy', events);
     if (s.winner) return this.collect(events);
@@ -1140,6 +1366,12 @@ export class Game {
         if (wasted > 0) events.push({ t: 'chargeWaste', side: 'enemy', ownerKind: 'program', programId: u.programId, amount: wasted });
       }
     }
+    // Alpha 0.7.0 §24/§26.8 — the FINAL action of every non-terminal ODANSHAY
+    // turn, after ALL normal Boss-turn resolution: the Function phase, the
+    // match/timer behavior, their cascades, damage, charge, and countdown
+    // consequences have all already happened in their established places.
+    if (this.odanshay && !s.winner) this.placeEndOfTurnOverrides(events);
+    if (s.winner) return this.collect(events);
     s.turn += 1;
     return this.collect(events);
   }

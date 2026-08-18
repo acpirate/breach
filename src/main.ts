@@ -17,18 +17,27 @@ import {
 } from './logic/constants';
 import {
   DEFAULT_DECK_ID,
+  BOSS_MECHANIC_BOSS_ID,
   DEFAULT_HACKER_ID,
+  FN_CODESHATTER,
+  FN_DATABEND,
+  FN_REBOOT,
   GAME_VERSION,
+  OVERRIDE_PLACEMENT_COUNT,
+  OVERRIDE_THRESHOLD,
   PortfolioSource,
+  ResolvedBoss,
   ResolvedDeck,
   ResolvedHacker,
   ResolvedHost,
   ResolvedProgram,
   ResolvedSystem,
+  allBosses,
   allDecks,
   allHackers,
   allHosts,
   allSystems,
+  bossById,
   contentStamp,
   deckById,
   defaultBuild,
@@ -68,16 +77,15 @@ import {
   PathOffer,
   PendingPath,
   PendingResultInfo,
-  PendingSetup,
   RunInfo,
-  SelectedSystem,
+  RunSetupInfo,
+  SelectedOpponent,
   SessionInfo,
   battleContext,
   beginBuild,
-  beginSetup,
-  chooseDeck,
-  chooseHacker,
-  commitNewRun,
+  commitBossSelection,
+  commitSetupDeck,
+  commitSetupHacker,
   RUN_LENGTH,
   contextLabel,
   continueLabel,
@@ -94,6 +102,8 @@ import {
   naturalOf,
   nextStep,
   openPathChoice,
+  opponentContent,
+  opponentOfIdentity,
   progressesAsVictory,
   randomBuild,
   randomHost,
@@ -106,9 +116,8 @@ import {
   selectPath,
   serializeConstructedPreset,
   serializeSession,
-  setupBack,
-  setupComplete,
   snapshotRunSettings,
+  systemOpponent,
 } from './logic/session';
 import {
   ActivationTarget,
@@ -116,6 +125,7 @@ import {
   BattleIdentity,
   BattleSettings,
   BuildOrigin,
+  Board,
   Color,
   Pt,
   Shape,
@@ -153,9 +163,12 @@ const overlay = document.getElementById('overlay') as HTMLDivElement;
 let session: SessionInfo | null = null;
 let pending: PendingResultInfo | null = null;
 let game: Game | null = null;
-// §12 — ephemeral pending New Run setup. NEVER a save: entering setup does not
-// touch the resident save, and there is no resumable half-configured Run.
-let setup: PendingSetup | null = null;
+// Alpha 0.7.0 §10 — which row each setup screen is currently SHOWING as picked.
+// Pure presentation: §10 is explicit that a highlighted-but-uncommitted row is
+// never Run state. The committed selections live in the Run save (RunSetupInfo),
+// which is what makes setup progress resumable at all.
+let hackerPick: string | null = null;
+let deckPick: string | null = null;
 
 let busy = false; // true while animations / System phase are in flight
 let selection: Pt | null = null;
@@ -174,9 +187,10 @@ let targeting: { slot: number; kind: TargetKind } | null = null;
 // §8 — the Build screen's state while it is open (null at every other time).
 let build: BuildState | null = null;
 // Alpha 0.5.0 §12.3 — the System chosen for a Constructed Quick Match that has
-// NOT started yet. Ephemeral pending setup exactly like `setup` above: it does
-// not touch the resident save until the battle actually begins.
-let pendingQuickSystem: SelectedSystem | null = null;
+// NOT started yet. Ephemeral pending setup: it does not touch the resident save
+// until the battle actually begins. Alpha 0.7.0 §45 — Quick Match stays
+// System-only, so this is only ever a `SYS` opponent.
+let pendingQuickSystem: SelectedOpponent | null = null;
 // Alpha 0.6.0 §38 — the HOST chosen for a Constructed Quick Match that has not
 // started yet, on exactly the same ephemeral terms as the System above.
 let pendingQuickHost: string | null = null;
@@ -785,6 +799,25 @@ function systemProgramStrip(programIds: ReadonlyArray<string>, back: () => void)
   return portfolioStrip(programIds, null, back, true);
 }
 
+// Alpha 0.7.0 §44 — small helpers for the Boss reference panel. The mechanic
+// text is derived from ENGINE constants and resolved Function names, never from
+// the authored placeholder copy (§5.4/§44).
+function fnName(fnId: string): string {
+  return getContent().functions.get(fnId)?.name ?? fnId;
+}
+
+// §44 — an Override count display is optional, but it falls straight out of the
+// existing board model, so the whitebox reference sheet shows it. The board and
+// the logs remain authoritative.
+function overrideCountOf(board: Board | undefined): number {
+  if (!board) return 0;
+  let n = 0;
+  for (const rowCells of board) {
+    for (const t of rowCells) if (t?.special?.type === 'override') n++;
+  }
+  return n;
+}
+
 // ---- character sheets (§20.3 — per side, opened from the avatar boxes) ----
 
 function characterSheetSide(cfg: BattleConfig, side: Side, identity: BattleIdentity): HTMLElement {
@@ -808,10 +841,25 @@ function characterSheetSide(cfg: BattleConfig, side: Side, identity: BattleIdent
     row(`HACKER — ${hacker.name}`, true);
     row(`LINK ${cfg.playerHp}`);
   } else {
-    // §17 — the sheet now names the System it is describing. BIO and GRAPHICS
+    // §17 — the sheet names the opponent it is describing. BIO and GRAPHICS
     // stay unused placeholders and are deliberately not displayed.
-    row(`SYSTEM — ${systemById(identity.systemId).name}`, true);
+    // Alpha 0.7.0 §17/§44 — a Boss battle must show ODANSHAY as a BOSS, never
+    // as a System identity. The heading is the identity layer, not a label
+    // hardcoded to "SYSTEM".
+    const enemy = opponentOfIdentity(identity);
+    row(`${enemy.kind === 'BOS' ? 'BOSS' : 'SYSTEM'} — ${enemy.name}`, true);
     row(`ICE ${cfg.enemyHp}`);
+    // §44 — the Boss mechanic, described from the ENGINE's own constants rather
+    // than from the authored placeholder copy (§5.4 — presentation fields are
+    // not mechanic authority, and §44 forbids fabricating polished boss help
+    // text). Director-approved 2026-08-17.
+    if (enemy.kind === 'BOS' && enemy.id === BOSS_MECHANIC_BOSS_ID) {
+      row('MECHANIC', true);
+      row(`Places ${OVERRIDE_PLACEMENT_COUNT} Overrides at the end of each turn`);
+      row(`Too few targets: activates ${fnName(FN_DATABEND)}, then retries`);
+      row(`At ${OVERRIDE_THRESHOLD} Overrides: ${fnName(FN_CODESHATTER)}, then ${fnName(FN_REBOOT)}`);
+      row(`Overrides on board: ${overrideCountOf(game?.state.board)}`);
+    }
   }
   row(`Strong colors (${DAMAGE_PER_TILE_HIGH_COLOR} dmg): ${colorList(strongC)}`);
   row(`Weak colors (${DAMAGE_PER_TILE_LOW_COLOR} dmg): ${colorList(weakC)}`);
@@ -830,7 +878,11 @@ function characterSheetSide(cfg: BattleConfig, side: Side, identity: BattleIdent
             upgradeById(uid).passives.map((p) => ({ p, src: `UPG ${upgradeById(uid).name}` })),
           ),
         ]
-      : systemById(identity.systemId).passives.map((p) => ({ p, src: `SYS ${identity.systemId}` }));
+      // Alpha 0.7.0 §5.1/§26 — only a System opponent contributes identity
+      // PASSIVEs; the Alpha 0.7 Boss schema has no PASSIVES column at all.
+      : identity.opponentKind === 'SYS'
+        ? systemById(identity.opponentId).passives.map((p) => ({ p, src: `SYS ${identity.opponentId}` }))
+        : [];
   row('PASSIVES', true);
   if (!sidePassives.length) row('none');
   for (const { p, src } of sidePassives) row(`${p.display} [${p.id}] — ${src}`);
@@ -885,7 +937,10 @@ function showCharacterSheet(side: Side): void {
   panels.appendChild(head);
   const roster = side === 'player' ? identity.hackerPrograms : identity.systemPrograms;
   panels.appendChild(portfolioStrip(roster, null, () => showCharacterSheet(side), true));
-  showDialog(side === 'player' ? 'HACKER' : 'SYSTEM', '', [['Close', hideDialog]], panels);
+  // Alpha 0.7.0 §17/§44 — the dialog title names the identity LAYER, so a Boss
+  // battle never presents its opponent sheet as "SYSTEM".
+  const title = side === 'player' ? 'HACKER' : identity.opponentKind === 'BOS' ? 'BOSS' : 'SYSTEM';
+  showDialog(title, '', [['Close', hideDialog]], panels);
 }
 
 // ---- persistence (session envelope — logic/session.ts owns the format) ----
@@ -897,12 +952,18 @@ function showCharacterSheet(side: Side): void {
 // Quick Match envelope would not deserialize, so it is never written.
 function persistSession(): void {
   if (!session) return;
-  if (!game && session.mode !== 'RUN') return;
+  // Alpha 0.7.0 §9/§10 — a Run in SETUP is saveable with no battle too: Boss
+  // commitment is the destructive New-Run boundary, and setup progress from
+  // there must survive a reload (§10).
+  if (!game && session.mode === 'QUICK_MATCH') return;
   saveBattle(serializeSession(session, game, pending), game?.state.turn ?? 0);
 }
 
 function appendWizard(action: WizardAction): void {
   if (!game || !session || !pending) return;
+  // A wizard action always accompanies a battle result, so the session is a
+  // committed Run or a Quick Match — never a setup phase.
+  if (session.mode === 'RUN_SETUP') return;
   appendWizardLog({
     v: LOG_VERSION,
     battleId: game.state.battleId,
@@ -931,7 +992,10 @@ function logSelection(
     event,
     fp: getContent().fingerprint,
     identity: opts.g ? identityStamp(opts.g.state.identity) : (opts.identity ?? {}),
-    ...(session ? { mode: session.mode } : {}),
+    // Alpha 0.7.0 — `mode` on a selection record stays the two-value BATTLE
+    // vocabulary. A setup-phase record simply omits it rather than inventing a
+    // third battle mode that no battle record could ever carry.
+    ...(session && session.mode !== 'RUN_SETUP' ? { mode: session.mode } : {}),
     ...(session?.mode === 'RUN' ? { runStep: session.step } : {}),
     ...(opts.g ? { battleId: opts.g.state.battleId, hackerMaxLink: opts.g.state.config.playerHp, systemMaxIce: opts.g.state.config.enemyHp } : {}),
     ...(opts.extra ?? {}),
@@ -943,18 +1007,31 @@ function logSelection(
 // the moment the System is resolved (Run roll, Random Quick Match roll, or an
 // explicit Constructed choice), never once per turn: System identity is
 // battle-static and joins to turn records through the battle-level record.
-function logSystemSelected(system: SelectedSystem, context: SelectionLogEntry['buildContext']): void {
-  const s = systemById(system.systemId);
+// Alpha 0.7.0 §40 — the record identifies WHICH IDENTITY LAYER supplied the
+// opponent, so a Boss battle never emits a misleading SYS identity.
+function logSystemSelected(opponent: SelectedOpponent, context: SelectionLogEntry['buildContext']): void {
+  const o = opponentContent(opponent);
   logSelection('SYSTEM_SELECTED', {
     extra: {
-      systemId: s.id,
-      systemSelectionSource: system.source,
-      systemStrongColors: [...s.strongColors],
-      systemStrongShapes: [...s.strongShapes],
-      systemPrograms: [...s.programIds],
+      opponentKind: o.kind,
+      opponentId: o.id,
+      opponentSelectionSource: opponent.source,
+      opponentStrongColors: [...o.strongColors],
+      opponentStrongShapes: [...o.strongShapes],
+      opponentPrograms: [...o.programIds],
       ...(context ? { buildContext: context } : {}),
     },
   });
+}
+
+// Alpha 0.7.0 §12/§39 — Boss Selection records, through the EXISTING
+// event-sourced selection pipeline (§12 — no separate boss log store).
+function logBossOffered(bosses: ReadonlyArray<ResolvedBoss>): void {
+  logSelection('BOSS_OFFERED', { extra: { bossIds: bosses.map((b) => b.id) } });
+}
+
+function logBossSelected(bossId: string): void {
+  logSelection('BOSS_SELECTED', { extra: { bossId } });
 }
 
 // Alpha 0.6.0 §46 — one record per COMMITTED HOST resolution, on exactly the
@@ -983,7 +1060,13 @@ function logPathOffered(p: PendingPath): void {
   logSelection('PATH_OFFERED', {
     extra: {
       targetStep: p.step,
-      offers: p.offers.map((o) => ({ index: o.index, systemId: o.systemId, hostId: o.hostId, upgradeId: o.upgradeId })),
+      offers: p.offers.map((o) => ({
+        index: o.index,
+        opponentKind: o.opponentKind,
+        opponentId: o.opponentId,
+        hostId: o.hostId,
+        upgradeId: o.upgradeId,
+      })),
       upgradeExhausted: p.upgradeExhausted,
     },
   });
@@ -996,7 +1079,8 @@ function logPathSelected(p: PendingPath, offer: PathOffer, before: string[], aft
     extra: {
       targetStep: p.step,
       selectedPath: offer.index,
-      systemId: offer.systemId,
+      opponentKind: offer.opponentKind,
+      opponentId: offer.opponentId,
       hostId: offer.hostId,
       upgradeId: offer.upgradeId,
       upgradeExhausted: p.upgradeExhausted,
@@ -1109,10 +1193,14 @@ function showTitle(): void {
   game = null;
   session = null;
   pending = null;
-  setup = null; // §12.2 — returning to Title discards pending setup ONLY
   build = null;
   targeting = null;
   systemTurnActive = false;
+  // §10 — returning to Title clears the SCREEN's presentation picks only. Any
+  // committed setup progress lives in the save and is resumed by Continue.
+  bossPick = null;
+  hackerPick = null;
+  deckPick = null;
   view.clearBoard();
   const restored = deserializeSession(loadBattleJson());
   const buttons: ButtonSpec[] = [];
@@ -1122,10 +1210,10 @@ function showTitle(): void {
   // §9.1 — Quick Match is a bounded submenu now; neither mode replaces the
   // save until its battle is actually created.
   buttons.push(['Quick Match', showQuickMatchMenu]);
-  // §12.1/§12.3 — New Run enters SETUP. The resident save is preserved
-  // throughout Hacker Selection, Deck Selection, and Build; only the final
-  // Start Run action replaces it.
-  buttons.push(['New Run', () => showHackerSelection(beginSetup())]);
+  // Alpha 0.7.0 §8/§9 — New Run opens BOSS SELECTION first. The resident save
+  // is preserved until the Boss is committed, which is now the destructive
+  // boundary and carries the replacement confirmation.
+  buttons.push(['New Run', showBossSelection]);
   buttons.push(['Settings', showSettings]);
   showDialog(`BREACH — ${GAME_VERSION}`, '', buttons);
 }
@@ -1184,58 +1272,90 @@ function optionList(
   return wrap;
 }
 
-// §13 — Hacker Selection. Displays every loaded Hacker: name, base LINK, strong
-// colors, strong shapes, and separately rendered Skill descriptions. BIO and
-// GRAPHICS are never displayed or loaded (§13.1).
-function showHackerSelection(s: PendingSetup): void {
-  setup = s;
-  const hackers = allHackers();
-  const preselect = s.hackerId ?? (hackers.length === 1 ? hackers[0].id : null);
+// ============================================================================
+// Alpha 0.7.0 §11 — BOSS SELECTION, the FIRST New Run choice (§8).
+//
+// Committing here is the DESTRUCTIVE New-Run boundary (§9): it replaces the
+// resident save, persists the Boss immediately, and fixes it for the Run. It
+// reuses the established identity-selection presentation rather than forcing
+// BOS into the HAK/SYS schema, and it deliberately builds no boss lore UI (§11).
+// ============================================================================
+
+// Which Boss row the screen is currently showing as picked. Pure presentation:
+// §10 is explicit that a highlighted-but-uncommitted row is never Run state.
+let bossPick: string | null = null;
+
+function showBossSelection(): void {
+  const bosses = allBosses();
+  const preselect = bossPick ?? (bosses.length ? bosses[0].id : null);
+  bossPick = preselect;
   const list = optionList(
-    hackers.map((h: ResolvedHacker) => ({
-      id: h.id,
-      title: `${h.name} [${h.id}]`,
+    bosses.map((b: ResolvedBoss) => ({
+      id: b.id,
+      title: `${b.name} [${b.id}]`,
       lines: [
-        // §6.1 — the LINK contribution resolved under the CURRENT selection
-        // context, plus strong AND weak sets on both axes.
-        s.deckId
-          ? `LINK ${resolveHackerMaxLink(menuSettings, h.id, s.deckId)} (base ${h.baseLink} + deck ${deckById(s.deckId).addLink})`
-          : `Base LINK ${h.baseLink}`,
-        `Strong colors: ${colorList(h.strongColors)}`,
-        `Weak colors: ${colorList(h.weakColors)}`,
-        `Strong shapes: ${shapeList(h.strongShapes)}`,
-        `Weak shapes: ${shapeList(h.weakShapes)}`,
-        ...h.passives.map((p) => `Passive: ${p.display}`),
+        // §11 — ICE and both axis pairs, using the existing identity
+        // presentation conventions. §19 — the authored value IS the Boss-battle
+        // ICE; no Run escalation is added on top of it.
+        `ICE ${b.baseIce}`,
+        `Strong colors: ${colorList(b.strongColors)}`,
+        `Weak colors: ${colorList(b.weakColors)}`,
+        `Strong shapes: ${shapeList(b.strongShapes)}`,
+        `Weak shapes: ${shapeList(b.weakShapes)}`,
       ],
     })),
     preselect,
-    (id) => showHackerSelection({ ...s, hackerId: id }),
+    (id) => {
+      bossPick = id;
+      showBossSelection();
+    },
   );
   const panels = document.createElement('div');
   panels.className = 'panelscroll';
   panels.appendChild(list);
-  // §6.1 — the selected Hacker's three Programs in authored portfolio order,
-  // each with an inspection affordance.
   if (preselect) {
+    const b = bossById(preselect);
+    // §44 — the mechanic, described from ENGINE constants and resolved Function
+    // names. The authored BOSS_PASSIVE_DESCRIPTION is a placeholder and §5.4
+    // forbids treating it as mechanic authority, so it is not displayed.
+    if (b.id === BOSS_MECHANIC_BOSS_ID) {
+      const mech = document.createElement('div');
+      mech.className = 'config readonly';
+      for (const [text, head] of [
+        ['MECHANIC — OVERRIDE', true],
+        [`Places ${OVERRIDE_PLACEMENT_COUNT} Overrides at the end of each of its turns.`, false],
+        ['An Override does not change a Packet, but it occupies the Packet and can overwrite one of your specials.', false],
+        [`Too few valid targets: activates ${fnName(FN_DATABEND)}, then tries again.`, false],
+        [`At ${OVERRIDE_THRESHOLD} Overrides on the board: ${fnName(FN_CODESHATTER)}, then ${fnName(FN_REBOOT)}.`, false],
+      ] as [string, boolean][]) {
+        const d = document.createElement('div');
+        if (head) d.className = 'cfghead';
+        d.textContent = text;
+        mech.appendChild(d);
+      }
+      panels.appendChild(mech);
+    }
+    // §11 — the ordered Programs, through the existing selection-card pattern.
     const head = document.createElement('div');
     head.className = 'cfghead';
-    head.textContent = 'PROGRAMS (portfolio order)';
+    head.textContent = 'PROGRAMS (charge-routing order)';
     panels.appendChild(head);
-    panels.appendChild(
-      portfolioStrip(hackerById(preselect).portfolioProgramIds, 'HACKER_PORTFOLIO', () =>
-        showHackerSelection({ ...s, hackerId: preselect }),
-      ),
-    );
+    panels.appendChild(systemProgramStrip(b.programIds, showBossSelection));
   }
   showDialog(
-    'SELECT HACKER',
-    'Step 1 of 2',
+    'SELECT BOSS',
+    'Step 1 of 3',
     [
-      // explicit forward action; no modal confirmation follows it (§13.2)
       ['Choose', () => {
         if (!preselect) return;
-        logSelection('HACKER_SELECTED', { identity: { hackerId: preselect } });
-        showDeckSelection(chooseHacker({ ...s, hackerId: preselect }, preselect));
+        // §9.1 — the existing new-run replacement confirmation, now attached to
+        // THIS commitment because Boss commit is the destructive boundary.
+        const restored = deserializeSession(loadBattleJson());
+        confirmReplace(
+          restored ? restored.info : null,
+          () => void commitBossToSetup(preselect),
+          showBossSelection,
+        );
       }, undefined, !preselect],
       ['Back to Title', showTitle],
     ],
@@ -1244,14 +1364,121 @@ function showHackerSelection(s: PendingSetup): void {
   );
 }
 
+// §9 — THE DESTRUCTIVE COMMITMENT. Replace the active save, persist the Boss,
+// and park setup on Hacker Selection so a reload resumes exactly there (§10).
+function commitBossToSetup(bossId: string): void {
+  logBossSelected(bossId);
+  const { seed } = makeSetupRandom();
+  session = commitBossSelection(bossId, menuSettings, seed);
+  game = null;
+  pending = null;
+  logSelection('RUN_CREATED', { extra: { routeSeed: seed, bossId } });
+  persistSession();
+  showHackerSelection();
+}
+
+// §13 — Hacker Selection. Displays every loaded Hacker: name, base LINK, strong
+// colors, strong shapes, and separately rendered PASSIVE descriptions. BIO and
+// GRAPHICS are never displayed or loaded (§13.1).
+//
+// Alpha 0.7.0 §10 — it now reads the COMMITTED Run setup rather than ephemeral
+// pending state: the Boss is already fixed and persisted by the time this opens.
+function showHackerSelection(): void {
+  const s = session;
+  if (!s || s.mode !== 'RUN_SETUP') return;
+  const hackers = allHackers();
+  const preselect = hackerPick ?? s.hackerId ?? (hackers.length === 1 ? hackers[0].id : null);
+  hackerPick = preselect;
+  const list = optionList(
+    hackers.map((h: ResolvedHacker) => ({
+      id: h.id,
+      title: `${h.name} [${h.id}]`,
+      lines: [
+        // §6.1 — the LINK contribution. Alpha 0.7.0 §8 puts Hacker Selection
+        // BEFORE Deck Selection, so no Deck contribution is known yet and the
+        // base value is what the screen can honestly show.
+        `Base LINK ${h.baseLink}`,
+        `Strong colors: ${colorList(h.strongColors)}`,
+        `Weak colors: ${colorList(h.weakColors)}`,
+        `Strong shapes: ${shapeList(h.strongShapes)}`,
+        `Weak shapes: ${shapeList(h.weakShapes)}`,
+        ...h.passives.map((p) => `Passive: ${p.display}`),
+      ],
+    })),
+    preselect,
+    (id) => {
+      hackerPick = id;
+      showHackerSelection();
+    },
+  );
+  const panels = document.createElement('div');
+  panels.className = 'panelscroll';
+  // Alpha 0.7.0 §43 — the committed Boss stays visible for the rest of setup,
+  // using the simplest existing whitebox pattern rather than a route map (§43).
+  panels.appendChild(runBossBanner(s.bossId));
+  panels.appendChild(list);
+  // §6.1 — the selected Hacker's three Programs in authored portfolio order,
+  // each with an inspection affordance.
+  if (preselect) {
+    const head = document.createElement('div');
+    head.className = 'cfghead';
+    head.textContent = 'PROGRAMS (portfolio order)';
+    panels.appendChild(head);
+    panels.appendChild(portfolioStrip(hackerById(preselect).portfolioProgramIds, 'HACKER_PORTFOLIO', showHackerSelection));
+  }
+  showDialog(
+    'SELECT HACKER',
+    'Step 2 of 3',
+    [
+      // explicit forward action; no modal confirmation follows it (§13.2)
+      ['Choose', () => {
+        if (!preselect) return;
+        logSelection('HACKER_SELECTED', { identity: { hackerId: preselect } });
+        // §10 — the committed Hacker is persisted immediately, so a reload
+        // before Deck selection resumes at Deck Selection with it intact.
+        session = commitSetupHacker(s, preselect);
+        deckPick = null;
+        persistSession();
+        showDeckSelection();
+      }, undefined, !preselect],
+      // §10 — Back returns to the Title. It deliberately does NOT reopen Boss
+      // Selection: the Boss is committed for this Run, and changing it requires
+      // deliberately starting/replacing the Run again.
+      ['Back to Title', showTitle],
+    ],
+    panels,
+    true,
+  );
+}
+
+// Alpha 0.7.0 §43 — the Run's committed Boss, shown as a plain whitebox strip.
+function runBossBanner(bossId: string): HTMLElement {
+  const b = bossById(bossId);
+  const el = document.createElement('div');
+  el.className = 'config readonly';
+  for (const [text, head] of [
+    [`BOSS — ${b.name} [${b.id}]`, true],
+    [`ICE ${b.baseIce} · strong ${colorList(b.strongColors)} / ${shapeList(b.strongShapes)}`, false],
+    ['Fixed for this run.', false],
+  ] as [string, boolean][]) {
+    const d = document.createElement('div');
+    if (head) d.className = 'cfghead';
+    d.textContent = text;
+    el.appendChild(d);
+  }
+  return el;
+}
+
 // §14 — Deck Selection. Displays every loaded Deck: name, added LINK, Deck
 // Function name, cost, and starting-charge state. All Decks are compatible with
 // the selected Hacker; there is no filtering (§2.8). DESCRIPT and GRAPHICS are
 // never displayed or loaded.
-function showDeckSelection(s: PendingSetup): void {
-  setup = s;
+function showDeckSelection(): void {
+  const s = session;
+  if (!s || s.mode !== 'RUN_SETUP') return;
   const decks = allDecks();
-  const preselect = s.deckId ?? (decks.length === 1 ? decks[0].id : null);
+  const preselect = deckPick ?? (decks.length === 1 ? decks[0].id : null);
+  deckPick = preselect;
   const list = optionList(
     decks.map((d: ResolvedDeck) => ({
       id: d.id,
@@ -1263,10 +1490,14 @@ function showDeckSelection(s: PendingSetup): void {
       ],
     })),
     preselect,
-    (id) => showDeckSelection({ ...s, deckId: id }),
+    (id) => {
+      deckPick = id;
+      showDeckSelection();
+    },
   );
   const panels = document.createElement('div');
   panels.className = 'panelscroll';
+  panels.appendChild(runBossBanner(s.bossId));
   // §6.2 — the selected Hacker's strengths sit on the PRIMARY screen so the
   // Deck's Programs can be compared against them without navigating away.
   if (s.hackerId) {
@@ -1294,36 +1525,27 @@ function showDeckSelection(s: PendingSetup): void {
     head.className = 'cfghead';
     head.textContent = 'PROGRAMS (portfolio order)';
     panels.appendChild(head);
-    panels.appendChild(
-      portfolioStrip(deckById(preselect).portfolioProgramIds, 'DECK_PORTFOLIO', () =>
-        showDeckSelection({ ...s, deckId: preselect }),
-      ),
-    );
+    panels.appendChild(portfolioStrip(deckById(preselect).portfolioProgramIds, 'DECK_PORTFOLIO', showDeckSelection));
   }
   showDialog(
     'SELECT DECK',
-    'Step 2 of 2',
+    'Step 3 of 3',
     [
       ['Choose', () => {
         if (!preselect) return;
         logSelection('DECK_SELECTED', { identity: { hackerId: s.hackerId ?? undefined, deckId: preselect } });
-        setup = chooseDeck({ ...s, deckId: preselect }, preselect);
-        // Alpha 0.6.0 §28 — this is now the DESTRUCTIVE COMMITMENT BOUNDARY:
-        // advancing into the initial Path Choice creates the Run and replaces
-        // the resident save. The confirmation moved here with it, so the
-        // destructive step is still confirmed exactly once (§12.3).
-        const restored = deserializeSession(loadBattleJson());
-        confirmReplace(
-          restored ? restored.info : null,
-          () => void commitRunToPathChoice(),
-          () => showDeckSelection({ ...s, deckId: preselect }),
-        );
+        // Alpha 0.7.0 §8/§9 — the Run was already created at BOSS commitment,
+        // so this is no longer a destructive step and carries no replacement
+        // confirmation. It completes setup and opens the initial Path Choice.
+        commitSetupToPathChoice(commitSetupDeck(s, preselect));
       }, undefined, !preselect],
-      // Back RETAINS the pending choices (§12.2)
+      // §10 — Back returns to Hacker Selection WITHIN the committed Run. The
+      // Boss cannot change; only the identity choice can be revisited.
       ['Back', () => {
-        const prev = setupBack(s);
-        if (prev) showHackerSelection(prev);
-        else showTitle();
+        session = { ...s, step: 'HACKER' };
+        hackerPick = s.hackerId;
+        persistSession();
+        showHackerSelection();
       }],
     ],
     panels,
@@ -1356,10 +1578,18 @@ let buildPick: string | null = null;
 // resolved PASSIVE displays: enough to understand the encounter without an art
 // system, an inventory screen, or `notes` leaking into player-facing copy.
 function pathOfferLines(offer: PathOffer): string[] {
-  const sys = systemById(offer.systemId);
+  // Alpha 0.7.0 §16 — the card names the opponent's identity LAYER honestly. A
+  // Battle-4 card reads "BOSS ODANSHAY", never a System.
+  const enemy = opponentContent({ kind: offer.opponentKind, id: offer.opponentId, source: 'RUN_RANDOM' });
   const host = hostById(offer.hostId);
   const upgrade = upgradeById(offer.upgradeId);
-  const lines = [`SYSTEM ${sys.name} — base ICE ${sys.baseIce}`];
+  const lines = [
+    enemy.kind === 'BOS'
+      // §19 — a Boss's authored ICE is its FINAL battle ICE, so the card says
+      // so rather than showing a "base" the Run would escalate.
+      ? `BOSS ${enemy.name} — ICE ${enemy.baseIce}`
+      : `SYSTEM ${enemy.name} — base ICE ${enemy.baseIce}`,
+  ];
   lines.push(`HOST ${host.name}${host.passives.length ? '' : ' — no passives'}`);
   for (const p of host.passives) lines.push(`  ${p.display}`);
   lines.push(`UPGRADE ${upgrade.name}`);
@@ -1449,7 +1679,10 @@ async function takePath(index: number): Promise<void> {
   session = committed;
   logPathSelected(path, offer, before, committed.upgradeIds);
   logHostSelected(offer.hostId, 'RUN_PATH', path.step === 1 ? 'INITIAL_RUN' : 'RUN_BETWEEN');
-  logSystemSelected({ systemId: offer.systemId, source: 'RUN_RANDOM' }, path.step === 1 ? 'INITIAL_RUN' : 'RUN_BETWEEN');
+  logSystemSelected(
+    { kind: offer.opponentKind, id: offer.opponentId, source: 'RUN_RANDOM' },
+    path.step === 1 ? 'INITIAL_RUN' : 'RUN_BETWEEN',
+  );
   pathPick = null;
   // §33 — Battle 1 opens on the DEFAULT build for a new Run; later battles
   // carry the current build and order forward.
@@ -1487,12 +1720,13 @@ function openBuild(s: BuildState): void {
 // context reads it from the authority that already owns it, so the Build
 // screen never re-resolves or rerolls an opponent: pending New Run setup, the
 // committed Run's persisted selection, or the pending Constructed choice.
-function upcomingSystemFor(s: BuildState): SelectedSystem | null {
+function upcomingSystemFor(s: BuildState): SelectedOpponent | null {
   if (s.context === 'CONSTRUCTED_QUICK_MATCH') return pendingQuickSystem;
   // Alpha 0.6.0 §27/§33 — every Run Build screen, INITIAL_RUN included, now
   // opens only after a path is committed, so the committed Run is the one
-  // authority for the upcoming encounter.
-  return session?.mode === 'RUN' ? session.system : null;
+  // authority for the upcoming encounter. Alpha 0.7.0 §16 — at step 4 that is
+  // the selected Boss, and the panel below reports it as such (§43).
+  return session?.mode === 'RUN' ? session.opponent : null;
 }
 
 // §25/§33 — the committed HOST for this Build screen, from the same authority.
@@ -1549,19 +1783,22 @@ function showBuild(): void {
   // or replace interaction anywhere in a Run.
   const upcoming = upcomingSystemFor(s);
   if (upcoming) {
-    const sys = systemById(upcoming.systemId);
+    // Alpha 0.7.0 §16/§43 — resolved through the opponent union, so the Boss
+    // Build screen names ODANSHAY as a BOSS rather than as a System (§17).
+    const enemy = opponentContent(upcoming);
     const ice =
       s.context === 'CONSTRUCTED_QUICK_MATCH'
-        ? resolveQuickMatchIce(menuSettings, sys.id)
+        ? resolveQuickMatchIce(menuSettings, upcoming)
         : session?.mode === 'RUN'
-          ? resolveRunIce(session.settings, sys.id, session.step)
-          : resolveQuickMatchIce(menuSettings, sys.id);
+          ? resolveRunIce(session.settings, upcoming, session.step)
+          : resolveQuickMatchIce(menuSettings, upcoming);
+    const label = enemy.kind === 'BOS' ? 'BOSS' : 'SYSTEM';
     const sysBox = document.createElement('div');
     sysBox.className = 'config readonly';
     const sysDetails = document.createElement('details');
     sysDetails.className = 'cfgsection';
     const sysSummary = document.createElement('summary');
-    sysSummary.textContent = `SYSTEM: ${sys.name} — ICE ${ice}`;
+    sysSummary.textContent = `${label}: ${enemy.name} — ICE ${ice}`;
     sysDetails.appendChild(sysSummary);
     const sysRow = (text: string, head = false): void => {
       const d = document.createElement('div');
@@ -1569,16 +1806,27 @@ function showBuild(): void {
       d.textContent = text;
       sysDetails.appendChild(d);
     };
-    sysRow(`${sys.name} [${sys.id}] — ICE ${ice}`, true);
-    sysRow(`Strong colors: ${colorList(sys.strongColors)}`);
-    sysRow(`Weak colors: ${colorList(sys.weakColors)}`);
-    sysRow(`Strong shapes: ${shapeList(sys.strongShapes)}`);
-    sysRow(`Weak shapes: ${shapeList(sys.weakShapes)}`);
+    sysRow(`${enemy.name} [${enemy.id}] — ICE ${ice}`, true);
+    sysRow(`Strong colors: ${colorList(enemy.strongColors)}`);
+    sysRow(`Weak colors: ${colorList(enemy.weakColors)}`);
+    sysRow(`Strong shapes: ${shapeList(enemy.strongShapes)}`);
+    sysRow(`Weak shapes: ${shapeList(enemy.weakShapes)}`);
     sysRow('PROGRAMS (top to bottom — charge priority)', true);
-    sysDetails.appendChild(systemProgramStrip(sys.programIds, showBuild));
-    if (sys.passives.length) {
-      sysRow('SYSTEM PASSIVES', true);
-      for (const p of sys.passives) sysRow(p.display);
+    sysDetails.appendChild(systemProgramStrip(enemy.programIds, showBuild));
+    // §5.1 — only a System opponent has a PASSIVES column at all.
+    if (enemy.kind === 'SYS') {
+      const sysPassives = systemById(enemy.id).passives;
+      if (sysPassives.length) {
+        sysRow('SYSTEM PASSIVES', true);
+        for (const p of sysPassives) sysRow(p.display);
+      }
+    }
+    // §44 — the Boss mechanic, from engine constants rather than placeholder copy.
+    if (enemy.kind === 'BOS' && enemy.id === BOSS_MECHANIC_BOSS_ID) {
+      sysRow('MECHANIC — OVERRIDE', true);
+      sysRow(`Places ${OVERRIDE_PLACEMENT_COUNT} Overrides at the end of each of its turns.`);
+      sysRow(`Too few valid targets: activates ${fnName(FN_DATABEND)}, then tries again.`);
+      sysRow(`At ${OVERRIDE_THRESHOLD} Overrides: ${fnName(FN_CODESHATTER)}, then ${fnName(FN_REBOOT)}.`);
     }
     sysBox.appendChild(sysDetails);
     panels.appendChild(sysBox);
@@ -1763,33 +2011,31 @@ function showBuild(): void {
   showDialog(buildTitle(s.context), sub, buttons, panels, true);
 }
 
-// Alpha 0.6.0 §28 — THE DESTRUCTIVE COMMITMENT BOUNDARY. Advancing from Deck
-// Selection into the initial Path Choice creates the Run, replaces the previous
-// active save, generates the two initial offers, and PERSISTS them immediately,
-// so a reload lands on exactly the same two cards (§35).
+// Alpha 0.7.0 §8/§10 — completing Deck Selection finishes setup: the Run gains
+// its identity, inventory, and default build, and its two initial offers are
+// generated and PERSISTED immediately so a reload lands on exactly the same two
+// cards (§35).
 //
-// It does not create a battle and does not open Build: the encounter package is
-// what the player is about to choose (§27).
-async function commitRunToPathChoice(): Promise<void> {
-  if (!setup || !setupComplete(setup) || !setup.hackerId || !setup.deckId) return;
-  const hackerId = setup.hackerId;
-  const deckId = setup.deckId;
-  // §35 — the Run's route randomness comes from ONE isolated stream, seeded
-  // here and then persisted with the Run. It never touches gameplay RNG.
-  const { seed } = makeSetupRandom();
-  clearBattleSave();
-  // §10.4 — the settings snapshot (including Normal LINK) is taken at Run
-  // creation and is authoritative for the whole Run.
-  const run = commitNewRun(setup, menuSettings, seed);
+// This is NOT the destructive boundary any more — that moved to Boss commitment
+// (§9) — so there is no save replacement and no confirmation here. It does not
+// create a battle and does not open Build: the encounter package is what the
+// player is about to choose (§27).
+function commitSetupToPathChoice(run: RunInfo): void {
   session = run;
   pending = null;
-  setup = null;
   build = null;
   game = null;
   pathPick = null;
+  bossPick = null;
+  hackerPick = null;
+  deckPick = null;
   persistSession();
-  logSelection('RUN_CREATED', {
-    extra: { ...portfolioContext(hackerId, deckId), buildContext: 'INITIAL_RUN', routeSeed: seed },
+  logSelection('DECK_SELECTED', {
+    extra: {
+      ...portfolioContext(run.identity.hackerId, run.identity.deckId),
+      buildContext: 'INITIAL_RUN',
+      bossId: run.bossId,
+    },
   });
   logPathOffered(run.pendingPath!);
   showPathChoice();
@@ -1898,7 +2144,7 @@ function showSystemSelection(): void {
       lines: [
         // §15 — Quick Match ICE is the System's own BASE_ICE (§10.1), so the
         // number shown here is the number the battle will actually use.
-        `ICE ${resolveQuickMatchIce(menuSettings, s.id)}`,
+        `ICE ${resolveQuickMatchIce(menuSettings, systemOpponent(s.id, 'QUICK_CONSTRUCTED'))}`,
         `Strong: ${colorList(s.strongColors)} / ${shapeList(s.strongShapes)}`,
         `Weak: ${colorList(s.weakColors)} / ${shapeList(s.weakShapes)}`,
       ],
@@ -1926,7 +2172,7 @@ function showSystemSelection(): void {
     [
       ['Choose', () => {
         if (!preselect) return;
-        const system: SelectedSystem = { systemId: preselect, source: 'QUICK_CONSTRUCTED' };
+        const system = systemOpponent(preselect, 'QUICK_CONSTRUCTED');
         logSystemSelected(system, 'CONSTRUCTED_QUICK_MATCH');
         // Alpha 0.6.0 §37 — HOST Selection sits between System Selection and
         // Build, so both deliberate choices are made before the build is edited.
@@ -1989,7 +2235,7 @@ function showHostSelection(): void {
       }, undefined, !preselect],
       ['Back', () => {
         hostPick = null;
-        systemPick = pendingQuickSystem?.systemId ?? null;
+        systemPick = pendingQuickSystem?.id ?? null;
         pendingQuickSystem = null;
         showSystemSelection();
       }],
@@ -2001,7 +2247,7 @@ function showHostSelection(): void {
 
 // §9.3 — open the Constructed Build screen: the last valid remembered build
 // when one exists, otherwise the default.
-function openConstructedQuickMatchBuild(system: SelectedSystem): void {
+function openConstructedQuickMatchBuild(system: SelectedOpponent): void {
   pendingQuickSystem = system;
   const ids = defaultIdentity();
   // §9.4 — an unusable preference is discarded quietly and falls back to the
@@ -2035,9 +2281,8 @@ async function startRandomQuickMatch(): Promise<void> {
   // from the in_pool subset, and no HOST Selection screen opens.
   const hostId = randomHost(rng);
   clearBattleSave(); // confirmed replacement
-  session = { mode: 'QUICK_MATCH', identity: ids, system, hostId, build: chosen, buildOrigin: 'RANDOM' };
+  session = { mode: 'QUICK_MATCH', identity: ids, opponent: system, hostId, build: chosen, buildOrigin: 'RANDOM' };
   pending = null;
-  setup = null;
   build = null;
   pendingQuickSystem = null;
   pendingQuickHost = null;
@@ -2060,6 +2305,47 @@ async function startRandomQuickMatch(): Promise<void> {
   await enterBattle(g);
 }
 
+// ============================================================================
+// Alpha 0.7.0 §45 — DEV-ONLY DIRECT BOSS ENTRY.
+//
+// §45 forbids adding Boss Selection to Quick Match and directs automated or
+// manual testing that needs direct Boss entry to use a narrowly scoped dev/test
+// helper instead. This is that helper: it is reachable ONLY by loading the app
+// with `?dev=boss`, appears in no menu, and changes nothing about the player
+// flow. Reaching a 15+ Override state legitimately takes several Battle-4 turns
+// every attempt, which makes the §55 threshold observation impractical without
+// it. Director-approved 2026-08-17.
+// ============================================================================
+
+function devBossRequested(): boolean {
+  try {
+    return new URLSearchParams(window.location.search).get('dev') === 'boss';
+  } catch {
+    return false;
+  }
+}
+
+async function startDevBossBattle(): Promise<void> {
+  const ids = defaultIdentity();
+  const boss = allBosses()[0];
+  if (!boss) return;
+  const opponent: SelectedOpponent = { kind: 'BOS', id: boss.id, source: 'HEADLESS_PINNED' };
+  const hostId = headlessDevHost();
+  const chosen = defaultBuild(ids.hackerId, ids.deckId);
+  clearBattleSave();
+  session = { mode: 'QUICK_MATCH', identity: ids, opponent, hostId, build: chosen, buildOrigin: 'DEFAULT' };
+  pending = null;
+  build = null;
+  const g = createQuickMatchBattle(menuSettings, ids, opponent, hostId, chosen, 'DEFAULT');
+  console.warn(`[breach] DEV Boss battle: ${boss.name} on ${hostId} — not reachable from normal play`);
+  await enterBattle(g);
+}
+
+// THRESHOLD, so the dev battle isolates the Boss mechanic from HOST PASSIVEs.
+function headlessDevHost(): string {
+  return allHosts()[0]?.id ?? '';
+}
+
 // §9.3 — start the Constructed battle and remember the build. The preset is
 // written ONLY here, never on Back.
 async function startConstructedQuickMatch(): Promise<void> {
@@ -2074,13 +2360,13 @@ async function startConstructedQuickMatch(): Promise<void> {
   // independent of Run progression.
   saveConstructedPreset(serializeConstructedPreset(ids.hackerId, ids.deckId, chosen));
   clearBattleSave();
-  session = { mode: 'QUICK_MATCH', identity: ids, system, hostId, build: chosen, buildOrigin: build.origin };
+  const origin = build.origin;
+  session = { mode: 'QUICK_MATCH', identity: ids, opponent: system, hostId, build: chosen, buildOrigin: origin };
   pending = null;
-  setup = null;
   build = null;
   pendingQuickSystem = null;
   pendingQuickHost = null;
-  const g = createQuickMatchBattle(menuSettings, ids, system, hostId, chosen, session.buildOrigin);
+  const g = createQuickMatchBattle(menuSettings, ids, system, hostId, chosen, origin);
   logSelection('QUICK_MATCH_CREATED', { g, extra: { buildContext: 'CONSTRUCTED_QUICK_MATCH', buildEdited: edited } });
   await enterBattle(g);
 }
@@ -2095,7 +2381,7 @@ async function resetQuickMatch(config: BattleConfig, identity: BattleIdentity): 
     identity: { hackerId: identity.hackerId, deckId: identity.deckId, selectionSource: identity.selectionSource },
     // §18.3/§14 — Reset replays the concluded battle's OWN encounter. It never
     // rerolls the opponent, exactly as it never rerolls a Random build.
-    system: { systemId: identity.systemId, source: identity.systemSelectionSource },
+    opponent: { kind: identity.opponentKind, id: identity.opponentId, source: identity.opponentSelectionSource },
     hostId: identity.hostId,
     build: [...identity.hackerPrograms],
     buildOrigin: identity.buildOrigin,
@@ -2128,11 +2414,21 @@ async function resumeSession(): Promise<void> {
     session = r.info;
     game = null;
     pending = null;
-    setup = null;
     selection = null;
     targeting = null;
     systemTurnActive = false;
     view.clearBoard();
+    // Alpha 0.7.0 §10 — a Run parked in SETUP resumes to the exact screen it
+    // left off on, with the committed Boss (and Hacker, at the Deck step) intact.
+    if (r.info.mode === 'RUN_SETUP') {
+      build = null;
+      bossPick = r.info.bossId;
+      hackerPick = r.info.hackerId;
+      deckPick = null;
+      if (r.info.step === 'HACKER') showHackerSelection();
+      else showDeckSelection();
+      return;
+    }
     if (r.info.mode !== 'RUN') {
       showTitle();
       return;
@@ -2522,7 +2818,10 @@ function boot(): void {
     },
   });
 
-  showTitle();
+  // Alpha 0.7.0 §45 — the dev-only direct Boss entry, reachable ONLY via
+  // `?dev=boss`. Normal startup always lands on the Title.
+  if (devBossRequested()) void startDevBossBattle();
+  else showTitle();
 
   // MK7.7 — hint timer
   window.addEventListener('pointerdown', () => {

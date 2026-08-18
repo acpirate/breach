@@ -151,9 +151,13 @@ registerEffect({
 // Alpha 0.3.0 §8.2 — EFFECT_SHAKE takes exactly four colon-delimited integer
 // enum values and no discrete parameter columns:
 //   boardComposition:specialGems:matches:cascades
+// Alpha 0.7.0 §7.1 — `specialGems` gains value 2, "remove only the overlays the
+// activating side does NOT own". It deliberately mirrors the LineSlice tuple's
+// established SPECIALS_RETAIN_OWN = 2 rather than inventing a third enum
+// vocabulary, so the two Effects cannot drift apart on special handling.
 export const SHAKE_TUPLE: ReadonlyArray<EffectTupleField> = [
   { name: 'boardComposition', min: 0, max: 1 },
-  { name: 'specialGems', min: 0, max: 1 },
+  { name: 'specialGems', min: 0, max: 2 },
   { name: 'matches', min: 0, max: 1 },
   { name: 'cascades', min: 0, max: 2 },
 ];

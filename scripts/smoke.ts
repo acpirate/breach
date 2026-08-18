@@ -221,7 +221,11 @@ function testSaveRoundTrip(): void {
     identity: defaultIdentity(),
     // Alpha 0.5.0 §32 — the session's opponent must agree with the battle's own
     // identity, or the envelope legitimately fails its consistency check.
-    system: { systemId: g.state.identity.systemId, source: g.state.identity.systemSelectionSource },
+    opponent: {
+      kind: g.state.identity.opponentKind,
+      id: g.state.identity.opponentId,
+      source: g.state.identity.opponentSelectionSource,
+    },
     // Alpha 0.6.0 §44 — the HOST is part of Quick Match session identity on the
     // System's terms and must likewise agree with the battle's own identity.
     hostId: g.state.identity.hostId,
@@ -279,11 +283,11 @@ function testSaveRoundTrip(): void {
   console.log('save round-trip OK');
 }
 
-assert(SAVE_VERSION === 'alpha-0.6.0', 'save version must be alpha-0.6.0');
+assert(SAVE_VERSION === 'alpha-0.7.0', 'save version must be alpha-0.7.0');
 console.log(`content fingerprint: ${getContent().fingerprint}`);
 // §44 — every simulation in this file runs against the PINNED headless System
 // and HOST, so results stay comparable between runs.
-console.log(`headless System: ${headlessSystem().systemId} | headless HOST: ${headlessHost()}`);
+console.log(`headless System: ${headlessSystem().id} | headless HOST: ${headlessHost()}`);
 console.log(`default identity LINK: ${defaultHackerLink()} (deck function cost ${DECK_COST})`);
 
 // defaults (cap-0, Normal LINK on) — standard and low-LINK

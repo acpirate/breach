@@ -133,7 +133,7 @@ console.log(`system programs (loaded): ${stamp.systemPrograms.join(', ')}`);
 // Alpha 0.5.0 §44 — the opponent is PINNED for simulations, and its ordered
 // build is what actually fights, so both are reported: batch numbers are only
 // comparable between runs against the same System.
-const sim = systemById(headlessSystem().systemId);
+const sim = systemById(headlessSystem().id);
 console.log(`system: ${sim.id} ${sim.name} | base ICE ${sim.baseIce} | build: ${sim.programIds.join(', ')}`);
 console.log(`system strong: colors=[${sim.strongColors.join(',')}] shapes=[${sim.strongShapes.join(',')}]`);
 console.log(`functions: ${stamp.functions.map((f) => `${f.id}=${f.cost}`).join(', ')}`);

@@ -36,6 +36,7 @@ import {
   AXIS_NEUTRAL,
   AxisResult,
   AxisTarget,
+  BOSS_MECHANIC_FUNCTION_IDS,
   BombParams,
   DATA_SCHEMA_VERSION,
   DEFAULT_DECK_ID,
@@ -57,6 +58,7 @@ import {
   ResolvedHacker,
   ResolvedHost,
   ResolvedPassive,
+  ResolvedBoss,
   ResolvedProgram,
   ResolvedSystem,
   ResolvedUpgrade,
@@ -80,6 +82,7 @@ export type DatasetName =
   | 'systems' // Alpha 0.5.0 §5 — the seventh required runtime dataset
   | 'hosts' // Alpha 0.6.0 §7 — the eighth
   | 'upgrades' // Alpha 0.6.0 §8 — the ninth
+  | 'bosses' // Alpha 0.7.0 §5 — the tenth
   | 'content';
 
 export interface DataIssue {
@@ -132,6 +135,10 @@ export interface DataFiles {
   // Alpha 0.6.0 §0.2 — the eighth and ninth, on the same terms.
   hosts: DataFile;
   upgrades: DataFile;
+  // Alpha 0.7.0 §0.2 — the tenth. Bosses are a DISTINCT identity layer, not
+  // Systems with a flag (§1.1): they carry their own header, their own ICE
+  // rule (§19), and their own enemy-side identity in combat, saves, and logs.
+  bosses: DataFile;
 }
 
 export interface LoadResult {
@@ -220,6 +227,16 @@ const SYSTEM_HEADER = [
 // rather than authored content.
 const HOST_HEADER = ['HOST_ID', 'name', 'passives', 'in_pool', 'display_text', 'graphics_ref', 'notes'];
 const UPGRADE_HEADER = ['UPGRADE_ID', 'name', 'passives', 'display_text', 'graphics_ref', 'notes'];
+// Alpha 0.7.0 §5.1 — the Boss schema, used EXACTLY as the workbook supplies it.
+// Deliberately NOT the System header: there is no `PASSIVES` column and no
+// `MECHANIC_ID` (§2/§5.1). ODANSHAY's Override mechanic is code keyed to
+// BOS_01, not a data-driven scripting field, so no column is invented to hold
+// it. A stale export missing BOSS_PASSIVE_DESCRIPTION fails the header check on
+// exactly the terms BASE_ICE and PASSIVES established in Alpha 0.5/0.6.
+const BOSS_HEADER = [
+  'BOS_ID', 'name', 'in_pool', 'BASE_ICE', 'STRONG_COLORS', 'STRONG_SHAPES', 'PRG_SET',
+  'BOSS_PASSIVE_DESCRIPTION', 'BIO', 'GRAPHICS',
+];
 
 // Required Alpha record IDs (their VALUES are validated by the schema/contract
 // rules; per designer ruling the dataset is the final authority on the values).
@@ -232,6 +249,9 @@ const REQUIRED_FNC_IDS = [
   'FNC_013', 'FNC_014', 'FNC_015',
   // Alpha 0.6.0 §9 — GREENING and SNEAK, the PASSIVE carrier payloads
   'FNC_016', 'FNC_017',
+  // Alpha 0.7.0 §6 — DATABEND, REBOOT, and CODESHATTER, ODANSHAY's mechanic
+  // payloads. Zero-cost and never directly assigned to a Program or Deck (§6.1).
+  'FNC_018', 'FNC_019', 'FNC_020',
 ];
 // Alpha 0.4.0 — NINJA and WEASEL complete the six-Program inventory.
 const REQUIRED_PRG_H_IDS = ['PRG_H_001', 'PRG_H_002', 'PRG_H_003', 'PRG_H_004', 'PRG_H_005', 'PRG_H_006'];
@@ -256,6 +276,9 @@ const REQUIRED_SYS_IDS = ['SYS_01', 'SYS_02', 'SYS_03'];
 // Alpha 0.6.0 §9 — THRESHOLD plus the four authored battlefields.
 const REQUIRED_HST_IDS = ['HST_01', 'HST_02', 'HST_03', 'HST_04', 'HST_05'];
 const REQUIRED_UPG_IDS = ['UPG_01', 'UPG_02', 'UPG_03', 'UPG_04'];
+// Alpha 0.7.0 §5.2 — ODANSHAY, the only authored Boss. Alpha 0.7 deliberately
+// does not add speculative Boss content (§2).
+const REQUIRED_BOS_IDS = ['BOS_01'];
 
 // ---- Alpha 0.4.0 §4.2 spreadsheet-safe value normalization ----
 
@@ -392,6 +415,26 @@ interface SystemRow {
   programs: string[]; // ordered PRG_SET — exactly SYSTEM_BUILD_SIZE PRG_S_* refs
   passiveIds: string[];
   inPool: boolean;
+  bio: string;
+  graphics: string;
+}
+
+// Alpha 0.7.0 §5 — an authored Boss row. Structurally close to a System, and
+// deliberately its own type anyway: a Boss has no PASSIVES column (§5.1), its
+// ICE is not subject to Run escalation (§19), and its `in_pool` is inert
+// because Boss Selection is explicit (§5.3). Collapsing the two would make
+// every one of those differences an implicit special case on ResolvedSystem.
+interface BossRow {
+  file: string;
+  row: number;
+  id: string;
+  name: string;
+  baseIce: number;
+  strongColors: Color[];
+  strongShapes: Shape[];
+  programs: string[]; // ordered PRG_SET — exactly SYSTEM_BUILD_SIZE PRG_S_* refs
+  inPool: boolean;
+  passiveDescription: string;
   bio: string;
   graphics: string;
 }
@@ -1171,6 +1214,64 @@ export function loadContent(files: DataFiles): LoadResult {
     }
   }
 
+  // ---- Phase 3/4 — parse Boss dataset (Alpha 0.7.0 §5) ----
+
+  const bossRows: BossRow[] = [];
+  {
+    const table = readTable(files.bosses, 'bosses', BOSS_HEADER);
+    if (table) {
+      for (const r of table.rows) {
+        const id = r.get('BOS_ID').trim();
+        const ctx: Ctx = { dataset: 'bosses', file: files.bosses.name, row: r.line, id };
+        if (!id) {
+          err({ ...ctx, field: 'BOS_ID', reason: 'BOS_ID is required' });
+          continue;
+        }
+        if (!id.startsWith('BOS_')) {
+          err({ ...ctx, field: 'BOS_ID', value: id, expected: 'BOS_*', reason: 'wrong Boss ID prefix' });
+          continue;
+        }
+        const name = checkName(r.get('name'), ctx);
+        // §5.5/§19 — a positive integer maximum ICE under the shared health
+        // sanity convention. Unlike a System's, it is the FINAL Boss-battle ICE:
+        // the Run's additive escalation modifier is never applied on top (§19).
+        const baseIce = readInt(r.get('BASE_ICE'), { ...ctx, field: 'BASE_ICE' }, 1, 9999);
+        const strongColors = parseTokenList(r.get('STRONG_COLORS'), COLOR_TOKENS, { ...ctx, field: 'STRONG_COLORS' });
+        const strongShapes = parseTokenList(r.get('STRONG_SHAPES'), SHAPE_TOKENS, { ...ctx, field: 'STRONG_SHAPES' });
+        // §5.5 — the Boss fields the existing four-Program enemy combat model,
+        // so PRG_SET resolves through exactly the System build parser. §5.5 is
+        // explicit that this must not become speculative variable-size support.
+        const programs = parseSystemBuild(r.get('PRG_SET'), { ...ctx, field: 'PRG_SET' });
+        // §5.3 — parsed for schema completeness and fingerprinting only. Alpha
+        // 0.7 has no random Boss pool: Boss Selection is explicit and lists
+        // every valid row, so this is deliberately NOT a selection filter.
+        const inPool = readInPool(r.get('in_pool'), { ...ctx, field: 'in_pool' });
+        if (
+          name === null || baseIce === null || strongColors === null || strongShapes === null ||
+          programs === null || inPool === null
+        ) {
+          continue;
+        }
+        bossRows.push({
+          file: files.bosses.name,
+          row: r.line,
+          id,
+          name,
+          baseIce,
+          strongColors,
+          strongShapes,
+          programs,
+          inPool,
+          // §5.4 presentation placeholders: retained verbatim, never interpreted
+          // as mechanic authority and never fingerprinted (§37).
+          passiveDescription: r.get('BOSS_PASSIVE_DESCRIPTION').trim(),
+          bio: r.get('BIO').trim(),
+          graphics: r.get('GRAPHICS').trim(),
+        });
+      }
+    }
+  }
+
   // ---- Phase 5 — global ID uniqueness + duplicate-name warnings ----
 
   const idHome = new Map<string, { dataset: DatasetName; file: string; row: number }>();
@@ -1191,6 +1292,7 @@ export function loadContent(files: DataFiles): LoadResult {
   const uniqueSystems = systemRows.filter((s) => claimId(s.id, { dataset: 'systems', file: s.file, row: s.row }));
   const uniqueHosts = hostRows.filter((h) => claimId(h.id, { dataset: 'hosts', file: h.file, row: h.row }));
   const uniqueUpgrades = upgradeRows.filter((u) => claimId(u.id, { dataset: 'upgrades', file: u.file, row: u.row }));
+  const uniqueBosses = bossRows.filter((b) => claimId(b.id, { dataset: 'bosses', file: b.file, row: b.row }));
 
   {
     // §4.2 — duplicate display names are valid but produce a startup warning.
@@ -1203,6 +1305,7 @@ export function loadContent(files: DataFiles): LoadResult {
       ...uniqueSystems.map((s) => ({ name: s.name, dataset: 'systems' as const, file: s.file, row: s.row, id: s.id })),
       ...uniqueHosts.map((h) => ({ name: h.name, dataset: 'hosts' as const, file: h.file, row: h.row, id: h.id })),
       ...uniqueUpgrades.map((u) => ({ name: u.name, dataset: 'upgrades' as const, file: u.file, row: u.row, id: u.id })),
+      ...uniqueBosses.map((b) => ({ name: b.name, dataset: 'bosses' as const, file: b.file, row: b.row, id: b.id })),
     ]) {
       const prev = names.get(rec.name);
       if (prev) {
@@ -1410,9 +1513,10 @@ export function loadContent(files: DataFiles): LoadResult {
           };
           out.shake = shake;
           // §4.9 semantic warnings: valid data whose combination is inert.
-          if (shake.boardComposition === 1 && shake.specialGems === 0) {
-            warn({ ...ctx, field: 'params', value: f.tupleRaw, reason: 'EFFECT_SHAKE Replace mode combined with Retain-specials mode — Retain is ineffective because Replace removes prior tile state' });
-          }
+          // Alpha 0.7.0 §7.1 — the Alpha 0.6 "Retain is ineffective under
+          // Replace" warning is RETIRED: Replace now leaves retained overlays
+          // and their Packets in place, so `1:0:x:x` and `1:2:x:x` are both
+          // meaningful combinations rather than inert ones.
           if (shake.matches === 0 && shake.cascades !== 0) {
             warn({ ...ctx, field: 'params', value: f.tupleRaw, reason: 'EFFECT_SHAKE matches are disabled while a nonzero cascade mode is supplied — the cascade mode is currently ignored' });
           }
@@ -1660,6 +1764,27 @@ export function loadContent(files: DataFiles): LoadResult {
     }
   }
 
+  // Alpha 0.7.0 §5.5 — a Boss's PRG_SET resolves on exactly the System's terms.
+  // §5.5 is explicit that an invalid reference FAILS rather than silently
+  // substituting a System or a default Boss, so this is an error, never a
+  // warning with a fallback.
+  for (const b of uniqueBosses) {
+    for (const pid of b.programs) {
+      if (!systemProgramIds.has(pid)) {
+        err({
+          dataset: 'bosses',
+          file: b.file,
+          row: b.row,
+          id: b.id,
+          field: 'PRG_SET',
+          value: pid,
+          expected: 'a loaded PRG_S_* Program',
+          reason: 'PRG_SET references an unknown System Program ID',
+        });
+      }
+    }
+  }
+
   // §4.6 — because every Deck is compatible with every Hacker (§2.7), EVERY
   // pairing must be able to produce a valid six-Program inventory. Overlap
   // between a Hacker and a Deck portfolio is a startup content error: Alpha
@@ -1781,6 +1906,8 @@ export function loadContent(files: DataFiles): LoadResult {
   const upgIds = new Set(uniqueUpgrades.map((u) => u.id));
   requireIds(REQUIRED_HST_IDS, (id) => hstIds.has(id), 'hosts', files.hosts.name);
   requireIds(REQUIRED_UPG_IDS, (id) => upgIds.has(id), 'upgrades', files.upgrades.name);
+  const bosIds = new Set(uniqueBosses.map((b) => b.id));
+  requireIds(REQUIRED_BOS_IDS, (id) => bosIds.has(id), 'bosses', files.bosses.name);
 
   // §11.1/§41 — random encounter selection samples the loaded catalog, so an
   // EMPTY catalog is not a playable state and must not be papered over with a
@@ -1790,6 +1917,11 @@ export function loadContent(files: DataFiles): LoadResult {
   }
   if (uniqueHosts.length === 0) {
     err({ dataset: 'hosts', file: files.hosts.name, reason: 'at least one valid HOST is required' });
+  }
+  // Alpha 0.7.0 §8/§9 — Boss Selection is the FIRST New Run choice, so an empty
+  // Boss catalog would leave the Run with no way to start at all.
+  if (uniqueBosses.length === 0) {
+    err({ dataset: 'bosses', file: files.bosses.name, reason: 'at least one valid Boss is required' });
   }
   // §8 — the four-UPGRADE / four-decision exhaustion case (§31) is deliberate
   // content, so a short pool is a blocking error rather than a Run that quietly
@@ -1847,6 +1979,10 @@ export function loadContent(files: DataFiles): LoadResult {
     // Alpha 0.6.0 §23 — a PASSIVE carrier payload is a real reference: it is
     // exactly how GREENING and SNEAK reach the board.
     for (const s of uniquePassives) if (s.functionId) referencedFns.add(s.functionId);
+    // Alpha 0.7.0 §21/§24/§27 — ODANSHAY's mechanic payloads are referenced by
+    // CODE rather than by data, because §2 forbids a MECHANIC_ID column. They
+    // are real references all the same, so they must not warn as dead rows.
+    for (const id of BOSS_MECHANIC_FUNCTION_IDS) referencedFns.add(id);
     for (const [id, payload] of payloads) {
       if (payload.kind === 'composite' && referencedFns.has(id)) {
         for (const child of payload.children!) referencedFns.add(child);
@@ -1873,26 +2009,35 @@ export function loadContent(files: DataFiles): LoadResult {
     // Alpha 0.5.0 §5.4 — SYS.PRG_SET is now the only thing that puts a System
     // Program into play, so a System Program no authored System fields is dead
     // content. It WARNS rather than failing (it is valid, just unused), which
-    // is how PRG_S_004 DISABLER currently surfaces: neither BOUNCER nor
-    // MIDNIGHT fields it, so the System never Drains in Alpha 0.5 (§6.2).
+    // is how PRG_S_004 DISABLER surfaced through Alpha 0.6: neither BOUNCER nor
+    // MIDNIGHT fielded it, so the System never Drained (§6.2). Alpha 0.7.0 §18 —
+    // a BOSS PRG_SET fields a Program just as genuinely as a System's does, so
+    // Boss references count here. ODANSHAY fields DISABLER, which is what
+    // finally retires that long-standing warning.
     const referencedSystemPrograms = new Set<string>();
     for (const s of uniqueSystems) for (const pid of s.programs) referencedSystemPrograms.add(pid);
+    for (const b of uniqueBosses) for (const pid of b.programs) referencedSystemPrograms.add(pid);
     for (const p of uniquePrograms) {
       if (p.dataset !== 'system-programs') continue;
       if (!referencedSystemPrograms.has(p.id)) {
-        warn({ dataset: p.dataset, file: p.file, row: p.row, id: p.id, reason: 'valid System Program row is not fielded by any System PRG_SET' });
+        warn({ dataset: p.dataset, file: p.file, row: p.row, id: p.id, reason: 'valid System Program row is not fielded by any System or Boss PRG_SET' });
       }
     }
   }
 
-  // ---- Alpha 0.6.0 — zero-cost Functions and carrier executability ----
+  // ---- zero-cost Functions and carrier executability ----
   //
-  // Director ruling (2026-08-11): cost 0 exists so a PASSIVE carrier payload can
-  // state its true cost. A Program's or Deck's charge pool capacity IS its
-  // Function's cost (§11.1), so a zero-cost DIRECTLY ASSIGNED Function would
-  // hold no pool and fire every turn for free. That is a blocking content
-  // error. Reachability as a composite child or a PASSIVE payload is fine:
-  // neither pays a cost anyway (§7.2/§16).
+  // Director ruling (2026-08-11), FORMALIZED by Alpha 0.7.0 §6.1: `cost = 0` is
+  // valid ONLY for a Function that is not directly assigned to a Program or a
+  // Deck, and that is therefore invoked exclusively through a PASSIVE, boss, or
+  // mechanic payload path where no charge is paid. A Program's or Deck's charge
+  // pool capacity IS its Function's cost (§11.1), so a zero-cost directly
+  // assigned Function would hold no pool and fire every turn for free — a
+  // blocking content error. Reachability as a composite child or a payload is
+  // fine: neither pays a cost anyway (§7.2/§16).
+  //
+  // FNC_016/017 (PASSIVE carriers) and FNC_018/019/020 (ODANSHAY's mechanic
+  // payloads) are the valid examples under this rule.
   {
     const directlyAssigned = new Map<string, string>(); // FNC_ID -> owning record
     for (const p of uniquePrograms) if (!directlyAssigned.has(p.functionId)) directlyAssigned.set(p.functionId, p.id);
@@ -2092,7 +2237,28 @@ export function loadContent(files: DataFiles): LoadResult {
     });
   }
 
-  const fingerprint = computeFingerprint(hacker, system, functions, hackers, passives, decks, systems, hosts, upgrades);
+  // Alpha 0.7.0 §20 — Boss weak sets are calculated complements over the
+  // recognized enum vocabularies, exactly as Hacker and System weak sets are.
+  // Nothing here consults the Hacker or any System.
+  const bosses = new Map<string, ResolvedBoss>();
+  for (const b of uniqueBosses) {
+    bosses.set(b.id, {
+      id: b.id,
+      name: b.name,
+      baseIce: b.baseIce,
+      strongColors: b.strongColors,
+      weakColors: RECOGNIZED_COLORS.filter((c) => !b.strongColors.includes(c)),
+      strongShapes: b.strongShapes,
+      weakShapes: RECOGNIZED_SHAPES.filter((sh) => !b.strongShapes.includes(sh)),
+      programIds: b.programs,
+      inPool: b.inPool,
+      passiveDescription: b.passiveDescription,
+      bio: b.bio,
+      graphics: b.graphics,
+    });
+  }
+
+  const fingerprint = computeFingerprint(hacker, system, functions, hackers, passives, decks, systems, hosts, upgrades, bosses);
   const content: ResolvedContent = {
     gameVersion: GAME_VERSION,
     schemaVersion: DATA_SCHEMA_VERSION,
@@ -2107,17 +2273,20 @@ export function loadContent(files: DataFiles): LoadResult {
     systems,
     hosts,
     upgrades,
+    bosses,
     hackerOrder: uniqueHackers.map((h) => h.id),
     deckOrder: uniqueDecks.map((d) => d.id),
     systemOrder: uniqueSystems.map((s) => s.id),
     hostOrder: uniqueHosts.map((h) => h.id),
     upgradeOrder: uniqueUpgrades.map((u) => u.id),
+    bossOrder: uniqueBosses.map((b) => b.id),
   };
   return { content, issues, errors, warnings };
 }
 
-// §4.10 / Alpha 0.6.0 §10 — normalized gameplay-content fingerprint. Includes
-// gameplay-affecting values from ALL NINE required datasets: program
+// §4.10 / Alpha 0.6.0 §10 / Alpha 0.7.0 §37 — normalized gameplay-content
+// fingerprint. Includes gameplay-affecting values from ALL TEN required
+// datasets, Boss ID/ICE/strong sets/ordered PRG_SET included: program
 // IDs/side/bindings/function refs, function IDs/costs/ordered payload
 // plans/validated parameters/startCharged, the named area-pattern registry and
 // its progression order, Hacker LINK and strong sets and ordered PASSIVE refs,
@@ -2138,6 +2307,7 @@ function computeFingerprint(
   systems: Map<string, ResolvedSystem>,
   hosts: Map<string, ResolvedHost>,
   upgrades: Map<string, ResolvedUpgrade>,
+  bosses: Map<string, ResolvedBoss>,
 ): string {
   const usedAreas = new Set<string>();
   const byId = <T extends { id: string }>(m: Map<string, T>): T[] =>
@@ -2229,6 +2399,22 @@ function computeFingerprint(
   // and `notes` are presentation and excluded.
   const hstNorm = byId(hosts).map((h) => ({ id: h.id, psv: [...h.passiveIds], pool: h.inPool }));
   const upgNorm = byId(upgrades).map((u) => ({ id: u.id, psv: [...u.passiveIds] }));
+  // Alpha 0.7.0 §37 — Boss gameplay identity, on exactly the System's terms:
+  // stable ID, the ICE that decides the final battle, the authored strong sets,
+  // and the ORDERED PRG_SET (order is charge-routing priority). The referenced
+  // Program and Function content already reaches the fingerprint through
+  // progNorm/fnNorm, so it is not duplicated here. BOSS_PASSIVE_DESCRIPTION,
+  // BIO, and GRAPHICS are presentation and are EXCLUDED, exactly as the System's
+  // and Hacker's placeholders are — fixing flavor copy must not invalidate a
+  // save. Weak sets derive from the strong sets and would be duplicate authority.
+  const bosNorm = byId(bosses).map((b) => ({
+    id: b.id,
+    ice: b.baseIce,
+    sc: [...b.strongColors],
+    ss: [...b.strongShapes],
+    prg: [...b.programIds],
+    pool: b.inPool,
+  }));
   // Alpha 0.6.0 §22 — PSV_BIGGER_BOMB can advance an authored Bomb into ANY
   // larger registered pattern, so the whole ordered registry is fingerprint
   // input now, not just the patterns the FNC rows name directly.
@@ -2247,6 +2433,7 @@ function computeFingerprint(
     systems: sysNorm,
     hosts: hstNorm,
     upgrades: upgNorm,
+    bosses: bosNorm,
   });
   let h = 5381;
   for (let i = 0; i < canonical.length; i++) h = ((h << 5) + h + canonical.charCodeAt(i)) >>> 0;

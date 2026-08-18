@@ -24,7 +24,18 @@ export type WizardAction = 'WIZARD_FORCE_WIN' | 'WIZARD_RESTART_LOST_BATTLE' | '
 // Match records defaulted identity; New Run records an explicit selection.
 export type SelectionSource = 'EXPLICIT_SELECTION' | 'QUICK_MATCH_DEFAULT';
 
-// Alpha 0.5.0 §32 — how the battle's opponent System was chosen. Recorded on
+// Alpha 0.7.0 §16 — WHICH IDENTITY LAYER an encounter's opponent comes from.
+// A Run's final battle is fought against a BOSS, which is a distinct identity
+// layer rather than a System with a flag (§1.1). Route state, battle identity,
+// saves, logs, metrics, and UI all carry this discriminator so a Boss is never
+// stored, reported, or displayed as a fake SYS_ID (§11/§16/§17).
+export type OpponentKind = 'SYS' | 'BOS';
+
+export function isOpponentKind(v: unknown): v is OpponentKind {
+  return v === 'SYS' || v === 'BOS';
+}
+
+// Alpha 0.5.0 §32 — how the battle's opponent was chosen. Recorded on
 // the battle and in logs so an analyst can separate a rolled encounter from a
 // deliberately chosen one without inferring it from the mode.
 export type SystemSelectionSource =
@@ -76,11 +87,18 @@ export enum Shape { Circle = 0, Square, Triangle, Diamond, Star, Cross }
 // ONE delivery branch. It is deliberately NOT a generalized delayed-Function
 // graph or a second scheduler (§27.1) — there is one countdown, one tick, and
 // one delivery switch.
+// Alpha 0.7.0 §22 — `override` is ODANSHAY's Boss-owned overlay. It reuses this
+// EXISTING special-overlay representation rather than adding a second board
+// layer (§22): it does not change the Packet's color or shape, deals no damage,
+// grants no charge, triggers no Sync, and is destroyed by every ordinary
+// mechanic that destroys an enemy special. It carries no countdown, no
+// magnitude, and no area — its only job is to occupy the overlay slot and be
+// counted (§25).
 export interface Special {
   // The overlay's board identity: what it looks like and how the rest of the
   // engine treats it. A `buff` whose countdown is still positive is PENDING and
   // contributes no magnitude until it is delivered (§28.1).
-  type: 'bomb' | 'buff' | 'shield';
+  type: 'bomb' | 'buff' | 'shield' | 'override';
   owner: Side;
   countdown?: number; // armed overlays only (bombs; pending Buffs)
   // §27.2 — what this overlay delivers when its countdown reaches zero.
@@ -176,12 +194,18 @@ export interface BattleConfig extends BattleSettings {
 export interface BattleIdentity {
   hackerId: string;
   deckId: string;
-  // Alpha 0.5.0 §9/§32 — the resolved opponent. This is the authority for
-  // System ICE, strong/weak axes, and the ordered System Program build; it is
-  // selected BEFORE the battle exists and is never rerolled by save/resume
-  // (§14). There is no default and no fallback (§41).
-  systemId: string;
-  systemSelectionSource: SystemSelectionSource;
+  // Alpha 0.5.0 §9/§32, revised by Alpha 0.7.0 §16/§17 — the resolved opponent.
+  // This is the authority for enemy ICE, strong/weak axes, and the ordered
+  // enemy Program build; it is selected BEFORE the battle exists and is never
+  // rerolled by save/resume (§14). There is no default and no fallback (§41).
+  //
+  // `opponentKind` is what makes the Boss battle HONEST: through Alpha 0.6 this
+  // was a bare `systemId`, and storing 'BOS_01' in it would have made every
+  // downstream log, metric, save, and reference sheet claim ODANSHAY was a
+  // System. The two fields travel together and are never collapsed (§16).
+  opponentKind: OpponentKind;
+  opponentId: string;
+  opponentSelectionSource: SystemSelectionSource;
   // Alpha 0.6.0 §7/§13 — the HOST this battle is fought on. A first-class
   // causal source alongside the two agents, not a property of either; every
   // battle has exactly one, Quick Match included.
@@ -242,7 +266,7 @@ export interface TileView {
   shape?: Shape;
   // `countdown` present means the overlay is still ARMED — the renderer shows
   // the remaining turns rather than the live badge (§28.1).
-  special?: { type: 'bomb' | 'buff' | 'shield'; owner: Side; countdown?: number };
+  special?: { type: 'bomb' | 'buff' | 'shield' | 'override'; owner: Side; countdown?: number };
 }
 
 export function tileViewOf(t: Tile): TileView {
@@ -268,7 +292,13 @@ export function gridViewOf(board: Board): (TileView | null)[][] {
 // Alpha 0.6.0 §23 adds the PASSIVE carrier: a Function invoked by a triggered
 // PASSIVE, which pays no cost and owns no charge pool (§16). Runtime, save,
 // targeting, metrics, and logs must distinguish all three.
-export type OwnerKind = 'program' | 'deck' | 'passive';
+// Alpha 0.7.0 §28 — `boss` is the ODANSHAY mechanic acting in its own right.
+// It is deliberately NOT folded into `passive`: the Alpha 0.7 Boss schema has
+// no PASSIVES column (§5.1), and §21 forbids inventing a PASSIVE type for the
+// mechanic. Like a passive carrier it pays no cost and owns no charge pool, but
+// its ACTOR ID is the Boss itself (`BOS_01`), which is what keeps §28's
+// "all ODANSHAY mechanic actions are Boss-caused" true in every event.
+export type OwnerKind = 'program' | 'deck' | 'passive' | 'boss';
 
 // Alpha 0.6.0 §11/§47 — which content kind supplied a PASSIVE instance.
 export type PassiveSourceKind = 'HAK' | 'SYS' | 'HST' | 'UPG';
@@ -484,6 +514,27 @@ export type GameEvent =
   // Alpha 0.3.0 §21.3 — EFFECT_SHAKE outcome: `resolved` false is the legal
   // fizzle (no valid final arrangement; the Datastream is left unchanged).
   | { t: 'shake'; side: Side; resolved: boolean }
+  // Alpha 0.7.0 §41 — ODANSHAY mechanic transitions, through this SAME event
+  // pipeline rather than a parallel boss log stream (§38). One event per
+  // meaningful transition, at a volume that keeps §41's compactness goal: the
+  // per-turn placement batch, the insufficient-target condition, and the
+  // threshold firing. A threshold CHECK that finds nothing is never logged.
+  | {
+      t: 'bossMechanic';
+      bossId: string;
+      kind: 'OVERRIDE_PLACED' | 'INSUFFICIENT_TARGETS' | 'THRESHOLD' | 'PLACEMENT_ABANDONED';
+      countBefore: number;
+      countAfter: number;
+      placed?: number;
+      // §41 — the target coordinates, and how many Hacker specials the batch
+      // overwrote. Detailed targets belong at the COMPLETE logging level.
+      cells?: Pt[];
+      overwrote?: number;
+      // INSUFFICIENT_TARGETS / PLACEMENT_ABANDONED — how many valid targets
+      // existed, and which DATABEND retry this was.
+      available?: number;
+      attempt?: number;
+    }
   // MK6.6 — raw player think-time for the committed move (input-available ->
   // Sync-committed), supplied by the orchestrator, never pre-aggregated
   | { t: 'thinkTime'; ms: number }

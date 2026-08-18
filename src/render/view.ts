@@ -975,13 +975,18 @@ export class View {
       // nothing yet) and only switches to '+' once it is actually live.
       const sp = view.special;
       const armed = sp.countdown !== undefined && sp.countdown > 0;
+      // Alpha 0.7.0 §22 — an Override carries no countdown and no magnitude; it
+      // reads as a distinct glyph so a tester can see at a glance that the
+      // Packet's own color and shape are unchanged underneath it.
       const badge = armed
         ? String(sp.countdown)
         : sp.type === 'bomb'
           ? String(sp.countdown ?? '?')
           : sp.type === 'shield'
             ? 'S'
-            : '+';
+            : sp.type === 'override'
+              ? 'Ø'
+              : '+';
       ctx.fillText(badge, bx, by + 0.5);
       ctx.textBaseline = 'alphabetic';
     }

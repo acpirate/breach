@@ -13,7 +13,7 @@ import { isAreaPatternId } from './data/areas';
 import { GAME_VERSION, getContent, inventoryProgramIds, isValidBuild } from './data/content';
 import { Game } from './game';
 import { makeRNG } from './rng';
-import { BattleIdentity, BattleSettings, GameState, isSystemSelectionSource } from './types';
+import { BattleIdentity, BattleSettings, GameState, isOpponentKind, isSystemSelectionSource } from './types';
 
 export const SAVE_VERSION = GAME_VERSION;
 
@@ -74,20 +74,24 @@ export function isValidIdentity(raw: unknown): boolean {
   if (!isStringArray(id.inventory) || !isStringArray(id.upgradeIds)) return false;
   if (id.selectionSource !== 'EXPLICIT_SELECTION' && id.selectionSource !== 'QUICK_MATCH_DEFAULT') return false;
   if (typeof id.buildOrigin !== 'string') return false;
-  // Alpha 0.5.0 §32/§41 — an active save MUST name a System that still
-  // resolves. A missing or unknown SYS_ID is an incompatible save, never an
-  // invitation to substitute a default or reroll the encounter.
-  if (typeof id.systemId !== 'string') return false;
-  if (!isSystemSelectionSource(id.systemSelectionSource)) return false;
+  // Alpha 0.5.0 §32/§41, revised by Alpha 0.7.0 §16/§36 — an active save MUST
+  // name an opponent that still resolves IN THE IDENTITY LAYER IT CLAIMS. A
+  // missing or unknown ID is an incompatible save, never an invitation to
+  // substitute a default, reroll the encounter, or fall back to ODANSHAY.
+  if (!isOpponentKind(id.opponentKind)) return false;
+  if (typeof id.opponentId !== 'string') return false;
+  if (!isSystemSelectionSource(id.opponentSelectionSource)) return false;
   // Alpha 0.6.0 §7/§40 — the HOST is battle identity on exactly the System's
   // terms: it must name a HST_ID that still resolves. There is no default.
   if (typeof id.hostId !== 'string') return false;
   const c = getContent();
   const hacker = c.hackers.get(id.hackerId);
   const deck = c.decks.get(id.deckId);
-  const system = c.systems.get(id.systemId);
+  // §17 — the enemy roster comes from whichever layer owns the opponent. A
+  // Boss is never looked up as a System, and vice versa.
+  const enemy = id.opponentKind === 'BOS' ? c.bosses.get(id.opponentId) : c.systems.get(id.opponentId);
   const host = c.hosts.get(id.hostId);
-  if (!hacker || !deck || !system || !host) return false;
+  if (!hacker || !deck || !enemy || !host) return false;
   // ordered PASSIVE IDs must match the referenced Hacker exactly (§17.3)
   if (id.passiveIds.length !== hacker.passiveIds.length) return false;
   if (id.passiveIds.some((s, i) => s !== hacker.passiveIds[i])) return false;
@@ -105,12 +109,13 @@ export function isValidIdentity(raw: unknown): boolean {
   if (id.inventory.length !== inventory.length) return false;
   if (id.inventory.some((pid, i) => pid !== inventory[i])) return false;
   if (!isValidBuild(id.hackerPrograms, id.inventory)) return false;
-  // Alpha 0.5.0 §5.4/§32 — the System roster is the SELECTED System's ordered
-  // PRG_SET, not the full loaded PRG_S_* catalog as it was through Alpha 0.4.
-  // Order is gameplay-significant (charge routing), so it must match exactly.
+  // Alpha 0.5.0 §5.4/§32, Alpha 0.7.0 §18 — the enemy roster is the SELECTED
+  // opponent's ordered PRG_SET, not the full loaded PRG_S_* catalog as it was
+  // through Alpha 0.4. Order is gameplay-significant (charge routing), so it
+  // must match exactly, for a Boss as much as for a System.
   return (
-    id.systemPrograms.length === system.programIds.length &&
-    id.systemPrograms.every((pid, i) => pid === system.programIds[i])
+    id.systemPrograms.length === enemy.programIds.length &&
+    id.systemPrograms.every((pid, i) => pid === enemy.programIds[i])
   );
 }
 
@@ -152,6 +157,16 @@ export function restoreGameState(raw: unknown, concluded: boolean): Game | null 
         if (sp.type === 'bomb') {
           if (!(Number.isInteger(sp.countdown) && sp.countdown! >= 0)) return null;
           if (typeof sp.areaPattern !== 'string' || !isAreaPatternId(sp.areaPattern)) return null;
+        } else if (sp.type === 'override') {
+          // Alpha 0.7.0 §22/§35 — an Override carries NO countdown, magnitude,
+          // or footprint: it has no payload at all, and its only gameplay role
+          // is to occupy the overlay slot and be counted (§25). It is always
+          // Boss-owned, so a Hacker-owned one is a corrupt save. Persisting it
+          // needs no new machinery — it rides the ordinary board-special model,
+          // which is what makes §35's "no Overrides disappear or duplicate on
+          // reload" true by construction.
+          if (sp.owner !== 'enemy') return null;
+          if (sp.countdown !== undefined || sp.magnitude !== undefined || sp.areaPattern !== undefined) return null;
         } else {
           if (!(Number.isInteger(sp.magnitude) && sp.magnitude! >= 1)) return null;
         }

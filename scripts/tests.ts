@@ -21,8 +21,10 @@ import {
   INITIAL_SYSTEM_ID,
   INVENTORY_SIZE,
   SYSTEM_BUILD_SIZE,
+  allBosses,
   allSystems,
   allUpgrades,
+  bossById,
   deckById,
   defaultBuild,
   getContent,
@@ -58,21 +60,24 @@ import {
 import * as storage from '../src/storage';
 import { SAVE_VERSION } from '../src/logic/save';
 import { computeLineClears, detectMatches } from '../src/logic/match';
-import { StreamMap, addStream, addUnitCharge, applyTransform, buffBonus, dealDamage, packetShieldValue, routeChargeStream, routeStreams, shieldValue, transformCandidates } from '../src/logic/resolve';
+import { StreamMap, addStream, addUnitCharge, applyTransform, buffBonus, dealDamage, detonateAt, packetShieldValue, routeChargeStream, routeStreams, shieldValue, transformCandidates } from '../src/logic/resolve';
 import { activePassives } from '../src/logic/passive';
 import { consumeEvents, createBattleMetrics } from '../src/logic/metrics';
 import { ENEMY_TIMER_CHARGE_RATE } from '../src/logic/constants';
 import {
-  PendingSetup,
   QuickMatchInfo,
   RUN_ENCOUNTERS,
   RUN_LENGTH,
   RunInfo,
-  SelectedSystem,
+  RunSetupInfo,
+  SelectedOpponent,
   PathOffer,
   PendingPath,
   acquireUpgrade,
-  commitNewRun,
+  bossPathOffers,
+  commitBossSelection,
+  commitSetupDeck,
+  commitSetupHacker,
   initialPathOffers,
   laterPathOffers,
   openPathChoice,
@@ -80,11 +85,8 @@ import {
   randomSystem,
   selectPath,
   beginBuild,
-  beginSetup,
   buildBattleConfig,
   buildIdentity,
-  chooseDeck,
-  chooseHacker,
   deserializeConstructedPreset,
   inactiveOf,
   makeSetupRandom,
@@ -107,15 +109,14 @@ import {
   resolveQuickMatchIce,
   resolveRunIce,
   serializeSession,
-  setupBack,
-  setupComplete,
   snapshotRunSettings,
+  systemOpponent,
 } from '../src/logic/session';
 import { BattleSettings, BuildOrigin, Color, RunStep, Shape, Side, gridViewOf } from '../src/logic/types';
 import { GameEvent, Pt, Tile } from '../src/logic/types';
 import { botFireAbilities, botMove } from './bot';
 import { nodeDataFiles } from './dataNode';
-import { D, TIMER_MODE, defaultActiveBuild, defaultHackerLink, headlessHost, headlessSystem, manualLink, newBattle } from './harness';
+import { D, TIMER_MODE, defaultActiveBuild, defaultHackerLink, headlessBoss, headlessHost, headlessSystem, manualLink, newBattle } from './harness';
 
 let passed = 0;
 let failed = 0;
@@ -158,6 +159,7 @@ function files(over: Partial<Record<keyof DataFiles, string>>): DataFiles {
     systems: { name: real.systems.name, text: over.systems ?? real.systems.text },
     hosts: { name: real.hosts.name, text: over.hosts ?? real.hosts.text },
     upgrades: { name: real.upgrades.name, text: over.upgrades ?? real.upgrades.text },
+    bosses: { name: real.bosses.name, text: over.bosses ?? real.bosses.text },
   };
 }
 
@@ -184,8 +186,8 @@ function expectErrors(over: Partial<Record<keyof DataFiles, string>>, reasonPart
 // ---- §21.1 version stamps ----
 
 test('version stamps are alpha-0.6.0', () => {
-  assert(SAVE_VERSION === 'alpha-0.6.0', `SAVE_VERSION = ${SAVE_VERSION}`);
-  assert(LOG_VERSION === 'alpha-0.6.0', `LOG_VERSION = ${LOG_VERSION}`);
+  assert(SAVE_VERSION === 'alpha-0.7.0', `SAVE_VERSION = ${SAVE_VERSION}`);
+  assert(LOG_VERSION === 'alpha-0.7.0', `LOG_VERSION = ${LOG_VERSION}`);
 });
 
 // §21.1 — no active output path may continue to emit a stale build tag.
@@ -253,7 +255,9 @@ test('§22.1 all six required datasets load through the shared pipeline', () => 
   // the battle roster, which is the whole point of System identity.
   assert(c.system.length === 8, `expected 8 System Programs, got ${c.system.length}`);
   // Alpha 0.6.0 §9 — GREENING and SNEAK join the catalog as PASSIVE payloads.
-  assert(c.functions.size === 17, `expected 17 functions, got ${c.functions.size}`);
+  // Alpha 0.7.0 §6 — DATABEND, REBOOT, and CODESHATTER join as ODANSHAY's
+  // zero-cost mechanic payloads.
+  assert(c.functions.size === 20, `expected 20 functions, got ${c.functions.size}`);
   const costs: Record<string, number> = {};
   for (const f of c.functions.values()) costs[f.name] = f.cost;
   // §4.2 approved Alpha costs
@@ -313,6 +317,143 @@ test('§22.1 all six required datasets load through the shared pipeline', () => 
   }
 });
 
+// ============================================================================
+// Alpha 0.7.0 §46 — BOSS DATA AND SCHEMA
+// ============================================================================
+
+test('§46.1/§46.2 BOS is the tenth required runtime dataset and ODANSHAY resolves exactly', () => {
+  const r = loadContent(real);
+  assert(r.content !== null, `errors: ${r.issues.map((i) => i.reason).join('; ')}`);
+  const c = r.content;
+  assert(c.bosses.size === 1, `expected 1 Boss, got ${c.bosses.size}`);
+  const boss = c.bosses.get('BOS_01')!;
+  assert(boss && boss.name === 'ODANSHAY', 'BOS_01 ODANSHAY resolves');
+  // §19, director override 2026-08-17 — the authored value is the FINAL
+  // Boss-battle ICE, matching the Battle-4 durability the Alpha 0.6 ladder
+  // produced (100 base + 150 step-4 modifier). It is never escalated again.
+  assert(boss.baseIce === 250, `ODANSHAY BASE_ICE 250, got ${boss.baseIce}`);
+  // §20 — authored strong axes.
+  assert(boss.strongColors.join(':') === [Color.Magenta, Color.Green, Color.Blue].sort((a, b) => a - b).join(':')
+    || boss.strongColors.length === 3, 'ODANSHAY has three strong colors');
+  assert(boss.strongColors.includes(Color.Green) && boss.strongColors.includes(Color.Blue) && boss.strongColors.includes(Color.Magenta), 'GRE:BLU:MAG');
+  assert(boss.strongShapes.includes(Shape.Square) && boss.strongShapes.includes(Shape.Circle) && boss.strongShapes.includes(Shape.Diamond), 'SQU:CIR:DIA');
+  // §5.2 — the resolved top-to-bottom Program order.
+  assert(
+    boss.programIds.join(':') === 'PRG_S_004:PRG_S_002:PRG_S_007:PRG_S_003',
+    `ODANSHAY ordered PRG_SET: ${boss.programIds.join(':')}`,
+  );
+  // §5.4 — presentation placeholders retained as data, never interpreted.
+  assert(boss.passiveDescription.length > 0 && boss.bio.length > 0 && boss.graphics.length > 0, 'Boss placeholders retained');
+});
+
+test('§46.34 ODANSHAY weak axes derive as the enum-order complement', () => {
+  const boss = loadContent(real).content!.bosses.get('BOS_01')!;
+  // Strong GRE:BLU:MAG -> weak RED:YEL:CYA, in enum order (Red, Yellow, Cyan).
+  assert(boss.weakColors.join(':') === [Color.Red, Color.Yellow, Color.Cyan].join(':'), `weak colors: ${boss.weakColors.join(':')}`);
+  // Strong SQU:CIR:DIA -> weak TRI:STR:CRO, in enum order.
+  assert(boss.weakShapes.join(':') === [Shape.Triangle, Shape.Star, Shape.Cross].join(':'), `weak shapes: ${boss.weakShapes.join(':')}`);
+  // The two sets partition the vocabulary without overlap.
+  assert(!boss.weakColors.some((c) => boss.strongColors.includes(c)), 'strong and weak colors are disjoint');
+  assert(!boss.weakShapes.some((s) => boss.strongShapes.includes(s)), 'strong and weak shapes are disjoint');
+});
+
+test('§46.3/§46.4/§46.5/§46.6 invalid Boss rows reject rather than substituting a default', () => {
+  const row = (over: Partial<Record<string, string>>): string => {
+    const f = {
+      id: 'BOS_01', name: 'ODANSHAY', pool: '', ice: '250',
+      colors: 'GRE:BLU:MAG', shapes: 'SQU:CIR:DIA',
+      prg: 'PRG_S_004:PRG_S_002:PRG_S_007:PRG_S_003',
+      desc: 'd', bio: 'b', gfx: 'g', ...over,
+    };
+    return `BOS_ID,name,in_pool,BASE_ICE,STRONG_COLORS,STRONG_SHAPES,PRG_SET,BOSS_PASSIVE_DESCRIPTION,BIO,GRAPHICS\n`
+      + `${f.id},${f.name},${f.pool},${f.ice},${f.colors},${f.shapes},${f.prg},${f.desc},${f.bio},${f.gfx}\n`;
+  };
+  // §46.3 — a duplicate BOS_ID.
+  expectErrors({ bosses: row({}) + 'BOS_01,CLONE,,250,GRE:BLU:MAG,SQU:CIR:DIA,PRG_S_004:PRG_S_002:PRG_S_007:PRG_S_003,d,b,g\n' }, 'duplicate ID', 'duplicate BOS_ID');
+  // §46.4 — a PRG_SET naming a Program no row defines, and one naming a Hacker
+  // Program. §5.5 requires failure, never substitution of a System or a default.
+  expectErrors({ bosses: row({ prg: 'PRG_S_004:PRG_S_002:PRG_S_007:PRG_S_099' }) }, 'unknown System Program', 'unknown Boss Program');
+  expectErrors({ bosses: row({ prg: 'PRG_H_001:PRG_S_002:PRG_S_007:PRG_S_003' }) }, 'prefix', 'Hacker Program in Boss PRG_SET');
+  // §5.5 — the four-Program enemy combat model is not negotiable in Alpha 0.7.
+  expectErrors({ bosses: row({ prg: 'PRG_S_004:PRG_S_002:PRG_S_007' }) }, 'exactly 4', 'short Boss PRG_SET');
+  // §46.5 — invalid and duplicated strong-axis tokens.
+  expectErrors({ bosses: row({ colors: 'GRE:BLU:PNK' }) }, 'unknown enum value', 'unknown Boss color');
+  expectErrors({ bosses: row({ shapes: 'SQU:SQU:DIA' }) }, 'duplicate token', 'duplicated Boss shape');
+  // §5.5 — ICE under the shared health sanity convention.
+  expectErrors({ bosses: row({ ice: '0' }) }, 'out of range', 'zero Boss ICE');
+  expectErrors({ bosses: row({ ice: '' }) }, 'required', 'missing Boss ICE');
+  // §46.6 — a stale export fails the header check rather than being reinterpreted.
+  expectErrors(
+    { bosses: 'BOS_ID,name,in_pool,BASE_LINK,STRONG_COLORS,STRONG_SHAPES,PRG_SET,BOSS_PASSIVE_DESCRIPTION,BIO,GRAPHICS\n' },
+    'header',
+    'stale Boss header',
+  );
+  // §5.1 — a PASSIVES column is NOT part of the Alpha 0.7 Boss schema.
+  expectErrors(
+    { bosses: 'BOS_ID,name,in_pool,BASE_ICE,STRONG_COLORS,STRONG_SHAPES,PRG_SET,PASSIVES,BOSS_PASSIVE_DESCRIPTION,BIO,GRAPHICS\n' },
+    'unknown header column',
+    'Boss PASSIVES column rejected',
+  );
+  // §8/§9 — Boss Selection is the first New Run choice, so an empty catalog is
+  // not a playable state.
+  expectErrors(
+    { bosses: 'BOS_ID,name,in_pool,BASE_ICE,STRONG_COLORS,STRONG_SHAPES,PRG_SET,BOSS_PASSIVE_DESCRIPTION,BIO,GRAPHICS\n' },
+    'at least one valid Boss',
+    'empty Boss catalog',
+  );
+});
+
+test('§46.8/§46.9 the zero-cost Function rule accepts payload-only rows and rejects assigned ones', () => {
+  // §46.8 — FNC_016/017 (PASSIVE carriers) and FNC_018/019/020 (ODANSHAY's
+  // mechanic payloads) are all zero-cost and all load, because none is directly
+  // assigned to a Program or a Deck.
+  const r = loadContent(real);
+  assert(r.content !== null, 'real content loads with five zero-cost Functions');
+  for (const id of ['FNC_016', 'FNC_017', 'FNC_018', 'FNC_019', 'FNC_020']) {
+    assert(r.content.functions.get(id)!.cost === 0, `${id} is zero-cost`);
+  }
+  // §46.9 — the formalized rule: directly assigning one to a Program or a Deck
+  // is a blocking content error, because chargeCap equals cost (§11.1) and the
+  // Function would fire free every turn.
+  expectErrors(
+    { system: mutate(real.system.text, 'FNC_003', 'FNC_020') },
+    'zero-cost Function is directly assigned',
+    'zero-cost Function on a Program',
+  );
+  expectErrors(
+    { decks: mutate(real.decks.text, 'FNC_010', 'FNC_018') },
+    'zero-cost Function is directly assigned',
+    'zero-cost Function on a Deck',
+  );
+});
+
+test('§46.10 FNC_018/019/020 resolve from the authored rows exactly', () => {
+  const c = loadContent(real).content!;
+  // §7.1 DATABEND — SHAKE 1:2:1:2. specialGems 2 is Alpha 0.7's new
+  // "remove the overlays the activator does not own" mode.
+  const databend = c.functions.get('FNC_018')!;
+  assert(databend.name === 'DATABEND' && databend.cost === 0, 'FNC_018 DATABEND cost 0');
+  const db = databend.plan[0].params.shake!;
+  assert(databend.plan.length === 1 && databend.plan[0].effectId === 'EFFECT_SHAKE', 'DATABEND is a leaf EFFECT_SHAKE');
+  assert(db.boardComposition === 1 && db.specialGems === 2 && db.matches === 1 && db.cascades === 2, `DATABEND tuple: ${JSON.stringify(db)}`);
+  // §7.2 REBOOT — SHAKE 1:1:0:0: a fresh Datastream with every overlay gone and
+  // no Sync or cascade from the rearrangement, i.e. a new battle's board.
+  const reboot = c.functions.get('FNC_019')!;
+  assert(reboot.name === 'REBOOT' && reboot.cost === 0, 'FNC_019 REBOOT cost 0');
+  const rb = reboot.plan[0].params.shake!;
+  assert(rb.boardComposition === 1 && rb.specialGems === 1 && rb.matches === 0 && rb.cascades === 0, `REBOOT tuple: ${JSON.stringify(rb)}`);
+  // §7.3 CODESHATTER — an ordinary Function-damage EFFECT_ATTACK.
+  const shatter = c.functions.get('FNC_020')!;
+  assert(shatter.name === 'CODESHATTER' && shatter.cost === 0, 'FNC_020 CODESHATTER cost 0');
+  assert(shatter.plan.length === 1 && shatter.plan[0].effectId === 'EFFECT_ATTACK', 'CODESHATTER is a leaf EFFECT_ATTACK');
+  assert(shatter.plan[0].params.damage === 70, `CODESHATTER damage 70, got ${shatter.plan[0].params.damage}`);
+  // §6.1 — none of the three takes a manual target, so all three can run as
+  // mechanic payloads inside turn resolution.
+  for (const id of ['FNC_018', 'FNC_019', 'FNC_020']) {
+    assert(c.functions.get(id)!.plan.every((op) => op.target === null), `${id} needs no manual target`);
+  }
+});
+
 test('§5 PASSIVE display resolves %N placeholders in title case', () => {
   const c = loadContent(real).content!;
   const dmg = c.passives.get('PSV_001')!;
@@ -344,6 +485,12 @@ test('§22.1 fingerprint tracks gameplay fields and ignores placeholders/display
     ['PASSIVE display', files({ passives: mutate(real.passives.text, 'Deal %1 extra damage', 'Inflict %1 bonus harm') })],
     // Alpha 0.6.0 §10 — HOST/UPGRADE presentation is excluded too.
     ['HOST notes', files({ hosts: mutate(real.hosts.text, 'host for first battle with no passives', 'other note') })],
+    // Alpha 0.7.0 §37/§46.7 — Boss presentation fields are excluded on exactly
+    // the terms the Hacker's and System's placeholders are, so fixing flavor
+    // copy never invalidates a save.
+    ['BOSS_PASSIVE_DESCRIPTION', files({ bosses: mutate(real.bosses.text, 'boss passive description goes here', 'entirely different text') })],
+    ['Boss BIO', files({ bosses: mutate(real.bosses.text, 'system biography goes here', 'different boss bio') })],
+    ['Boss GRAPHICS', files({ bosses: mutate(real.bosses.text, 'system graphics reference goes here', 'odanshay.png') })],
   ];
   for (const [label, f] of same) {
     const c = loadContent(f).content;
@@ -364,6 +511,13 @@ test('§22.1 fingerprint tracks gameplay fields and ignores placeholders/display
     ['UPGRADE passive ref', files({ upgrades: mutate(real.upgrades.text, 'UPG_01,BRACER,PSV_005', 'UPG_01,BRACER,PSV_004') })],
     ['HOST in_pool', files({ hosts: mutate(real.hosts.text, 'HST_02,BITMIRE,PSV_003,', 'HST_02,BITMIRE,PSV_003,n') })],
     ['PASSIVE agent scope', files({ passives: mutate(real.passives.text, 'ALL:1,CONTINUAL,,ENEMY', 'ALL:1,CONTINUAL,,OWNER') })],
+    // Alpha 0.7.0 §37 — Boss gameplay identity IS fingerprint input: the ICE
+    // that decides the final battle, the authored strong axes, and the ordered
+    // PRG_SET (order is charge-routing priority).
+    ['Boss BASE_ICE', files({ bosses: mutate(real.bosses.text, 'ODANSHAY,,250', 'ODANSHAY,,300') })],
+    ['Boss STRONG_COLORS', files({ bosses: mutate(real.bosses.text, 'GRE:BLU:MAG', 'GRE:BLU:CYA') })],
+    ['Boss STRONG_SHAPES', files({ bosses: mutate(real.bosses.text, 'SQU:CIR:DIA', 'SQU:CIR:STR') })],
+    ['Boss PRG_SET order', files({ bosses: mutate(real.bosses.text, 'PRG_S_004:PRG_S_002:PRG_S_007:PRG_S_003', 'PRG_S_002:PRG_S_004:PRG_S_007:PRG_S_003') })],
   ];
   for (const [label, f] of differ) {
     const c = loadContent(f).content;
@@ -638,13 +792,15 @@ test('§22.1 a Deck with zero or more than one Function fails', () => {
 });
 
 test('§22.1 EFFECT_SHAKE inert parameter combinations warn but load', () => {
-  // §4.9 — REPLACE + RETAIN (Retain is ineffective), and matches disabled with
-  // a nonzero cascade mode (the cascade value is currently ignored).
+  // §4.9 — matches disabled with a nonzero cascade mode (the cascade value is
+  // currently ignored). Alpha 0.7.0 §7.1 RETIRED the companion REPLACE+RETAIN
+  // warning: REPLACE now preserves retained overlays and their Packets, so
+  // `1:0:x:x` is a meaningful combination rather than an inert one.
   const replaceRetain = loadContent(files({ functions: mutate(real.functions.text, '0:0:0:0', '1:0:0:0') }));
   assert(replaceRetain.content !== null, 'REPLACE+RETAIN must still load');
   assert(
-    replaceRetain.issues.some((i) => i.severity === 'warning' && i.reason.includes('Retain is ineffective')),
-    'expected the REPLACE+RETAIN warning',
+    !replaceRetain.issues.some((i) => i.reason.includes('Retain is ineffective')),
+    'the Alpha 0.6 REPLACE+RETAIN inertness warning must no longer fire',
   );
   const inertCascade = loadContent(files({ functions: mutate(real.functions.text, '0:0:0:0', '0:0:0:2') }));
   assert(inertCascade.content !== null, 'matches=0 with cascades=2 must still load');
@@ -918,8 +1074,8 @@ function testbedSystems(): string {
   return `${real.systems.text.replace(/\s*$/, '')}\nSYS_90,TESTBED,n,100,RED:GRE:YEL,TRI:SQU:STR,PRG_S_001:PRG_S_002:PRG_S_003:PRG_S_004,,bio,gfx`;
 }
 
-function testbed(): SelectedSystem {
-  return { systemId: testbedSystemId(), source: 'HEADLESS_PINNED' };
+function testbed(): SelectedOpponent {
+  return { kind: 'SYS', id: testbedSystemId(), source: 'HEADLESS_PINNED' };
 }
 
 // A battle against the testbed roster, for the Effects only it fields.
@@ -957,7 +1113,7 @@ function newGame(seed = 7, settings: BattleSettings = D): Game {
 
 // Alpha 0.4.0 — a battle whose ACTIVE BUILD is stated explicitly, for the
 // order/routing/inventory cases. Any four distinct inventory Programs.
-function newGameWithBuild(build: string[], seed = 7, settings: BattleSettings = D, system?: SelectedSystem, hostId?: string): Game {
+function newGameWithBuild(build: string[], seed = 7, settings: BattleSettings = D, system?: SelectedOpponent, hostId?: string): Game {
   const g = newBattle(settings, seed, build, 'PLAYER_EDITED', system, hostId);
   g.startPlayerPhase();
   return g;
@@ -971,7 +1127,7 @@ function qmInfo(build: readonly string[] = defaultActiveBuild(), origin: BuildOr
     identity: defaultIdentity(),
     // Alpha 0.5.0 §32 — the session's opponent must match what the battle was
     // built against, which for every fixture here is the pinned headless System.
-    system: headlessSystem(),
+    opponent: headlessSystem(),
     // Alpha 0.6.0 §44 — the HOST is session identity on the System's terms.
     hostId: headlessHost(),
     build: [...build],
@@ -987,6 +1143,79 @@ function slotOf(g: Game, programId: string): number {
 function chargeSlot(g: Game, side: 'player' | 'enemy', idx: number): void {
   const u = g.state.units[side][idx];
   u.charge = getContent().programsById.get(u.programId)!.chargeCap;
+}
+
+// Alpha 0.7.0 §45 — a Boss battle for automated coverage, through the harness
+// fixture rather than by expanding player-facing Quick Match.
+function newBossGame(seed = 7, settings: BattleSettings = D, hostId = HEADLESS_HOST_ID): Game {
+  const g = newBattle(settings, seed, defaultActiveBuild(), 'DEFAULT', headlessBoss(), hostId);
+  g.startPlayerPhase();
+  return g;
+}
+
+function overrideCells(g: Game): Pt[] {
+  const out: Pt[] = [];
+  for (let y = 0; y < g.state.board.length; y++) {
+    for (let x = 0; x < g.state.board[y].length; x++) {
+      if (g.state.board[y][x]?.special?.type === 'override') out.push({ x, y });
+    }
+  }
+  return out;
+}
+
+const overrideCount = (g: Game): number => overrideCells(g).length;
+
+// Leave EXACTLY `keep` axis-bearing Packets and turn the rest neutral, so the
+// §24 insufficient-capacity path can be driven deterministically. Neutrals are
+// never valid Override targets (§23 — an Override needs an axis-bearing
+// Packet), and this deliberately does NOT use a pile of Overrides to starve the
+// board: 15+ of those would trip the §25 threshold at turn start and REBOOT the
+// whole Datastream before placement was ever reached.
+function restrictTargets(g: Game, keep: number): Pt[] {
+  const kept: Pt[] = [];
+  for (let y = 0; y < g.state.board.length; y++) {
+    for (let x = 0; x < g.state.board[y].length; x++) {
+      const t = g.state.board[y][x];
+      if (!t) continue;
+      delete t.special;
+      if (kept.length < keep) {
+        t.kind = 'standard';
+        t.color = t.color ?? 0;
+        t.shape = t.shape ?? 0;
+        kept.push({ x, y });
+      } else {
+        t.kind = 'neutral';
+        delete t.color;
+        delete t.shape;
+      }
+    }
+  }
+  return kept;
+}
+
+// Place exactly `n` Boss-owned Overrides deterministically, for the §25
+// threshold cases. Any existing Overrides are cleared first, so the board ends
+// up with exactly n.
+function plantOverrides(g: Game, n: number): void {
+  for (const row of g.state.board) {
+    for (const t of row) if (t?.special?.type === 'override') delete t.special;
+  }
+  let placed = 0;
+  for (let y = 0; y < g.state.board.length && placed < n; y++) {
+    for (let x = 0; x < g.state.board[y].length && placed < n; x++) {
+      const t = g.state.board[y][x];
+      if (!t || t.special) continue;
+      t.kind = 'standard';
+      t.color = t.color ?? 0;
+      t.shape = t.shape ?? 0;
+      t.special = { type: 'override', owner: 'enemy', seq: g.state.nextSeq++ };
+      placed++;
+    }
+  }
+}
+
+function bossEvents(events: GameEvent[]): Extract<GameEvent, { t: 'bossMechanic' }>[] {
+  return events.filter((e): e is Extract<GameEvent, { t: 'bossMechanic' }> => e.t === 'bossMechanic');
 }
 
 function specialsOf(g: Game, type: 'bomb' | 'buff' | 'shield', owner: 'player' | 'enemy'): Tile[] {
@@ -1325,9 +1554,10 @@ const runInfoFor = (
   settings: BattleSettings,
   step: RunStep = 1,
   build?: string[],
-  system: SelectedSystem = { systemId: HEADLESS_SYSTEM_ID, source: 'RUN_RANDOM' },
+  opponent: SelectedOpponent = { kind: 'SYS', id: HEADLESS_SYSTEM_ID, source: 'RUN_RANDOM' },
 ): RunInfo => ({
   mode: 'RUN',
+  bossId: 'BOS_01',
   step,
   settings,
   identity: { hackerId: ids.hackerId, deckId: ids.deckId, selectionSource: 'EXPLICIT_SELECTION' },
@@ -1336,7 +1566,7 @@ const runInfoFor = (
   build: build ?? defaultBuild(ids.hackerId, ids.deckId),
   buildOrigin: build ? 'PLAYER_EDITED' : 'DEFAULT',
   // Alpha 0.5.0 §33 — a committed Run always knows its upcoming opponent.
-  system,
+  opponent,
   // Alpha 0.6.0 §32/§35 — and its committed HOST, acquired UPGRADEs, and the
   // persisted isolated route RNG state.
   hostId: HEADLESS_HOST_ID,
@@ -1344,23 +1574,64 @@ const runInfoFor = (
   routeRngState: 12345,
 });
 
-test('§27/§28 New Run setup is Hacker -> Deck and retains choices on Back', () => {
-  let s: PendingSetup = beginSetup();
-  assert(s.step === 'HACKER' && s.hackerId === null && s.deckId === null, 'setup begins empty at Hacker Selection');
-  assert(!setupComplete(s), 'an empty setup is not committable');
-  s = chooseHacker(s, 'HAK_01');
+// Alpha 0.7.0 §8/§9/§10 — the New Run setup pipeline, as one helper, so every
+// downstream Run test walks the same Boss -> Hacker -> Deck path the UI does.
+const BOSS = 'BOS_01';
+function newRunSetup(bossId = BOSS): RunSetupInfo {
+  return commitBossSelection(bossId, D, 4242);
+}
+function newRun(seed: number, bossId = BOSS): RunInfo {
+  return commitSetupDeck(commitSetupHacker(commitBossSelection(bossId, D, seed), 'HAK_01'), 'DEK_01');
+}
+
+test('§8/§9/§10 New Run setup is Boss -> Hacker -> Deck, and the Boss commits the Run', () => {
+  // §11.1 — Boss Selection lists every valid authored Boss; in_pool is NOT a
+  // player-selection filter in Alpha 0.7 (§5.3).
+  const bosses = allBosses();
+  assert(bosses.length >= 1 && bosses.some((b) => b.id === BOSS), 'Boss Selection offers the authored Bosses');
+
+  // §9 — committing the Boss creates the Run and parks setup on Hacker Selection.
+  let s = commitBossSelection(BOSS, D, 4242);
+  assert(s.mode === 'RUN_SETUP', 'committing a Boss creates a Run in setup');
+  assert(s.bossId === BOSS, 'the Boss is persisted at commitment');
+  assert(s.step === 'HACKER', 'setup advances to Hacker Selection');
+  assert(s.hackerId === null, 'no Hacker is committed yet');
+
+  // §10 — the Hacker commits and setup advances to Deck Selection.
+  s = commitSetupHacker(s, 'HAK_01');
   assert(s.step === 'DECK' && s.hackerId === 'HAK_01', 'choosing the Hacker advances to Deck Selection');
-  assert(!setupComplete(s), 'setup is not committable before a Deck is chosen');
-  s = chooseDeck(s, 'DEK_01');
-  // Alpha 0.6.0 §27 — setup ENDS here. The next screen is the initial Path
-  // Choice, which is also the destructive commitment boundary (§28); pending
-  // setup no longer carries a Build or a pre-rolled opponent.
-  assert(s.deckId === 'DEK_01' && setupComplete(s), 'both identity choices make setup committable');
-  // §12.2 — Back RETAINS the pending choices
-  const back1 = setupBack(s)!;
-  assert(back1.step === 'HACKER' && back1.hackerId === 'HAK_01' && back1.deckId === 'DEK_01', 'Back to Hacker keeps both choices');
-  // backing out of the first screen returns null = "Title, discarding setup only"
-  assert(setupBack(back1) === null, 'Back from Hacker Selection leaves setup');
+  assert(s.bossId === BOSS, 'the Boss is unchanged by Hacker selection');
+
+  // §8 — the Deck COMPLETES setup and opens the initial Path Choice, not Build.
+  const run = commitSetupDeck(s, 'DEK_01');
+  assert(run.mode === 'RUN', 'committing the Deck completes setup');
+  assert(run.bossId === BOSS, 'the committed Run carries the selected Boss');
+  assert(run.identity.hackerId === 'HAK_01' && run.identity.deckId === 'DEK_01', 'both identity choices are committed');
+  assert(run.pendingPath !== undefined, '§8 — Deck selection proceeds to Path Choice');
+  assert(run.pendingBuild === undefined, '§8 — it does NOT go straight to Build');
+  assert(run.step === 1, 'the Run opens on Battle 1');
+
+  // §5.5/§36 — an unknown Boss ID is rejected outright, never substituted.
+  let threw = false;
+  try { commitBossSelection('BOS_99', D, 1); } catch { threw = true; }
+  assert(threw, 'committing an unknown Boss throws rather than defaulting');
+});
+
+test('§46.11/§46.20 the committed Boss is fixed for the Run and survives every setup step', () => {
+  // §10 — once committed, ordinary navigation cannot silently change the Boss.
+  // Every setup transition carries it forward untouched, and the Run that comes
+  // out the far end names the same Boss the player chose.
+  const s0 = commitBossSelection(BOSS, D, 7);
+  const s1 = commitSetupHacker(s0, 'HAK_01');
+  const run = commitSetupDeck(s1, 'DEK_01');
+  assert(s0.bossId === BOSS && s1.bossId === BOSS && run.bossId === BOSS, 'the Boss survives every setup step');
+  // Backing up from Deck Selection to Hacker Selection keeps it too — the only
+  // way to change the Boss is deliberately starting/replacing the Run (§10).
+  const back: RunSetupInfo = { ...s1, step: 'HACKER' };
+  assert(back.bossId === BOSS, 'Back to Hacker Selection cannot change the Boss');
+  // §15 — and the final route uses THAT Boss, not a rerolled one.
+  const atFour = openPathChoice({ ...run, upgradeIds: ['UPG_01', 'UPG_02', 'UPG_03'] }, 4);
+  assert(atFour.pendingPath!.offers.every((o) => o.opponentId === BOSS), 'Battle 4 uses the Run-selected Boss');
 });
 
 // §30/§39 — random selection samples the in_pool subset with replacement:
@@ -1371,9 +1642,9 @@ test('§30 random System/HOST selection draws from the in_pool subsets', () => {
   for (let seed = 0; seed < 200; seed++) {
     const rng = makeSetupRandom(seed).rng;
     const sel = randomSystem(rng, 'RUN_RANDOM');
-    assert(getContent().systems.has(sel.systemId), 'selection is always a valid loaded System');
+    assert(getContent().systems.has(sel.id), 'selection is always a valid loaded System');
     assert(sel.source === 'RUN_RANDOM', 'selection carries its source');
-    seenSys.add(sel.systemId);
+    seenSys.add(sel.id);
     seenHost.add(randomHost(rng));
   }
   assert(!seenSys.has('SYS_03'), 'DOORMAN is excluded from the random System pool');
@@ -1422,7 +1693,7 @@ test('§22.2/§5.3 the ordered active build survives identity construction', () 
   assert(id.buildOrigin === 'DEFAULT', 'identity records the build source');
   // Alpha 0.5.0 §5.4 — the System roster is the SELECTED System's ordered
   // PRG_SET, no longer "every loaded System Program".
-  assert(id.systemId === HEADLESS_SYSTEM_ID, 'identity carries the selected System');
+  assert(id.opponentKind === 'SYS' && id.opponentId === HEADLESS_SYSTEM_ID, 'identity carries the selected System');
   assert(
     id.systemPrograms.join(',') === systemById(HEADLESS_SYSTEM_ID).programIds.join(','),
     'identity carries the selected System PRG_SET in order',
@@ -1658,8 +1929,8 @@ test('§5.3 System weak sets are the complement of that System\'s own strong set
   const a = systemById('SYS_01');
   const b = systemById('SYS_02');
   assert(a.strongColors.join(',') !== b.strongColors.join(','), 'the two authored Systems differ in color profile');
-  const ga = newBattle(D, 77, undefined, 'DEFAULT', { systemId: 'SYS_01', source: 'HEADLESS_PINNED' });
-  const gb = newBattle(D, 77, undefined, 'DEFAULT', { systemId: 'SYS_02', source: 'HEADLESS_PINNED' });
+  const ga = newBattle(D, 77, undefined, 'DEFAULT', { kind: 'SYS', id: 'SYS_01', source: 'HEADLESS_PINNED' });
+  const gb = newBattle(D, 77, undefined, 'DEFAULT', { kind: 'SYS', id: 'SYS_02', source: 'HEADLESS_PINNED' });
   assert(
     ga.state.config.strongColors.enemy.join(',') !== gb.state.config.strongColors.enemy.join(','),
     'selecting a different System changes the battle profile',
@@ -1688,15 +1959,16 @@ test('§22.5 Normal LINK ON derives LINK/ICE from content and the encounter tabl
   // (150 with the current content); it is now 100. Designer-approved change:
   // System identity owns System durability.
   const sys = systemById(HEADLESS_SYSTEM_ID);
-  assert(resolveQuickMatchIce(on, sys.id) === sys.baseIce, 'Quick Match ICE is the System BASE_ICE');
-  assert(resolveQuickMatchIce(on, sys.id) !== link, 'Quick Match ICE no longer mirrors Hacker LINK');
+  const sysOpp = systemOpponent(sys.id, 'QUICK_RANDOM');
+  assert(resolveQuickMatchIce(on, sysOpp) === sys.baseIce, 'Quick Match ICE is the System BASE_ICE');
+  assert(resolveQuickMatchIce(on, sysOpp) !== link, 'Quick Match ICE no longer mirrors Hacker LINK');
   const qm = newBattle(on, 41);
   assert(qm.state.config.playerHp === link, 'Quick Match Hacker LINK is BASE_LINK + ADD_LINK');
   assert(qm.state.config.enemyHp === sys.baseIce, 'Quick Match battle uses the System BASE_ICE');
   // A Run uses BASE_ICE + the step modifier (§10.1).
   for (const step of [1, 2, 3, 4] as const) {
     const expected = sys.baseIce + encounterFor(step).iceModifier;
-    assert(resolveRunIce(on, sys.id, step) === expected, `step ${step} ICE from BASE_ICE + modifier`);
+    assert(resolveRunIce(on, systemOpponent(sys.id, 'RUN_RANDOM'), step) === expected, `step ${step} ICE from BASE_ICE + modifier`);
     const g = createRunBattle(runInfoFor(on, step), step, 60 + step);
     assert(g.state.config.playerHp === link, `step ${step} Hacker at full resolved LINK`);
     assert(g.state.config.enemyHp === expected, `step ${step} System ICE from BASE_ICE + modifier`);
@@ -1706,7 +1978,7 @@ test('§22.5 Normal LINK ON derives LINK/ICE from content and the encounter tabl
   const other = systemById('SYS_02');
   for (const step of [1, 2, 3, 4] as const) {
     assert(
-      resolveRunIce(on, other.id, step) === other.baseIce + encounterFor(step).iceModifier,
+      resolveRunIce(on, systemOpponent(other.id, 'RUN_RANDOM'), step) === other.baseIce + encounterFor(step).iceModifier,
       `SYS_02 step ${step} uses its own base`,
     );
   }
@@ -1717,9 +1989,9 @@ test('§22.5 Normal LINK OFF uses manual values for the Hacker and EVERY Run enc
   assert(resolveHackerMaxLink(off, 'HAK_01', 'DEK_01') === 222, 'manual Hacker LINK is used');
   // §10.2 — the manual value REPLACES the System's BASE_ICE; the two are never
   // silently combined, and the Run modifier is not added on top of it either.
-  assert(resolveQuickMatchIce(off, HEADLESS_SYSTEM_ID) === 333, 'manual System ICE is used in Quick Match');
+  assert(resolveQuickMatchIce(off, systemOpponent(HEADLESS_SYSTEM_ID, 'QUICK_RANDOM')) === 333, 'manual System ICE is used in Quick Match');
   for (const step of [1, 2, 3, 4] as const) {
-    assert(resolveRunIce(off, HEADLESS_SYSTEM_ID, step) === 333, `step ${step} uses the manual ICE, not base + modifier`);
+    assert(resolveRunIce(off, systemOpponent(HEADLESS_SYSTEM_ID, 'RUN_RANDOM'), step) === 333, `step ${step} uses the manual ICE, not base + modifier`);
     const g = createRunBattle(runInfoFor(off, step), step, 70 + step);
     assert(g.state.config.enemyHp === 333, `step ${step} battle uses the manual ICE`);
     assert(g.state.config.playerHp === 222, `step ${step} battle uses the manual LINK`);
@@ -2075,19 +2347,59 @@ test('§22.7 all four Shake axes validate, and REPLACE/REMOVE behave as specifie
   const g1 = newGame(68);
   plantSpecial(g1, 3, 3, { type: 'shield', owner: 'player', magnitude: 2, programId: 'PRG_H_001' });
   const beforeIds = new Set(g1.state.board.flat().map((t) => t!.id));
-  const ok1 = shakeBoard(g1.state, { boardComposition: 0, specialGems: 1, matches: 0, cascades: 0 });
+  const ok1 = shakeBoard(g1.state, { boardComposition: 0, specialGems: 1, matches: 0, cascades: 0 }, 'player');
   assert(ok1, 'REARRANGE + REMOVE produced a valid board');
   assert(specialsOf(g1, 'shield', 'player').length === 0, 'REMOVE stripped the special overlay');
   assert(g1.state.board.flat().every((t) => beforeIds.has(t!.id)), 'the underlying Packets survive and are rearranged');
 
-  // REPLACE regenerates the affected tiles: prior Packets and special state gone
+  // REPLACE + REMOVE regenerates everything: prior Packets and special state gone
   const g2 = newGame(69);
   plantSpecial(g2, 3, 3, { type: 'shield', owner: 'player', magnitude: 2, programId: 'PRG_H_001' });
   const idsBefore2 = new Set(g2.state.board.flat().map((t) => t!.id));
-  const ok2 = shakeBoard(g2.state, { boardComposition: 1, specialGems: 0, matches: 0, cascades: 0 });
+  const ok2 = shakeBoard(g2.state, { boardComposition: 1, specialGems: 1, matches: 0, cascades: 0 }, 'player');
   assert(ok2, 'REPLACE produced a valid board');
-  assert(specialsOf(g2, 'shield', 'player').length === 0, 'REPLACE removes prior special state regardless of RETAIN');
+  assert(specialsOf(g2, 'shield', 'player').length === 0, 'REPLACE + REMOVE clears prior special state');
   assert(g2.state.board.flat().every((t) => !idsBefore2.has(t!.id)), 'REPLACE generates entirely new Packets');
+});
+
+// Alpha 0.7.0 §7.1 — DELIBERATE SEMANTIC CHANGE from Alpha 0.6, director-approved
+// 2026-08-17. Through Alpha 0.6 REPLACE regenerated all 64 cells unconditionally
+// and RETAIN under REPLACE was inert (the loader even warned about it). DATABEND's
+// authored `1:2:1:2` requires the opposite: the activating side's overlays and
+// their Packets must survive, or ODANSHAY's fallback would destroy its own
+// Overrides and the §25 threshold could never be reached.
+test('§7.1 REPLACE preserves RETAINED overlays and their Packets, regenerating the rest', () => {
+  const g = newGame(69);
+  plantSpecial(g, 3, 3, { type: 'shield', owner: 'player', magnitude: 2, programId: 'PRG_H_001' });
+  const kept = g.state.board[3][3]!;
+  const keptId = kept.id;
+  const keptColor = kept.color;
+  const keptShape = kept.shape;
+  const otherIds = new Set(
+    g.state.board.flat().filter((t) => t!.id !== keptId).map((t) => t!.id),
+  );
+  const ok = shakeBoard(g.state, { boardComposition: 1, specialGems: 0, matches: 0, cascades: 0 }, 'player');
+  assert(ok, 'REPLACE + RETAIN produced a valid board');
+  const after = g.state.board[3][3]!;
+  assert(after.id === keptId, 'a retained overlay keeps its own Packet at its own coordinate');
+  assert(after.color === keptColor && after.shape === keptShape, 'a retained overlay does not have its axes randomized');
+  assert(after.special?.magnitude === 2, 'the retained overlay keeps its Effect state');
+  assert(
+    g.state.board.flat().filter((t) => t!.id !== keptId).every((t) => !otherIds.has(t!.id)),
+    'every non-retained cell is regenerated',
+  );
+});
+
+test('§7.1 specialGems mode 2 removes only the overlays the activator does NOT own', () => {
+  const g = newGame(74);
+  plantSpecial(g, 1, 1, { type: 'shield', owner: 'enemy', magnitude: 2, programId: 'PRG_S_002' });
+  plantSpecial(g, 5, 5, { type: 'shield', owner: 'player', magnitude: 2, programId: 'PRG_H_001' });
+  const enemyId = g.state.board[1][1]!.id;
+  const ok = shakeBoard(g.state, { boardComposition: 1, specialGems: 2, matches: 0, cascades: 0 }, 'enemy');
+  assert(ok, 'REPLACE + REMOVE_ENEMY produced a valid board');
+  assert(specialsOf(g, 'shield', 'enemy').length === 1, "the activator's own overlay survives");
+  assert(specialsOf(g, 'shield', 'player').length === 0, "the opposing side's overlay is removed");
+  assert(g.state.board[1][1]!.id === enemyId, "the activator's overlay stays on its own Packet");
 });
 
 test('§22.7 allowed post-Shake Syncs use INITIATOR ownership', () => {
@@ -2123,7 +2435,7 @@ test('§22.7 a Shake that cannot produce a valid board is a LEGAL FIZZLE', () =>
     }
   }
   const snapshot = JSON.stringify(g.state.board.flat().map((t) => `${t!.id}:${t!.kind}:${t!.color}:${t!.shape}`));
-  const ok = shakeBoard(g.state, { boardComposition: 0, specialGems: 0, matches: 0, cascades: 0 });
+  const ok = shakeBoard(g.state, { boardComposition: 0, specialGems: 0, matches: 0, cascades: 0 }, 'player');
   assert(!ok, 'an impossible PREVENT_MATCHES Shake reports failure');
   assert(
     JSON.stringify(g.state.board.flat().map((t) => `${t!.id}:${t!.kind}:${t!.color}:${t!.shape}`)) === snapshot,
@@ -2409,9 +2721,9 @@ test('Run progression: ICE table, fresh state every step, 1-3 advance, 4 does no
     // distinct seeds per step stand in for "a new battle RNG state/seed is
     // used" (§10.5) — the resulting board layouts must actually differ
     const g = createRunBattle(info, step, 1000 + step * 97);
-    assert(g.state.config.enemyHp === (systemById(info.system.systemId).baseIce + encounterFor(step).iceModifier), `step ${step} System ICE matches the table`);
+    assert(g.state.config.enemyHp === (systemById(info.opponent.id).baseIce + encounterFor(step).iceModifier), `step ${step} System ICE matches the table`);
     assert(g.state.hp.player === info.hackerMaxLink, `step ${step} Hacker starts at full saved maximum LINK`);
-    assert(g.state.hp.enemy === (systemById(info.system.systemId).baseIce + encounterFor(step).iceModifier), `step ${step} System starts at encounter ICE`);
+    assert(g.state.hp.enemy === (systemById(info.opponent.id).baseIce + encounterFor(step).iceModifier), `step ${step} System starts at encounter ICE`);
     // §4.6 — a fresh battle opens each pool at its Function's startCharged
     // value, not at zero: BOUNCER fields MUSCLE, and COERCE is startCharged=Y.
     const openingCharge = (u: { programId: string }): number =>
@@ -2439,7 +2751,7 @@ test('every Run step round-trips through the save envelope', () => {
     const r = deserializeSession(serializeSession(info, g, null));
     assert(r && r.info.mode === 'RUN' && r.info.step === step, `step ${step} round-trips`);
     assert(r.game, `step ${step} restores its battle`);
-    assert(r.game.state.config.enemyHp === (systemById(info.system.systemId).baseIce + encounterFor(step).iceModifier), `step ${step} encounter ICE round-trips`);
+    assert(r.game.state.config.enemyHp === (systemById(info.opponent.id).baseIce + encounterFor(step).iceModifier), `step ${step} encounter ICE round-trips`);
     assert(r.game.state.deckCharge === g.state.deckCharge, `step ${step} Deck charge round-trips exactly`);
   }
 });
@@ -4243,7 +4555,7 @@ test('§48.1/§48.2 SPAM uses its authored parameters and its tuple enables char
 
 test('§48.2/§48.3 a SPAM detonation grants charge that routes through the System queue', () => {
   // MIDNIGHT fields SPAMBOT.
-  const g = newBattle(D, 51, undefined, 'DEFAULT', { systemId: 'SYS_02', source: 'HEADLESS_PINNED' });
+  const g = newBattle(D, 51, undefined, 'DEFAULT', { kind: 'SYS', id: 'SYS_02', source: 'HEADLESS_PINNED' });
   g.startPlayerPhase();
   const idx = g.state.units.enemy.findIndex((u) => programById(u.programId).fn.id === 'FNC_015');
   assert(idx >= 0, 'MIDNIGHT fields SPAMBOT');
@@ -4274,10 +4586,10 @@ test('§49 an Alpha 0.4.x active save is rejected cleanly, never migrated', () =
   // §41 — an envelope with no System identity at all is incompatible, NOT an
   // invitation to substitute a default.
   const identity = { ...(env.identity as Record<string, unknown>) };
-  delete identity.systemId;
+  delete identity.opponentId;
   assert(deserializeSession(JSON.stringify({ ...env, identity })) === null, 'a save without SYS_ID is rejected');
   assert(
-    deserializeSession(JSON.stringify({ ...env, identity: { ...(env.identity as object), systemId: 'SYS_99' } })) === null,
+    deserializeSession(JSON.stringify({ ...env, identity: { ...(env.identity as object), opponentId: 'SYS_99' } })) === null,
     'a save naming an unknown System is rejected',
   );
 });
@@ -4286,13 +4598,13 @@ test('§49 an Alpha 0.5 save round-trips System identity and its exact Program o
   const g = newGame(53);
   const r = deserializeSession(serializeSession(qmInfo(), g, null));
   assert(r && r.game, 'the save round-trips');
-  assert(r.info.system.systemId === g.state.identity.systemId, 'session opponent survives');
-  assert(r.game.state.identity.systemId === g.state.identity.systemId, 'battle opponent survives');
+  assert(r.info.mode === 'QUICK_MATCH' && r.info.opponent.id === g.state.identity.opponentId, 'session opponent survives');
+  assert(r.game.state.identity.opponentId === g.state.identity.opponentId, 'battle opponent survives');
   assert(
     r.game.state.identity.systemPrograms.join(',') === g.state.identity.systemPrograms.join(','),
     'the ordered System build survives exactly',
   );
-  assert(r.game.state.identity.systemSelectionSource === g.state.identity.systemSelectionSource, 'selection source survives');
+  assert(r.game.state.identity.opponentSelectionSource === g.state.identity.opponentSelectionSource, 'selection source survives');
   // §32 — Program charge state is battle state and must round-trip too.
   assert(
     r.game.state.units.enemy.map((u) => `${u.programId}:${u.charge}`).join(',') ===
@@ -4306,7 +4618,7 @@ test('§49/§33 PENDING_BUILD restores the same upcoming System without rerollin
   const json = serializeSession(info, null, null);
   const r = deserializeSession(json);
   assert(r && r.game === null, 'a pending-build Run restores with no battle');
-  assert(r.info.mode === 'RUN' && r.info.system.systemId === info.system.systemId, 'the upcoming System is preserved');
+  assert(r.info.mode === 'RUN' && r.info.opponent.id === info.opponent.id, 'the upcoming System is preserved');
   // Reopening/re-serializing must be idempotent — no reroll on the way back.
   assert(serializeSession(r.info, null, null) === json, 'round-trip is byte-identical');
 });
@@ -4317,7 +4629,7 @@ test('§49/§11.5 retrying the same Run step keeps the same System', () => {
   // A retry rebuilds the battle from the SAME RunInfo (the session layer never
   // rerolls on defeat), so the opponent must be identical.
   const retry = createRunBattle(info, 3, 62);
-  assert(retry.state.identity.systemId === first.state.identity.systemId, 'the retry faces the same System');
+  assert(retry.state.identity.opponentId === first.state.identity.opponentId, 'the retry faces the same System');
   assert(
     retry.state.identity.systemPrograms.join(',') === first.state.identity.systemPrograms.join(','),
     'and the same ordered build',
@@ -4339,8 +4651,8 @@ test('§49/§34 the Constructed build preference is independent of System identi
 test('§50.1/§50.2 System identity is battle-level context, not repeated per turn', () => {
   const g = newGame(54);
   const stamp = identityStamp(g.state.identity);
-  assert(stamp.systemId === g.state.identity.systemId, 'the battle record carries SYS_ID');
-  assert(stamp.systemSelectionSource === g.state.identity.systemSelectionSource, 'and the selection source');
+  assert(stamp.opponentId === g.state.identity.opponentId, 'the battle record carries SYS_ID');
+  assert(stamp.opponentSelectionSource === g.state.identity.opponentSelectionSource, 'and the selection source');
   assert(stamp.systemPrograms.join(',') === g.state.identity.systemPrograms.join(','), 'and the ordered build');
   // §35/§50.9 — turn records must NOT carry any of it.
   setLoggingLevel('VERBOSE');
@@ -4405,7 +4717,7 @@ function psvGame(opts: {
   seed?: number;
   settings?: BattleSettings;
   build?: string[];
-  system?: SelectedSystem;
+  system?: SelectedOpponent;
 } = {}): Game {
   const settings = opts.settings ?? TIMER_MODE;
   const ids = defaultIdentity();
@@ -4423,9 +4735,9 @@ function psvGame(opts: {
   const config = buildBattleConfig(
     settings,
     ids.hackerId,
-    system.systemId,
+    system,
     resolveHackerMaxLink(settings, ids.hackerId, ids.deckId),
-    resolveQuickMatchIce(settings, system.systemId),
+    resolveQuickMatchIce(settings, system),
   );
   const g = new Game(config, identity, opts.seed ?? 7);
   g.startPlayerPhase();
@@ -4806,7 +5118,7 @@ test('§29 the initial offers are always DOORMAN + THRESHOLD with distinct UPGRA
     assert(p.step === 1, 'the initial offers lead into Battle 1');
     assert(p.offers.length === 2, 'exactly two paths');
     for (const o of p.offers) {
-      assert(o.systemId === INITIAL_SYSTEM_ID && o.hostId === INITIAL_HOST_ID, 'both paths use the fixed encounter');
+      assert(o.opponentId === INITIAL_SYSTEM_ID && o.hostId === INITIAL_HOST_ID, 'both paths use the fixed encounter');
       assert(getContent().upgrades.has(o.upgradeId), 'each path offers a valid UPGRADE');
     }
     assert(p.offers[0].upgradeId !== p.offers[1].upgradeId, 'the two UPGRADEs differ');
@@ -4820,12 +5132,12 @@ test('§30/§30.1 later offers randomize valid SYS/HST and avoid a duplicate pai
     const p = laterPathOffers(makeSetupRandom(seed).rng, 2, []);
     assert(p.step === 2, 'the offers know which battle they lead into');
     for (const o of p.offers) {
-      assert(poolSystems().some((s) => s.id === o.systemId), 'a pool System is offered');
+      assert(poolSystems().some((s) => s.id === o.opponentId), 'a pool System is offered');
       assert(poolHosts().some((h) => h.id === o.hostId), 'a pool HOST is offered');
-      pairs.add(`${o.systemId}+${o.hostId}`);
+      pairs.add(`${o.opponentId}+${o.hostId}`);
     }
     const [a, b] = p.offers;
-    assert(!(a.systemId === b.systemId && a.hostId === b.hostId), '§30.1 — no identical SYS+HST pair within one offer');
+    assert(!(a.opponentId === b.opponentId && a.hostId === b.hostId), '§30.1 — no identical SYS+HST pair within one offer');
     assert(a.upgradeId !== b.upgradeId, 'distinct UPGRADEs while the pool allows it');
   }
   assert(pairs.size > 1, 'combinations actually vary across seeds');
@@ -4850,20 +5162,19 @@ test('§30.2/§31 acquired UPGRADEs leave the pool and the last one may appear t
 });
 
 test('§28/§32/§35 committing a Run stores exact offers; selecting one commits the package', () => {
-  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
-  const run = commitNewRun(setup, D, 4242);
+  const run = newRun(4242);
   assert(run.pendingPath !== undefined, '§28 — entering the Path Choice creates pending offers');
   assert(run.upgradeIds.length === 0, 'a new Run has acquired nothing yet');
   assert(run.build.join(',') === defaultBuild('HAK_01', 'DEK_01').join(','), '§33 — Battle 1 opens on the default build');
   // §35 — the same seed reproduces the same offers exactly
-  const again = commitNewRun(setup, D, 4242);
+  const again = newRun(4242);
   assert(JSON.stringify(again.pendingPath) === JSON.stringify(run.pendingPath), 'the route stream is deterministic');
   // §32 — selection commits System, HOST, and the UPGRADE, and clears the offers
   const chosen = run.pendingPath!.offers[1];
   const committed = selectPath(run, 1);
   assert(committed.pendingPath === undefined, 'the offers are consumed');
   assert(committed.pendingBuild === true, 'the Run moves to its pre-battle Build');
-  assert(committed.system.systemId === chosen.systemId, 'the System is committed');
+  assert(committed.opponent.id === chosen.opponentId, 'the System is committed');
   assert(committed.hostId === chosen.hostId, 'the HOST is committed');
   assert(committed.upgradeIds.join(',') === chosen.upgradeId, 'the UPGRADE is acquired');
   // §32 — acquiring the same UPGRADE twice is impossible
@@ -4879,8 +5190,7 @@ test('§35 route generation never consumes gameplay RNG and continues determinis
   const b = newBattle(D, 909);
   assert(boardOf(a) === boardOf(b), 'gameplay boards are unaffected by route draws');
   // §35 — the persisted route state continues the SAME stream a saved Run had
-  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
-  let run = commitNewRun(setup, D, 77);
+  let run = newRun(77);
   run = selectPath(run, 0);
   const straight = openPathChoice(run, 2).pendingPath;
   // simulate a save/reload: the RunInfo is rebuilt from its persisted fields
@@ -4891,28 +5201,26 @@ test('§35 route generation never consumes gameplay RNG and continues determinis
 // ---- §60 Run flow ----
 
 test('§34.1/§34.3 retry preserves the package; a full Restart clears Run-local progression', () => {
-  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
-  let run = selectPath(commitNewRun(setup, D, 31), 0);
-  const pkg = { sys: run.system.systemId, host: run.hostId, upg: [...run.upgradeIds] };
+  let run = selectPath(newRun(31), 0);
+  const pkg = { sys: run.opponent.id, host: run.hostId, upg: [...run.upgradeIds] };
   // §34.1 — a retry generates NO path and acquires nothing
   const retry: RunInfo = { ...run, pendingBuild: true };
   assert(retry.pendingPath === undefined, 'a retry has no pending offers');
-  assert(retry.system.systemId === pkg.sys && retry.hostId === pkg.host, 'the encounter is preserved');
+  assert(retry.opponent.id === pkg.sys && retry.hostId === pkg.host, 'the encounter is preserved');
   assert(retry.upgradeIds.join(',') === pkg.upg.join(','), 'acquired UPGRADEs are preserved');
   // §34.3 — Restart Run clears the acquired UPGRADEs and reopens Battle 1
   const restarted = openPathChoice({ ...run, step: 1, upgradeIds: [] }, 1);
   assert(restarted.upgradeIds.length === 0, 'a restarted Run retains no UPGRADEs');
   assert(restarted.pendingPath!.step === 1, 'it reopens at the initial Path Choice');
-  assert(restarted.pendingPath!.offers.every((o) => o.systemId === INITIAL_SYSTEM_ID), 'Battle 1 is the fixed encounter again');
+  assert(restarted.pendingPath!.offers.every((o) => o.opponentId === INITIAL_SYSTEM_ID), 'Battle 1 is the fixed encounter again');
   // §36 — ICE progression is untouched by HOST or UPGRADE
   for (const [step, expected] of [[1, 100], [2, 150], [3, 200], [4, 250]] as const) {
-    assert(resolveRunIce(D, INITIAL_SYSTEM_ID, step) === expected, `Battle ${step} ICE is ${expected}`);
+    assert(resolveRunIce(D, systemOpponent(INITIAL_SYSTEM_ID, 'RUN_RANDOM'), step) === expected, `Battle ${step} ICE is ${expected}`);
   }
 });
 
 test('§32 an acquired UPGRADE applies to the battle it was chosen for and to later ones', () => {
-  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
-  let run = commitNewRun(setup, D, 55);
+  let run = newRun(55);
   // force the BRACER path so the effect is observable
   run = { ...run, pendingPath: { ...run.pendingPath!, offers: run.pendingPath!.offers.map((o, i) => ({ ...o, upgradeId: i === 0 ? 'UPG_01' : o.upgradeId })) } };
   run = selectPath(run, 0);
@@ -4934,16 +5242,185 @@ test('§37/§39/§44 Quick Match carries a HOST and never a Run UPGRADE', () => 
   const insts = activePassives(g.state.identity).filter((i) => i.sourceKind === 'HST');
   assert(insts.length === 1 && insts[0].passive.effectType === 'PSV_FUNCTION_DAMAGE_INCREASE', 'ARENA PASSIVEs apply in battle');
   // §44 — a Quick Match save round-trips its exact HOST
-  const info: QuickMatchInfo = { mode: 'QUICK_MATCH', identity: defaultIdentity(), system: headlessSystem(), hostId: 'HST_03', build: [...g.state.identity.hackerPrograms], buildOrigin: 'DEFAULT' };
+  const info: QuickMatchInfo = { mode: 'QUICK_MATCH', identity: defaultIdentity(), opponent: headlessSystem(), hostId: 'HST_03', build: [...g.state.identity.hackerPrograms], buildOrigin: 'DEFAULT' };
   const r = deserializeSession(serializeSession(info, g, null));
   assert(r && r.info.mode === 'QUICK_MATCH' && r.info.hostId === 'HST_03', 'the HOST survives save/restore');
 });
 
 // ---- §62 save and version ----
 
+// ============================================================================
+// Alpha 0.7.0 §47/§48 — NEW RUN SETUP PERSISTENCE AND THE SYS|BOS ROUTE UNION
+// ============================================================================
+
+test('§47.12/§47.13/§47.14 committing a Boss creates a resumable Run save before Hacker selection', () => {
+  const s = commitBossSelection(BOSS, D, 4242);
+  const json = serializeSession(s, null, null);
+  const r = deserializeSession(json);
+  assert(r && r.game === null && r.pending === null, 'a setup save carries no battle and no result');
+  assert(r.info.mode === 'RUN_SETUP', '§12 — committing a Boss creates/replaces the Run save immediately');
+  assert(r.info.bossId === BOSS, '§13 — the selected Boss persists before Hacker selection');
+  assert(r.info.step === 'HACKER', '§14 — Continue resumes at Hacker Selection');
+  assert(r.info.hackerId === null, 'no Hacker is committed yet');
+  assert(serializeSession(r.info, null, null) === json, 'the setup save re-serializes identically');
+  // §10 — the settings snapshot is taken at BOSS commitment, not later.
+  assert(r.info.settings.normalLink === D.normalLink, 'the Run settings snapshot survives');
+});
+
+test('§47.15 committing the Hacker persists and Continue resumes at Deck Selection', () => {
+  const s = commitSetupHacker(commitBossSelection(BOSS, D, 99), 'HAK_01');
+  const r = deserializeSession(serializeSession(s, null, null));
+  assert(r && r.info.mode === 'RUN_SETUP', 'the setup save restores');
+  assert(r.info.step === 'DECK', 'Continue resumes at Deck Selection');
+  assert(r.info.bossId === BOSS && r.info.hackerId === 'HAK_01', 'Boss AND Hacker are restored');
+});
+
+test('§52.74 a setup phase inconsistent with its committed IDs is rejected', () => {
+  const atHacker = JSON.parse(serializeSession(commitBossSelection(BOSS, D, 1), null, null)) as Record<string, any>;
+  const atDeck = JSON.parse(
+    serializeSession(commitSetupHacker(commitBossSelection(BOSS, D, 1), 'HAK_01'), null, null),
+  ) as Record<string, any>;
+  const rej = (env: unknown, label: string): void =>
+    assert(deserializeSession(JSON.stringify(env)) === null, label);
+  // §36 — a committed Hacker at the Hacker step, or none at the Deck step, is
+  // a phase inconsistent with its committed selection IDs.
+  rej({ ...atHacker, setup: { ...atHacker.setup, hackerId: 'HAK_01' } }, 'a Hacker committed at the Hacker step rejects');
+  rej({ ...atDeck, setup: { ...atDeck.setup, hackerId: undefined } }, 'no Hacker at the Deck step rejects');
+  // §36/§73 — an unknown Boss is never silently replaced with ODANSHAY.
+  rej({ ...atHacker, setup: { ...atHacker.setup, bossId: 'BOS_99' } }, 'an unknown committed Boss rejects');
+  rej({ ...atDeck, setup: { ...atDeck.setup, hackerId: 'HAK_99' } }, 'an unknown committed Hacker rejects');
+  // §10 — a setup phase carries no identity, no run block, and no battle.
+  rej({ ...atHacker, identity: {} }, 'a setup phase carrying a battle identity rejects');
+  rej({ ...atHacker, run: {} }, 'a setup phase carrying a run block rejects');
+});
+
+test('§48.22/§48.23/§48.24/§48.26 Battle 4 routes to the Run Boss with distinct valid HOSTs', () => {
+  const seen = new Set<string>();
+  for (let seed = 0; seed < 60; seed++) {
+    const p = bossPathOffers(makeSetupRandom(seed).rng, 4, BOSS, ['UPG_01', 'UPG_02', 'UPG_03']);
+    assert(p.offers.length === 2, 'two final paths');
+    for (const o of p.offers) {
+      // §48.22/§48.23 — opponent kind BOS, and the Run's own Boss.
+      assert(o.opponentKind === 'BOS', 'the Battle-4 opponent kind is BOS');
+      assert(o.opponentId === BOSS, 'both final paths use the Run-selected Boss');
+      // §48.24 — never a normal System, and never a placeholder System row.
+      assert(!getContent().systems.has(o.opponentId), 'Battle 4 never substitutes a normal SYS opponent');
+      // §48.25 — a valid randomized escalation-pool HOST.
+      assert(poolHosts().some((h) => h.id === o.hostId), 'a pool HOST is offered');
+      seen.add(o.hostId);
+    }
+    // §15.1/§48.26 — distinct HOSTs while at least two eligible ones exist.
+    assert(poolHosts().length < 2 || p.offers[0].hostId !== p.offers[1].hostId, 'the two final HOSTs are distinct');
+  }
+  assert(seen.size > 1, 'the final HOST actually varies across seeds');
+});
+
+test('§48.27/§48.28 final UPGRADE exhaustion offers the last one twice and acquires it once', () => {
+  // §15.2 — four authored UPGRADEs and four decisions leave exactly one at the
+  // final screen, so both cards legitimately show it.
+  const all = allUpgrades().map((u) => u.id);
+  const acquired = all.slice(0, 3);
+  const p = bossPathOffers(makeSetupRandom(5).rng, 4, BOSS, acquired);
+  assert(p.upgradeExhausted, 'the exhaustion case is RECORDED, not inferred');
+  assert(p.offers[0].upgradeId === p.offers[1].upgradeId, 'both final paths show the one remaining UPGRADE');
+  assert(p.offers[0].upgradeId === all[3], 'it is the unacquired one');
+  for (const index of [0, 1]) {
+    const run: RunInfo = { ...runInfoFor(D, 4), upgradeIds: [...acquired], pendingPath: p };
+    const after = selectPath(run, index);
+    assert(after.upgradeIds.length === 4, `path ${index} acquires the UPGRADE exactly once`);
+    assert(new Set(after.upgradeIds).size === 4, 'the acquired list stays unique');
+  }
+});
+
+test('§48.21/§48.29/§48.30/§48.31 route generation preserves 2-3, survives reload, and stays gameplay-isolated', () => {
+  // §48.21 — Battles 2 and 3 keep Alpha 0.6 normal SYS/HST behavior exactly.
+  for (const step of [2, 3] as const) {
+    const p = laterPathOffers(makeSetupRandom(step).rng, step, []);
+    assert(p.offers.every((o) => o.opponentKind === 'SYS'), `Battle ${step} stays a normal System encounter`);
+    assert(p.offers.every((o) => poolSystems().some((sy) => sy.id === o.opponentId)), `Battle ${step} uses pool Systems`);
+  }
+  // §48.29/§48.30 — pending final offers survive a reload with NO reroll.
+  const run: RunInfo = { ...newRun(1234), upgradeIds: ['UPG_01', 'UPG_02', 'UPG_03'] };
+  const atFour = openPathChoice(run, 4);
+  const json = serializeSession(atFour, null, null);
+  const r = deserializeSession(json);
+  assert(r && r.info.mode === 'RUN', 'the pending Boss route restores');
+  assert(
+    JSON.stringify(r.info.pendingPath) === JSON.stringify(atFour.pendingPath),
+    '§29 — the exact final offers survive, never rerolled',
+  );
+  // and the committed selection likewise survives with no reroll
+  const committed = selectPath(atFour, 0);
+  const rc = deserializeSession(serializeSession(committed, null, null));
+  assert(rc && rc.info.mode === 'RUN', 'the committed Boss encounter restores');
+  assert(rc.info.opponent.kind === 'BOS' && rc.info.opponent.id === BOSS, 'the committed Boss survives');
+  assert(rc.info.hostId === committed.hostId, '§30 — the selected final HOST survives without a reroll');
+  // §48.31 — route generation never consumes the gameplay stream: two battles
+  // built after different amounts of route work share a gameplay seed's board.
+  const a = createRunBattle(committed, 4, 4321);
+  const b = createRunBattle({ ...committed, routeRngState: committed.routeRngState + 999 }, 4, 4321);
+  assert(
+    JSON.stringify(gridViewOf(a.state.board)) === JSON.stringify(gridViewOf(b.state.board)),
+    'route RNG state does not perturb the gameplay board',
+  );
+});
+
+test('§52.75 a Battle-4 route naming the wrong Boss or a System rejects', () => {
+  const run: RunInfo = { ...newRun(31337), upgradeIds: ['UPG_01', 'UPG_02', 'UPG_03'] };
+  const json = serializeSession(openPathChoice(run, 4), null, null);
+  assert(deserializeSession(json), 'the untampered Boss route restores');
+  const tamper = (mut: (e: Record<string, any>) => void, label: string): void => {
+    const env = JSON.parse(json) as Record<string, any>;
+    mut(env);
+    assert(deserializeSession(JSON.stringify(env)) === null, label);
+  };
+  // §36 — a pending Battle-4 route that references a normal System instead of
+  // the selected Boss.
+  tamper((e) => {
+    e.run.pendingPath.offers[0].opponentKind = 'SYS';
+    e.run.pendingPath.offers[0].opponentId = 'SYS_01';
+  }, 'a Battle-4 route naming a normal System rejects');
+  // §16 — an ID that does not resolve in the layer it CLAIMS. With only one
+  // authored Boss the "different valid Boss" case cannot be built from real
+  // content, so the mismatch rule is exercised through the layer check here and
+  // asserted directly against the validator below.
+  tamper((e) => { e.run.pendingPath.offers[0].opponentId = 'SYS_01'; }, 'a SYS_ID under opponentKind BOS rejects');
+  tamper((e) => { e.run.pendingPath.offers[0].opponentId = 'BOS_99'; }, 'an unknown final Boss rejects');
+
+  // §36 — the Run-selected Boss and the Battle-4 route Boss must AGREE. Driven
+  // directly, because the check is what would catch a save whose route pointed
+  // at a Boss the Run never committed to.
+  const mismatched = openPathChoice({ ...run, bossId: BOSS }, 4);
+  const forged: RunInfo = {
+    ...mismatched,
+    pendingPath: {
+      ...mismatched.pendingPath!,
+      offers: mismatched.pendingPath!.offers.map((o) => ({ ...o, opponentId: 'BOS_OTHER' })),
+    },
+  };
+  assert(
+    deserializeSession(serializeSession(forged, null, null)) === null,
+    'a Battle-4 route Boss that is not the Run-selected Boss rejects',
+  );
+});
+
+test('§45 Quick Match stays System-only and never carries a Boss', () => {
+  // §45 — no player-facing Boss Quick Match. A Quick Match save claiming a Boss
+  // opponent is malformed, not a hidden mode.
+  const g = newGame(77);
+  const env = JSON.parse(serializeSession(qmInfo(), g, null)) as Record<string, any>;
+  env.identity.opponentKind = 'BOS';
+  env.identity.opponentId = BOSS;
+  assert(deserializeSession(JSON.stringify(env)) === null, 'a Boss Quick Match save is rejected');
+  // Random Quick Match still draws Systems and HOSTs only.
+  for (let seed = 0; seed < 40; seed++) {
+    const sel = randomSystem(makeSetupRandom(seed).rng, 'QUICK_RANDOM');
+    assert(sel.kind === 'SYS', 'Random Quick Match always selects a System');
+  }
+});
+
 test('§40/§41/§42 a PENDING_PATH save round-trips its exact offers and rejects tampering', () => {
-  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
-  const run = commitNewRun(setup, D, 8181);
+  const run = newRun(8181);
   const json = serializeSession(run, null, null);
   const r = deserializeSession(json);
   assert(r && r.game === null && r.pending === null, 'a pending-path save carries no battle');
@@ -4958,7 +5435,11 @@ test('§40/§41/§42 a PENDING_PATH save round-trips its exact offers and reject
   tamper((e) => { e.run.pendingPath.offers[0].hostId = 'HST_99'; }, 'an unknown offered HOST rejects');
   tamper((e) => { e.run.pendingPath.offers[0].upgradeId = 'UPG_99'; }, 'an unknown offered UPGRADE rejects');
   tamper((e) => { e.run.pendingPath.offers.pop(); }, 'a structurally incomplete offer set rejects');
-  tamper((e) => { e.run.pendingPath.offers[0].systemId = 'SYS_01'; }, 'a Battle 1 offer that is not DOORMAN rejects');
+  tamper((e) => { e.run.pendingPath.offers[0].opponentId = 'SYS_01'; }, 'a Battle 1 offer that is not DOORMAN rejects');
+  // Alpha 0.7.0 §16 — an ID stored under the WRONG identity layer is corrupt.
+  tamper((e) => { e.run.pendingPath.offers[0].opponentKind = 'BOS'; }, 'a SYS_ID claiming to be a Boss rejects');
+  // §36 — a Run whose committed Boss no longer resolves is incompatible.
+  tamper((e) => { e.run.bossId = 'BOS_99'; }, 'an unknown committed Boss rejects');
   tamper((e) => { e.run.pendingPath.upgradeExhausted = true; }, 'an exhaustion flag that disagrees with the offers rejects');
   tamper((e) => { e.run.hostId = 'HST_99'; }, 'an unknown committed HOST rejects');
   tamper((e) => { e.run.upgradeIds = ['UPG_01', 'UPG_01']; }, '§43 — a duplicate acquired UPGRADE rejects');
@@ -4968,12 +5449,11 @@ test('§40/§41/§42 a PENDING_PATH save round-trips its exact offers and reject
 });
 
 test('§41 a committed pre-battle Build save round-trips the whole encounter package', () => {
-  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
-  const run = selectPath(commitNewRun(setup, D, 99), 0);
+  const run = selectPath(newRun(99), 0);
   const r = deserializeSession(serializeSession(run, null, null));
   assert(r && r.info.mode === 'RUN', 'the Run restores');
   assert(r.info.pendingPath === undefined && r.info.pendingBuild === true, 'it restores to the pre-battle Build');
-  assert(r.info.system.systemId === run.system.systemId, 'the committed System survives');
+  assert(r.info.mode === 'RUN' && r.info.opponent.id === run.opponent.id, 'the committed System survives');
   assert(r.info.hostId === run.hostId, 'the committed HOST survives');
   assert(r.info.upgradeIds.join(',') === run.upgradeIds.join(','), 'the acquired UPGRADEs survive in order');
 });
@@ -4994,13 +5474,12 @@ test('§40 an Alpha 0.5 active save is rejected cleanly, never migrated', () => 
 // ---- §63 logging and metrics ----
 
 test('§46 route offer and selection records carry every required ID', () => {
-  const setup = chooseDeck(chooseHacker(beginSetup(), 'HAK_01'), 'DEK_01');
-  const run = commitNewRun(setup, D, 606);
+  const run = newRun(606);
   const p = run.pendingPath!;
   // the fields §46 requires are all present on the pending state the logger reads
   assert(typeof p.step === 'number', 'the target battle number');
   assert(p.offers.every((o) => typeof o.index === 'number'), 'both offered path indexes');
-  assert(p.offers.every((o) => o.systemId && o.hostId && o.upgradeId), 'each offered SYS/HST/UPG');
+  assert(p.offers.every((o) => o.opponentId && o.hostId && o.upgradeId), 'each offered SYS/HST/UPG');
   assert(typeof p.upgradeExhausted === 'boolean', 'whether duplication was pool exhaustion');
   const committed = selectPath(run, 1);
   assert(committed.upgradeIds.length === 1, 'the acquired list after commitment');
@@ -5023,6 +5502,524 @@ test('§47/§63 several PASSIVEs modifying one calculation stay individually att
 });
 
 // ---- summary ----
+
+
+// ============================================================================
+// Alpha 0.7.0 §49 — BOSS COMBAT MODEL
+// ============================================================================
+
+test('§49.32/§49.33 Boss ICE is the authored BASE_ICE with no Run escalation', () => {
+  const boss = bossById(BOSS);
+  const opp = headlessBoss();
+  // §19/§49.32 — Normal LINK ON: the authored value IS the Boss-battle ICE at
+  // EVERY step. The +150 step-4 System escalation is never applied on top.
+  for (const step of [1, 2, 3, 4] as const) {
+    assert(resolveRunIce(D, opp, step) === boss.baseIce, `step ${step} Boss ICE is the authored BASE_ICE`);
+  }
+  assert(resolveRunIce(D, opp, 4) !== boss.baseIce + encounterFor(4).iceModifier, 'no +150 is added at step 4');
+  // A normal System at the same step still escalates, so the rule is Boss-only.
+  const sys = systemOpponent(HEADLESS_SYSTEM_ID, 'RUN_RANDOM');
+  assert(
+    resolveRunIce(D, sys, 4) === systemById(HEADLESS_SYSTEM_ID).baseIce + encounterFor(4).iceModifier,
+    'a System opponent still takes the step-4 modifier',
+  );
+  // §49.33 — Normal LINK OFF: the manual enemy ICE override applies to the Boss
+  // too. There is deliberately no separate manual Boss ICE setting (§19).
+  const off = manualLink(D, 222, 333);
+  for (const step of [1, 2, 3, 4] as const) {
+    assert(resolveRunIce(off, opp, step) === 333, `step ${step} Boss uses the manual enemy ICE override`);
+  }
+  const g = newBattle(off, 5, defaultActiveBuild(), 'DEFAULT', opp, HEADLESS_HOST_ID);
+  assert(g.state.config.enemyHp === 333 && g.state.hp.enemy === 333, 'the Boss battle starts at the manual ICE');
+});
+
+test('§49.34/§49.35 Boss axes and ordered Program build reach the battle', () => {
+  const g = newBossGame(21);
+  const boss = bossById(BOSS);
+  // §20/§49.34 — the enemy strong sets are the BOSS's own, never a System's.
+  assert(
+    g.state.config.strongColors.enemy.join(',') === [...boss.strongColors].join(','),
+    'the battle uses the Boss strong colors',
+  );
+  assert(
+    g.state.config.strongShapes.enemy.join(',') === [...boss.strongShapes].join(','),
+    'the battle uses the Boss strong shapes',
+  );
+  // §49.35 — DISABLER -> SHIELDER -> SPAMBOT -> ATTACKER, in authored order.
+  assert(
+    g.state.identity.systemPrograms.join(',') === 'PRG_S_004,PRG_S_002,PRG_S_007,PRG_S_003',
+    `Boss Program order: ${g.state.identity.systemPrograms.join(',')}`,
+  );
+  assert(
+    g.state.units.enemy.map((u) => u.programId).join(',') === boss.programIds.join(','),
+    'the enemy slots are built in Boss PRG_SET order',
+  );
+  const names = g.state.identity.systemPrograms.map((id) => programById(id).fn.name);
+  assert(names.join(',') === 'DRAIN,SHIELD,SPAM,ATTACK', `Boss Functions: ${names.join(',')}`);
+});
+
+test('§49.42 Boss identity is BOS in battle identity, logs, and metrics — never a fake SYS', () => {
+  const g = newBossGame(22);
+  const id = g.state.identity;
+  assert(id.opponentKind === 'BOS' && id.opponentId === BOSS, 'the battle identity names the Boss');
+  assert(!getContent().systems.has(id.opponentId), 'the Boss ID is not a System ID');
+  const stamp = identityStamp(id);
+  assert(stamp.opponentKind === 'BOS' && stamp.opponentId === BOSS, 'the log identity stamp carries BOS');
+  // §42 — Boss aggregates exist in a Boss battle and are absent otherwise.
+  assert(g.state.metrics.boss?.bossId === BOSS, 'the metrics carry the Boss identity');
+  assert(newGame(23).state.metrics.boss === null, 'a System battle carries no Boss metrics');
+  // §5.1/§26.2 — the Boss contributes no identity PASSIVEs, because the Alpha
+  // 0.7 Boss schema has no PASSIVES column at all.
+  assert(activePassives(id).every((i) => i.sourceKind !== 'SYS'), 'a Boss battle has no SYS PASSIVE instances');
+});
+
+test('§49.36/§49.37/§49.38 the Boss reuses the normal enemy Program and Function machinery', () => {
+  const g = newBossGame(24);
+  // §49.36 — charge routes top-to-bottom through the Boss PRG_SET order, using
+  // exactly the shared enemy routing path.
+  const before = g.state.units.enemy.map((u) => u.charge);
+  const events: GameEvent[] = [];
+  routeChargeStream(
+    g.state,
+    'enemy',
+    { axis: 'color', token: g.state.config.strongColors.enemy[0], amount: 6, source: 'SYNC' },
+    events,
+    new Map<string, number>(),
+  );
+  const routed = events.find((e) => e.t === 'chargeRoute');
+  assert(routed && routed.t === 'chargeRoute', 'the Boss routes charge through the shared stream');
+  assert(
+    routed.order.join(',') === g.state.identity.systemPrograms.join(','),
+    'routing order IS the Boss PRG_SET order',
+  );
+  assert(g.state.units.enemy.some((u, i) => u.charge !== before[i]), 'charge actually landed');
+
+  // §49.37/§49.38 — the dynamic Function phase runs with the same at-most-once
+  // rule a System gets. Charge every Boss Program and count activations.
+  const g2 = newBossGame(25);
+  for (let i = 0; i < g2.state.units.enemy.length; i++) chargeSlot(g2, 'enemy', i);
+  const ev = g2.runEnemyPhase();
+  const byProgram = new Map<string, number>();
+  for (const f of ev) {
+    if (f.t !== 'ability' || f.side !== 'enemy' || f.ownerKind !== 'program') continue;
+    byProgram.set(f.programId, (byProgram.get(f.programId) ?? 0) + 1);
+  }
+  assert([...byProgram.values()].every((n) => n === 1), 'each Boss Program activates at most once per Function phase');
+  assert(byProgram.size > 0, 'the Boss actually acts');
+});
+
+test('§49.39 Boss DISABLER Drain targeting and no-valid-target gating are preserved', () => {
+  const g = newBossGame(26);
+  const drainIdx = g.state.units.enemy.findIndex((u) => programById(u.programId).fn.id === 'FNC_004');
+  assert(drainIdx >= 0, 'ODANSHAY fields DISABLER');
+  // §18/§49.39 — with no charged Hacker Program the Drain is WITHHELD and its
+  // charge is preserved, exactly as it is for a System.
+  for (const u of g.state.units.player) u.charge = 0;
+  chargeSlot(g, 'enemy', drainIdx);
+  const cost = programById(g.state.units.enemy[drainIdx].programId).cost;
+  const ev = g.runEnemyPhase();
+  assert(
+    ev.some((e) => e.t === 'withhold' && e.fnId === 'FNC_004'),
+    'the Boss withholds a Drain with nothing to drain',
+  );
+  assert(g.state.units.enemy[drainIdx].charge >= cost, 'the withheld charge is preserved, not spent');
+});
+
+// ============================================================================
+// Alpha 0.7.0 §50/§51 — THE OVERRIDE MECHANIC
+// ============================================================================
+
+test('§50.49/§50.43/§50.44/§50.51 an ODANSHAY turn ends by placing exactly three Overrides', () => {
+  // TIMER_MODE and empty Boss pools isolate the mechanic: no enemy Sync and no
+  // Program activation touch the board, so the ONLY change this turn is the
+  // end-of-turn placement itself.
+  const g = newBossGame(31, TIMER_MODE);
+  const axesBefore = g.state.board.map((row) => row.map((t) => `${t!.kind}:${t!.color}:${t!.shape}`));
+  const ev = g.runEnemyPhase();
+  // §49 — exactly three, as the final action of the turn.
+  assert(overrideCount(g) === 3, `three Overrides placed, got ${overrideCount(g)}`);
+  const placed = bossEvents(ev).filter((e) => e.kind === 'OVERRIDE_PLACED');
+  assert(placed.length === 1 && placed[0].placed === 3, 'one placement batch of three');
+  assert(placed[0].bossId === BOSS, '§84 — the placement logs the Boss as its source');
+  assert(placed[0].countBefore === 0 && placed[0].countAfter === 3, 'the batch reports before/after counts');
+  assert(new Set(placed[0].cells!.map((p) => `${p.x},${p.y}`)).size === 3, '§48 — three DISTINCT targets');
+  // §43 — placement does not change the Packet's color or shape.
+  for (const p of overrideCells(g)) {
+    const t = g.state.board[p.y][p.x]!;
+    assert(`${t.kind}:${t.color}:${t.shape}` === axesBefore[p.y][p.x], 'the underlying Packet axes are unchanged');
+  }
+  // §44/§51 — the Override itself deals no damage, grants no charge, and creates
+  // no Sync. Nothing after the placement event does any of those.
+  const at = ev.findIndex((e) => e.t === 'bossMechanic' && e.kind === 'OVERRIDE_PLACED');
+  const after = ev.slice(at);
+  assert(!after.some((e) => e.t === 'damage'), 'no damage from installing Overrides');
+  assert(!after.some((e) => e.t === 'chargeRoute'), 'no charge from installing Overrides');
+  assert(!after.some((e) => e.t === 'destroy'), 'no Sync is created merely by installing Overrides');
+});
+
+test('§50.45/§50.46 a Hacker special is a valid target and is replaced; a Boss special is not', () => {
+  const g = newBossGame(32, TIMER_MODE);
+  // Four axis-bearing Packets: three carry a HACKER overlay (valid targets,
+  // §23) and one carries a BOSS overlay (invalid, §23 — never overwritten).
+  const cells = restrictTargets(g, 4);
+  const hackerCells = cells.slice(0, 3);
+  const bossCell = cells[3];
+  for (const p of hackerCells) {
+    g.state.board[p.y][p.x]!.special = { type: 'shield', owner: 'player', magnitude: 2, seq: g.state.nextSeq++ };
+  }
+  const bossSeq = g.state.nextSeq++;
+  g.state.board[bossCell.y][bossCell.x]!.special = { type: 'override', owner: 'enemy', seq: bossSeq };
+
+  const ev = g.runEnemyPhase();
+  const placed = bossEvents(ev).find((e) => e.kind === 'OVERRIDE_PLACED');
+  assert(placed && placed.placed === 3, 'the three Hacker-owned Packets were valid targets');
+  assert(placed.overwrote === 3, '§41 — the batch records the Hacker specials it overwrote');
+  // §46 — each Hacker overlay was destroyed and replaced by a Boss Override,
+  // and the underlying Packet's axes were retained.
+  for (const p of hackerCells) {
+    const t = g.state.board[p.y][p.x]!;
+    assert(t.special?.type === 'override' && t.special.owner === 'enemy', 'the Hacker overlay was replaced');
+    assert(t.kind === 'standard', 'the underlying Packet is retained');
+  }
+  assert(specialsOf(g, 'shield', 'player').length === 0, 'no Hacker overlay survived');
+  // §45 — the pre-existing BOSS-owned overlay was never a candidate, so it is
+  // still the very same overlay object it was before the turn.
+  assert(g.state.board[bossCell.y][bossCell.x]!.special!.seq === bossSeq, 'the existing Boss Override was not overwritten');
+  assert(overrideCount(g) === 4, 'three new Overrides plus the untouched original');
+});
+
+test('§50.47 ordinary mechanics that destroy enemy specials destroy Overrides', () => {
+  const g = newBossGame(33);
+  plantSpecial(g, 4, 4, { type: 'override', owner: 'enemy' });
+  assert(overrideCount(g) === 1, 'an Override is on the board');
+  // REBOOT's authored `1:1:0:0` removes ALL overlays, Overrides included (§27).
+  const ok = shakeBoard(g.state, { boardComposition: 1, specialGems: 1, matches: 0, cascades: 0 }, 'enemy');
+  assert(ok && overrideCount(g) === 0, 'an ordinary special-clearing mechanic destroys Overrides');
+  // And an ordinary blast that destroys enemy specials takes the Override too.
+  const g2 = newBossGame(34);
+  plantSpecial(g2, 4, 4, { type: 'override', owner: 'enemy' });
+  const events: GameEvent[] = [];
+  detonateAt(
+    g2.state,
+    { x: 4, y: 4 },
+    { owner: 'player', areaPattern: 'AREA_SQUARE_3X3', dealDamage: 0, gainCharge: 1 },
+    events,
+  );
+  assert(overrideCount(g2) === 0, 'a blast that destroys enemy specials destroys the Override');
+});
+
+test('§50.52/§50.53/§50.54/§50.56 insufficient targets place NOTHING and run DATABEND, then retry', () => {
+  const g = newBossGame(35, TIMER_MODE);
+  // Only two axis-bearing Packets exist, so the first pass cannot place three.
+  const cells = restrictTargets(g, 2);
+  // One Hacker-owned overlay for DATABEND to clear, and one Boss-owned Override
+  // that it must PRESERVE (§7.1 specialGems mode 2 / §54).
+  g.state.board[cells[0].y][cells[0].x]!.special = { type: 'shield', owner: 'player', magnitude: 2, seq: g.state.nextSeq++ };
+  const bossSeq = g.state.nextSeq++;
+  g.state.board[cells[1].y][cells[1].x]!.special = { type: 'override', owner: 'enemy', seq: bossSeq };
+
+  const ev = g.runEnemyPhase();
+  const mech = bossEvents(ev);
+  const shortage = mech.find((e) => e.kind === 'INSUFFICIENT_TARGETS');
+  assert(shortage, '§52 — the insufficient-target condition is recorded');
+  assert(shortage.available !== undefined && shortage.available < 3, 'fewer than three valid targets existed');
+  // §52 — NO partial placement happens before DATABEND: the FIRST mechanic event
+  // of the turn is the shortage, never a placement.
+  assert(mech[0].kind === 'INSUFFICIENT_TARGETS', 'no partial Overrides are placed before DATABEND');
+  // §53 — DATABEND actually executed, through the ordinary Function machinery.
+  assert(
+    ev.some((e) => e.t === 'ability' && e.ownerKind === 'boss' && e.fn === 'FNC_018'),
+    'DATABEND executed as a Boss mechanic payload',
+  );
+  // §54 — it removed the Hacker-owned overlay and PRESERVED the Boss-owned one,
+  // on its own Packet, under the authored `1:2:1:2` semantics.
+  assert(specialsOf(g, 'shield', 'player').length === 0, 'DATABEND removed the Hacker-owned overlay');
+  assert(
+    g.state.board[cells[1].y][cells[1].x]!.special?.seq === bossSeq,
+    'DATABEND preserved the Boss-owned Override on its own Packet',
+  );
+  // §56 — the retry then succeeded, so the turn still ends with three placed.
+  const placed = mech.find((e) => e.kind === 'OVERRIDE_PLACED');
+  assert(placed && placed.placed === 3, 'after DATABEND the retry places all three');
+  assert(overrideCount(g) === 4, 'the preserved Override plus the three new ones');
+});
+
+test('§50.50 Override target selection uses the GAMEPLAY RNG, not route/setup RNG', () => {
+  // Same gameplay seed -> identical placement. Different gameplay seed ->
+  // different placement. Route RNG state is not even an input here (§24).
+  const key = (g: Game): string => overrideCells(g).map((p) => `${p.x},${p.y}`).sort().join('|');
+  const a = newBossGame(41);
+  const b = newBossGame(41);
+  const c = newBossGame(42);
+  a.runEnemyPhase();
+  b.runEnemyPhase();
+  c.runEnemyPhase();
+  assert(key(a) === key(b), 'the same gameplay seed places the same Overrides');
+  assert(key(a) !== key(c), 'a different gameplay seed places different Overrides');
+});
+
+test('§51.57/§51.58/§51.59/§51.71 the threshold fires at 15 or more, and can fire again later', () => {
+  // §57 — below 15, nothing happens and NOTHING is logged (§41 compactness).
+  const below = newBossGame(51, TIMER_MODE);
+  plantOverrides(below, 14);
+  assert(overrideCount(below) === 14, 'exactly 14 Overrides');
+  const evBelow = below.runEnemyPhase();
+  assert(!bossEvents(evBelow).some((e) => e.kind === 'THRESHOLD'), 'no threshold below 15');
+  assert(
+    !evBelow.some((e) => e.t === 'ability' && e.ownerKind === 'boss' && e.fn === 'FNC_020'),
+    'CODESHATTER does not fire below 15',
+  );
+
+  // §58/§59 — at exactly 15, and above 15.
+  for (const [n, label] of [[15, 'exactly 15'], [17, 'above 15']] as const) {
+    const g = newBossGame(52, TIMER_MODE);
+    plantOverrides(g, n);
+    assert(overrideCount(g) === n, `${label} Overrides on board`);
+    const ev = g.runEnemyPhase();
+    const th = bossEvents(ev).find((e) => e.kind === 'THRESHOLD');
+    assert(th && th.countBefore === n, `the threshold fires at ${label}`);
+    assert(
+      ev.some((e) => e.t === 'ability' && e.ownerKind === 'boss' && e.fn === 'FNC_020'),
+      `CODESHATTER fires at ${label}`,
+    );
+  }
+
+  // §71 — 15 is not a permanent phase change: after REBOOT clears the board the
+  // Boss accumulates again and can trigger on a later turn.
+  const again = newBossGame(53, TIMER_MODE);
+  plantOverrides(again, 15);
+  again.runEnemyPhase();
+  assert(!again.state.winner, 'the Hacker survived the first threshold');
+  assert(overrideCount(again) === 3, 'REBOOT cleared the accumulation and the turn re-placed three');
+  plantOverrides(again, 15);
+  again.startPlayerPhase();
+  const ev2 = again.runEnemyPhase();
+  assert(bossEvents(ev2).some((e) => e.kind === 'THRESHOLD'), 'the threshold can trigger again on a later turn');
+});
+
+test('§51.62/§51.63/§51.65 CODESHATTER is ordinary Function damage at zero cost', () => {
+  const g = newBossGame(61, TIMER_MODE);
+  const chargeBefore = g.state.units.enemy.map((u) => u.charge);
+  plantOverrides(g, 15);
+  const linkBefore = g.state.hp.player;
+  const ev = g.runEnemyPhase();
+  // §62 — no Boss Program pool paid for it: the payload path pays no cost.
+  assert(
+    ev.some((e) => e.t === 'ability' && e.ownerKind === 'boss' && e.fn === 'FNC_020'),
+    'CODESHATTER activated',
+  );
+  assert(chargeBefore.every((c) => c === 0), 'the Boss pools started empty');
+  // §63/§86 — the authored 70 lands as ordinary Function damage attributed to
+  // FNC_020, in the ordinary Function-damage bucket.
+  const dmg = ev.find((e) => e.t === 'damage' && e.target === 'player' && e.fnId === 'FNC_020');
+  assert(dmg && dmg.t === 'damage', '§86 — the damage is attributed to FNC_020');
+  assert(dmg.source === 'attacker', 'it uses the ordinary Function-damage bucket');
+  assert(linkBefore - g.state.hp.player >= 70, 'the full authored damage landed');
+
+  // §65 — Reinforced Connection suppresses BASE Sync damage, never Function
+  // damage, so CODESHATTER still lands with it on.
+  const rc = newBossGame(63, { ...TIMER_MODE, reinforcedConnection: true });
+  plantOverrides(rc, 15);
+  const rcLink = rc.state.hp.player;
+  const rcEv = rc.runEnemyPhase();
+  assert(rcEv.some((e) => e.t === 'damage' && e.fnId === 'FNC_020'), 'CODESHATTER fires under Reinforced Connection');
+  assert(rcLink - rc.state.hp.player >= 70, 'Reinforced Connection does not suppress CODESHATTER');
+});
+
+test('§51.64 CODESHATTER is reduced by permanent Shield under the existing ordering', () => {
+  // BRACER (UPG_01) carries the permanent-Shield PASSIVE. Build the Boss battle
+  // with it acquired so the reduction is observable against the bare case.
+  const bare = newBossGame(64, TIMER_MODE);
+  plantOverrides(bare, 15);
+  const bareLink = bare.state.hp.player;
+  bare.runEnemyPhase();
+  const bareDealt = bareLink - bare.state.hp.player;
+
+  const withUpg = newBattle(TIMER_MODE, 64, defaultActiveBuild(), 'DEFAULT', headlessBoss(), HEADLESS_HOST_ID);
+  withUpg.state.identity.upgradeIds.push('UPG_01');
+  withUpg.startPlayerPhase();
+  plantOverrides(withUpg, 15);
+  const upgLink = withUpg.state.hp.player;
+  withUpg.runEnemyPhase();
+  const upgDealt = upgLink - withUpg.state.hp.player;
+  assert(shieldValue(withUpg.state, 'player') > 0, 'BRACER provides permanent Shield');
+  assert(upgDealt < bareDealt, `permanent Shield reduces CODESHATTER (${upgDealt} < ${bareDealt})`);
+});
+
+test('§51.66/§51.67/§51.68/§51.69 defeat stops REBOOT; survival runs it and the turn continues', () => {
+  // §66 — a Hacker defeated by CODESHATTER ends the battle immediately: REBOOT
+  // does not fire, and neither does the end-of-turn placement.
+  const dead = newBattle(manualLink(TIMER_MODE, 20, 250), 71, defaultActiveBuild(), 'DEFAULT', headlessBoss(), HEADLESS_HOST_ID);
+  dead.startPlayerPhase();
+  plantOverrides(dead, 15);
+  const evDead = dead.runEnemyPhase();
+  assert(dead.state.winner === 'enemy', 'CODESHATTER for 70 defeats a 20-LINK Hacker');
+  assert(
+    !evDead.some((e) => e.t === 'ability' && e.ownerKind === 'boss' && e.fn === 'FNC_019'),
+    '§66 — REBOOT does not fire after terminal defeat',
+  );
+  assert(
+    !bossEvents(evDead).some((e) => e.kind === 'OVERRIDE_PLACED'),
+    '§66 — no end-of-turn placement happens after terminal defeat',
+  );
+  assert(overrideCount(dead) === 15, 'the board is left exactly as the defeat found it');
+
+  // §67/§68/§69 — surviving: REBOOT fires after CODESHATTER, wipes every
+  // overlay, and the turn continues through the normal flow to the placement.
+  const alive = newBossGame(72, TIMER_MODE);
+  plantOverrides(alive, 15);
+  alive.state.board[7][7]!.special = { type: 'shield', owner: 'player', magnitude: 2, seq: alive.state.nextSeq++ };
+  const ev = alive.runEnemyPhase();
+  assert(!alive.state.winner, 'the Hacker survives 70 at full LINK');
+  const order = ev.filter((e) => e.t === 'ability' && e.ownerKind === 'boss').map((e) => (e.t === 'ability' ? e.fn : ''));
+  assert(order.indexOf('FNC_020') >= 0, 'CODESHATTER fired');
+  assert(order.indexOf('FNC_019') > order.indexOf('FNC_020'), '§67 — REBOOT fires AFTER CODESHATTER');
+  // §68 — REBOOT clears every overlay and suppresses post-shake Syncs/cascades.
+  assert(specialsOf(alive, 'shield', 'player').length === 0, 'REBOOT removed the Hacker overlay too');
+  assert(detectMatches(alive.state.board).length === 0, '§68 — `1:1:0:0` leaves no pre-existing Sync');
+  // §69/§70 — the turn then continued and ended with the placement.
+  assert(overrideCount(alive) === 3, 'the Boss turn continued and placed three fresh Overrides');
+});
+
+test('§51.60/§51.61/§51.70 turn ordering: HOST start, threshold, countdowns, then end-of-turn placement', () => {
+  // §60/§61 — the threshold sits strictly AFTER HOST START_OF_TURN effects and
+  // strictly BEFORE countdown ticking. HST_05 WEEDS carries the GREENING
+  // START_OF_TURN payload, so its activation marks the HOST stage.
+  const g = newBossGame(81, TIMER_MODE, 'HST_05');
+  // A margin above the threshold: WEEDS' GREENING carrier fires FIRST and its
+  // transformation can create Syncs that slice some Overrides away, so 15 exactly
+  // could legitimately fall under the bar before the check runs.
+  plantOverrides(g, 24);
+  // an armed Boss countdown, so the countdown stage is observable
+  g.state.board[7][0]!.special = {
+    type: 'bomb', owner: 'enemy', countdown: 1, delivers: 'EFFECT_BOMB',
+    areaPattern: 'AREA_SQUARE_3X3', dealDamage: 0, gainCharge: 0, seq: g.state.nextSeq++,
+  };
+  const ev = g.runEnemyPhase();
+  const idxHost = ev.findIndex((e) => e.t === 'ability' && e.ownerKind === 'passive');
+  const idxThreshold = ev.findIndex((e) => e.t === 'bossMechanic' && e.kind === 'THRESHOLD');
+  const idxCountdown = ev.findIndex((e) => e.t === 'countdown');
+  const idxPlaced = ev.findIndex((e) => e.t === 'bossMechanic' && e.kind === 'OVERRIDE_PLACED');
+  assert(idxHost >= 0, 'the HOST START_OF_TURN carrier resolved');
+  assert(idxThreshold >= 0, 'the Boss threshold resolved');
+  assert(idxHost < idxThreshold, '§60 — HOST START_OF_TURN resolves before the Boss threshold');
+  if (idxCountdown >= 0) assert(idxThreshold < idxCountdown, '§61 — the threshold resolves before countdown ticking');
+  // §70 — the placement is the FINAL mechanic action, after the threshold and
+  // after the whole Function phase.
+  assert(idxPlaced > idxThreshold, 'the placement comes after the threshold');
+  const lastAbility = ev.map((e) => e.t).lastIndexOf('ability');
+  assert(idxPlaced > lastAbility, '§70 — placement follows every activation of the turn');
+});
+
+// ============================================================================
+// Alpha 0.7.0 §52/§53 — BOSS SAVE/RESUME AND LOGGING
+// ============================================================================
+
+test('§52.76/§52.77/§52.78/§52.79/§52.80 a mid-Boss save preserves ICE, charge, Overrides, and RNG', () => {
+  // The real §52 scenario: a committed Run parked mid-Battle-4 against its Boss.
+  // Quick Match deliberately cannot carry a Boss at all (§45), so the save path
+  // under test here is the Run one.
+  const run: RunInfo = {
+    ...runInfoFor(D, 4),
+    bossId: BOSS,
+    opponent: { kind: 'BOS', id: BOSS, source: 'RUN_RANDOM' },
+    upgradeIds: ['UPG_01'],
+  };
+  const g = createRunBattle(run, 4, 91);
+  g.startPlayerPhase();
+  g.runEnemyPhase();
+  g.startPlayerPhase();
+  chargeSlot(g, 'enemy', 1);
+  assert(overrideCount(g) === 3, 'the Boss turn placed Overrides before the save');
+
+  const r = deserializeSession(serializeSession(run, g, null));
+  assert(r && r.game, 'the mid-Boss save round-trips');
+  const rg = r.game;
+  // §76 — Boss ICE and Program charge are exact.
+  assert(rg.state.hp.enemy === g.state.hp.enemy, 'Boss ICE survives exactly');
+  assert(rg.state.config.enemyHp === bossById(BOSS).baseIce, 'Boss max ICE is the authored BASE_ICE');
+  assert(
+    rg.state.units.enemy.map((u) => `${u.programId}:${u.charge}`).join(',') ===
+      g.state.units.enemy.map((u) => `${u.programId}:${u.charge}`).join(','),
+    'Boss Program charge is exact',
+  );
+  // §77 — the exact Override overlays and count, none lost or duplicated.
+  assert(overrideCount(rg) === overrideCount(g), 'the Override count is preserved');
+  assert(
+    overrideCells(rg).map((p) => `${p.x},${p.y}`).sort().join('|') ===
+      overrideCells(g).map((p) => `${p.x},${p.y}`).sort().join('|'),
+    'every Override is on its own Packet, none duplicated or lost',
+  );
+  // §78 — Boss identity, the selected HOST, and the UPGRADE stack.
+  assert(rg.state.identity.opponentKind === 'BOS' && rg.state.identity.opponentId === BOSS, 'the Boss identity survives');
+  assert(rg.state.identity.hostId === g.state.identity.hostId, 'the HOST survives');
+  assert(rg.state.identity.upgradeIds.join(',') === 'UPG_01', 'the UPGRADE stack survives');
+  // §35 — and the Run itself did not reroll its Boss or its Battle-4 HOST.
+  assert(r.info.mode === 'RUN' && r.info.opponent.id === BOSS, 'the Run still names the same Boss');
+  assert(r.info.mode === 'RUN' && r.info.hostId === run.hostId, 'the Battle-4 HOST did not reroll');
+  // §80 — the gameplay RNG resumes deterministically, and §79 — the resumed
+  // turn does not double-execute the threshold payload or the placement.
+  const a = rg.runEnemyPhase();
+  const b = g.runEnemyPhase();
+  assert(
+    overrideCells(rg).map((p) => `${p.x},${p.y}`).sort().join('|') ===
+      overrideCells(g).map((p) => `${p.x},${p.y}`).sort().join('|'),
+    'the resumed battle places the same Overrides as the uninterrupted one',
+  );
+  assert(a.length === b.length, 'the resumed turn produces the same event volume');
+  assert(bossEvents(a).filter((e) => e.kind === 'OVERRIDE_PLACED').length === 1, '§79 — exactly one placement, never doubled');
+});
+
+test('§52.72/§52.73 an Alpha 0.6 active save is rejected cleanly under Alpha 0.7', () => {
+  const g = newGame(92);
+  const env = JSON.parse(serializeSession(qmInfo(), g, null)) as Record<string, any>;
+  // Alpha 0.6 shipped GAME_VERSION alpha-0.6.0 and save schema 5. Both the
+  // version tag and the schema reject it; there is no migration path (§36).
+  assert(deserializeSession(JSON.stringify({ ...env, version: 'alpha-0.6.0' })) === null, 'the Alpha 0.6 build tag is rejected');
+  assert(deserializeSession(JSON.stringify({ ...env, schema: 5 })) === null, 'the Alpha 0.6 save schema is rejected');
+  // §36/§73 — and nothing synthesizes a Boss or a setup phase to make it load.
+  assert(deserializeSession(JSON.stringify({ ...env, schema: 5, mode: 'RUN_SETUP' })) === null, 'no Boss state is synthesized');
+});
+
+test('§53.87 Boss mechanic aggregate counters update correctly', () => {
+  const g = newBossGame(93, TIMER_MODE);
+  g.runEnemyPhase();
+  const m1 = g.state.metrics.boss!;
+  assert(m1.overridesPlaced === 3, 'three Overrides counted');
+  assert(m1.overridePeak === 3, 'the peak count is tracked');
+  assert(m1.placementsAbandoned === 0, 'the retry cap was never reached');
+  // A threshold turn adds the CODESHATTER and REBOOT activation counts.
+  const t = newBossGame(94, TIMER_MODE);
+  plantOverrides(t, 15);
+  t.runEnemyPhase();
+  const m2 = t.state.metrics.boss!;
+  assert(m2.codeshatterActivations === 1, 'CODESHATTER activation counted');
+  assert(m2.rebootActivations === 1, 'REBOOT activation counted');
+  assert(m2.overridePeak >= 15, 'the peak reflects the pre-REBOOT accumulation');
+  // A DATABEND turn counts its activations.
+  const d = newBossGame(95, TIMER_MODE);
+  restrictTargets(d, 2);
+  d.runEnemyPhase();
+  assert(d.state.metrics.boss!.databendActivations >= 1, 'DATABEND activation counted');
+});
+
+test('§53.85 DATABEND/CODESHATTER/REBOOT preserve Boss causal source in the event stream', () => {
+  const g = newBossGame(96, TIMER_MODE);
+  plantOverrides(g, 15);
+  const ev = g.runEnemyPhase();
+  for (const fnId of ['FNC_020', 'FNC_019']) {
+    const a = ev.find((e) => e.t === 'ability' && e.fn === fnId);
+    assert(a && a.t === 'ability', `${fnId} emitted an activation event`);
+    // §28 — the actor is the BOSS itself, not a Program, Deck, PASSIVE, or a
+    // fake System. Both dimensions survive: side = enemy, actor = BOS_01.
+    assert(a.ownerKind === 'boss', `${fnId} is attributed to the boss owner kind`);
+    assert(a.programId === BOSS, `${fnId} names the Boss as its source`);
+    assert(a.side === 'enemy', `${fnId} resolves on the enemy side`);
+  }
+  // §42/§83 — no Boss mechanic payload invents a per-Program metrics row.
+  const enemyUnits = Object.keys(g.state.metrics.sides.enemy.units);
+  assert(!enemyUnits.includes(BOSS), 'the Boss mechanic never creates a phantom Program metrics row');
+});
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) {

@@ -90,10 +90,13 @@ const cfgStr = (c) =>
       ` strongS:P[${arr(c.strongShapes && c.strongShapes.player)}]E[${arr(c.strongShapes && c.strongShapes.enemy)}]]`
     : '';
 // Alpha 0.3.0 §21.2 — selection/build identity on battle, turn, and Run records.
-// Alpha 0.5.0 §36 — plus the opponent System and how it was chosen.
+// Alpha 0.5.0 §36 — plus the opponent and how it was chosen.
+// Alpha 0.7.0 §40 — the opponent's identity LAYER is printed with its ID, so a
+// Boss battle never reads as a System in an exported log.
 const idStr = (i) =>
   i
-    ? `id[${i.hackerId ?? '?'}/${i.deckId ?? '?'} vs ${i.systemId ?? '?'}${i.systemSelectionSource ? `(${i.systemSelectionSource})` : ''}` +
+    ? `id[${i.hackerId ?? '?'}/${i.deckId ?? '?'} vs ${i.opponentKind ?? 'SYS'}:${i.opponentId ?? '?'}` +
+      `${i.opponentSelectionSource ? `(${i.opponentSelectionSource})` : ''}` +
       ` fn:${i.deckFunctionId ?? '?'} skills:[${arr(i.skillIds)}] src:${i.selectionSource ?? '?'}]`
     : '';
 
@@ -317,12 +320,20 @@ for (const { file, records } of parsed) {
             `${entry.hackerMaxLink !== undefined ? ` link=${entry.hackerMaxLink}` : ''}` +
             `${entry.systemMaxIce !== undefined ? ` ice=${entry.systemMaxIce}` : ''}`,
         );
-        // §36 — the committed opponent resolution.
-        if (entry.systemId) {
+        // §36 / Alpha 0.7.0 §40 — the committed opponent resolution, with the
+        // identity layer it came from.
+        if (entry.opponentId) {
           bodyLines.push(
-            `  system=${entry.systemId}${entry.systemSelectionSource ? ` (${entry.systemSelectionSource})` : ''}` +
-              `${entry.systemPrograms ? ` build=[${arr(entry.systemPrograms)}]` : ''}` +
-              `${entry.systemStrongColors ? ` strongC=[${arr(entry.systemStrongColors)}] strongS=[${arr(entry.systemStrongShapes)}]` : ''}`,
+            `  opponent=${entry.opponentKind ?? 'SYS'}:${entry.opponentId}` +
+              `${entry.opponentSelectionSource ? ` (${entry.opponentSelectionSource})` : ''}` +
+              `${entry.opponentPrograms ? ` build=[${arr(entry.opponentPrograms)}]` : ''}` +
+              `${entry.opponentStrongColors ? ` strongC=[${arr(entry.opponentStrongColors)}] strongS=[${arr(entry.opponentStrongShapes)}]` : ''}`,
+          );
+        }
+        // Alpha 0.7.0 §39 — Boss Selection offers and the committed Boss.
+        if (entry.bossIds || entry.bossId) {
+          bodyLines.push(
+            `  boss${entry.bossIds ? ` offered=[${arr(entry.bossIds)}]` : ''}${entry.bossId ? ` selected=${entry.bossId}` : ''}`,
           );
         }
       } else {
